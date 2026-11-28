@@ -8012,6 +8012,7 @@ pub const CudaCompute = struct {
         };
         if (!try audioWorkspaceLowerBoundFits(recipe, segments[0..recipe.count], rows, base)) return;
         if (recipe.workspace) |workspace| {
+            if (workspace.events.len == 0) return;
             // Seal the exact same event program before reserving either charge.
             var preview: AudioPlan.Owner = .{ .allocator = std.heap.page_allocator };
             preview.declare(base, workspace.events, workspace.published_slot) catch |err| switch (err) {
@@ -21438,6 +21439,31 @@ fn runAudioWithWorkspace(
     return run(context, inputs);
 }
 
+fn cachedGroupedAudioWorkspace(ctx: *anyopaque, recipe: CacheFunding.AudioRecipe) anyerror!?ops.ComputeBackend.AudioWorkspaceDeclaration {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const schedule = @import("../../execution/audio_schedule.zig");
+    var segments: [schedule.GroupedRows.max_clips]usize = undefined;
+    const partition = segments[0..recipe.count];
+    const rows = try recipe.rowsAndSegments(partition);
+    const Inputs = schedule.ExecutionInputs;
+    var shapes: [Inputs.count][2]i64 = undefined;
+    const metadata = try Inputs.describe(&shapes, rows, recipe.hidden, recipe.context_left, recipe.heads);
+    const inputs = metadata[0..Inputs.activeCount(!recipe.source_bf16)];
+    const key = recipe.key(partition, 0, recipe.blocks);
+    for (&self.audio_plans.entries) |*entry| {
+        if (entry.disabled) continue;
+        const snapshot = entry.declaration orelse continue;
+        if (snapshot.source_key != key) continue;
+        // Borrow only the immutable signature, even if Stage admission yields
+        // and a peer retires the actual owner. The current base certifies the
+        // weight and constant generations before any plan is reused.
+        const declaration: schedule.WorkspaceDeclaration = .{ .events = &.{}, .published_slot = 0, .fingerprint = snapshot.fingerprint };
+        const base = try self.audioCacheBase(declaration.cacheKey(key), inputs, null);
+        if (base.key == entry.key and entry.executableFor(base) != null) return declaration;
+    }
+    return null;
+}
+
 fn groupedAudioWorkspaceBytes(ctx: *anyopaque, physical: @import("../../execution/grouped_audio_block.zig").Physical) anyerror!?usize {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     switch (physical) {
@@ -21528,6 +21554,7 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
     };
     const entry = try self.audio_plans.getWithCleanup(base_key, plan_cleanup);
     if (!entry.disabled and entry.owner == null) if (dispatch.workspace) |workspace| {
+        if (workspace.events.len == 0) return null;
         if (self.ctx.prepared_cache_funding) |funding| {
             var lease = funding.take(.{ .audio_learning = .{ .key = base_key, .declared_cold = true } }, .{ .host_scratch_bytes = @sizeOf(plan_mod.Owner) }) catch |err| switch (err) {
                 error.UnpreparedCacheAdmission => return null,
@@ -21543,6 +21570,7 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
             try owner.declare(cache_base, workspace.events, workspace.published_slot);
             _ = try self.audio_plans.publishDeclared(cache_base, owner, plan_cleanup);
         }
+        entry.declaration = .{ .source_key = key, .fingerprint = workspace.fingerprint };
     };
     if (entry.disabled) return null;
     if (entry.owner == null) {
@@ -38803,6 +38831,7 @@ const vtable: ops.ComputeBackend.VTable = .{
             .imagePatches = &preprocessEmbeddingGemma2ImagePatchesOp,
         },
         .audio_execution = .{
+            .cachedWorkspace = &cachedGroupedAudioWorkspace,
             .workspaceBytes = &groupedAudioWorkspaceBytes,
             .execute = &audioExecutionOp,
             .storage = &sourceAudioStorageOp,

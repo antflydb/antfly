@@ -2833,6 +2833,7 @@ pub const ComputeBackend = struct {
     };
 
     pub const AudioExecutionRegion = struct {
+        cachedWorkspace: ?*const fn (ctx: *anyopaque, recipe: @import("../execution/audio_schedule.zig").AudioRecipe) anyerror!?AudioWorkspaceDeclaration = null,
         /// Exact pre-submission scratch bytes, or null for an unsupported schedule.
         workspaceBytes: ?*const fn (ctx: *anyopaque, physical: @import("../execution/grouped_audio_block.zig").Physical) anyerror!?usize = null,
         setControl: ?*const fn (ctx: *anyopaque, control: ?InferenceExecutionControl) ?InferenceExecutionControl = null,

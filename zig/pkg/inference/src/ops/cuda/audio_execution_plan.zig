@@ -178,6 +178,7 @@ pub const Entry = struct {
     warmed: bool = false,
     disabled: bool = false,
     owner: ?*Owner = null,
+    declaration: ?struct { source_key: u64, fingerprint: u64 } = null,
 
     pub fn executableFor(self: *const Entry, bindings: Bindings) ?Owner.Executable {
         const owner = self.owner orelse return null;

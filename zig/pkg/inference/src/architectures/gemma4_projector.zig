@@ -5066,6 +5066,9 @@ const GroupedAudioDeclaration = struct {
             !audio_schedule.supportsCudaGroupedGraph(recipe.count, recipe.context_right)) return null;
         const query = cb.vtable.regions.audio_execution.workspaceBytes orelse return null;
         if (try query(cb.ptr, .admit) == null) return null;
+        if (cb.vtable.regions.audio_execution.cachedWorkspace) |lookup| {
+            if (try lookup(cb.ptr, recipe)) |cached| return cached;
+        }
         var spans: [audio_schedule.GroupedRows.max_clips]usize = undefined;
         const segments = spans[0..recipe.count];
         const rows = try recipe.rowsAndSegments(segments);
