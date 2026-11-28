@@ -63468,14 +63468,13 @@ test "CUDA cold audio declaration dispatches before any learning invocation" {
     const projection = try SourceLinearGeometry.resolve(2, null, 2, 2);
     const publication_bytes = try checkedMul(projection.output_count, @sizeOf(f32));
     const layout = try sourceLinearLayout(compute.ctx.info.compute_major, projection.rows, 2, 2, true, false);
-    const events = [_]@import("../../execution/stream_workspace.zig").Plan.Declaration{
-        .{ .allocate = publication_bytes },
-        .{ .allocate_scratch = layout.bytes },
-        .{ .release = 1 },
-        .{ .allocate = publication_bytes },
-        .{ .release = 0 },
+    const Workspace = ops.ComputeBackend.AudioWorkspaceDeclaration;
+    const steps = [_]Workspace.Step{
+        .{ .output_bytes = publication_bytes, .scratch_bytes = layout.bytes },
+        .{ .output_bytes = publication_bytes, .reads = &.{0} },
     };
-    const workspace = ops.ComputeBackend.AudioWorkspaceDeclaration.init(&events, 2);
+    const workspace = try Workspace.compile(std.testing.allocator, &steps, 1);
+    defer std.testing.allocator.free(workspace.events);
     const bindings = try compute.audioCacheBase(workspace.cacheKey(cold_key), &geometry, null);
     const executes_before = compute.audio_arena_executes;
     const first = (try audioExecutionOp(&compute, cold_key, &inputs, @constCast(&cb), Run.call, .{
@@ -63491,7 +63490,7 @@ test "CUDA cold audio declaration dispatches before any learning invocation" {
     try std.testing.expect(!entry.warmed);
     try std.testing.expect(entry.owner.?.plan.origin == .declared);
     try std.testing.expectEqual(executes_before + 1, compute.audio_arena_executes);
-    const changed = ops.ComputeBackend.AudioWorkspaceDeclaration.init(&events, 0); // released output
+    const changed = ops.ComputeBackend.AudioWorkspaceDeclaration.init(workspace.events, 0); // released output
     try std.testing.expectError(error.InvalidExecutionPlan, audioExecutionOp(&compute, cold_key, &inputs, @constCast(&cb), Run.call, .{ .workspace = changed }));
     try std.testing.expectEqual(executes_before + 1, compute.audio_arena_executes);
     try std.testing.expect(entry.executableFor(bindings) != null);
