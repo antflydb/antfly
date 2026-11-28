@@ -4434,7 +4434,7 @@ pub const CudaCompute = struct {
                     cudaCublasLtEnabled() and self.cublaslt != null
             else
                 false,
-            .final_norm_mirror = cudaRmsNormBf16MirrorEnabled() and cudaCublasLtEnabled() and self.cublaslt != null and self.ctx.info.compute_major >= 8,
+            .final_norm_mirror = rmsNormBf16MirrorSupported(self, descriptor.rows),
         }) catch |err| switch (err) {
             error.InvalidShape, error.Overflow => return .unsupported,
         };
@@ -8254,7 +8254,13 @@ pub const CudaCompute = struct {
     /// a lower bound for the encoder. Decline only when that bound cannot fit.
     fn audioWorkspaceLowerBoundFits(recipe: CacheFunding.AudioRecipe, segments: []const usize, rows: usize, base: AudioCacheBase) !bool {
         if (!base.fitsArena()) return false;
-        if (!recipe.source_bf16) return true;
+        if (!recipe.source_bf16) {
+            // The F32 FFN up projection materializes its widened activation
+            // even when clamping and SiLU are fused into its epilogue.
+            const elements = std.math.mul(usize, rows, recipe.intermediate) catch return false;
+            const bytes = std.math.mul(usize, elements, @sizeOf(f32)) catch return false;
+            return bytes <= AudioPlan.limit - base.input_bytes;
+        }
         const schedule = @import("../../execution/audio_schedule.zig");
         const Source = @import("local_relative_source.zig");
         if (segments.len > schedule.GroupedRows.max_clips) return error.InvalidPreparedAudioRecipe;
@@ -12840,6 +12846,12 @@ fn cudaDeviceMirrorDequantEnabled() bool {
 
 fn cudaRmsNormBf16MirrorEnabled() bool {
     return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_RMS_NORM_BF16_MIRROR", false);
+}
+
+/// Use the same sidecar eligibility for storage planning and dispatch.
+fn rmsNormBf16MirrorSupported(self: *const CudaCompute, rows: usize) bool {
+    return rows > 1 and self.ctx.info.compute_major >= 8 and self.cublaslt != null and
+        self.kernels.rms_norm_f32_bf16 != null and cudaRmsNormBf16MirrorEnabled() and cudaCublasLtEnabled();
 }
 
 const cuda_kv_format_polar4: u32 = 0;
@@ -30410,7 +30422,7 @@ fn rmsNormWithDestination(ctx: *anyopaque, input: CT, weight: CT, dim: usize, ep
         tensorFromCt(result).owns_buffer = destination == null;
         return result;
     }
-    if (geometry.rows > 1 and cudaRmsNormBf16MirrorEnabled() and cudaCublasLtEnabled() and self.ctx.info.compute_major >= 8 and self.cublaslt != null) {
+    if (rmsNormBf16MirrorSupported(self, geometry.rows)) {
         var bf16_mirror = mirror_destination orelse allocDeviceBuffer(self, input_tensor.elem_count * @sizeOf(u16)) catch buffer_mod.DeviceBuffer{};
         if (bf16_mirror.ptr != 0) {
             const launched_mirror = blk: {
@@ -42064,8 +42076,7 @@ fn assignedKernelAuxiliariesOp(ctx: *anyopaque, descriptor: *const ops.kernel_de
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     if (descriptor.operation != .norm or descriptor.operation.norm.kind != .rms) return .{};
     const rows = descriptor.elements() / descriptor.operation.norm.dim;
-    if (rows <= 1 or !cudaRmsNormBf16MirrorEnabled() or !cudaCublasLtEnabled() or
-        self.ctx.info.compute_major < 8 or self.cublaslt == null or self.kernels.rms_norm_f32_bf16 == null) return .{};
+    if (!rmsNormBf16MirrorSupported(self, rows)) return .{};
     var shape = descriptor.output_shape;
     shape.dtype = .bf16;
     var result = ops.kernel_descriptor.AuxiliaryRequirements{};
@@ -61425,6 +61436,15 @@ test "CUDA grouped audio admission rejects an impossible mandatory workspace bef
     recipe.context_right = 0;
     const output = 37 * 1024 * @sizeOf(f32);
     var bindings: CudaCompute.AudioCacheBase = .{ .key = 0, .input_bytes = CudaCompute.AudioPlan.limit - layout.bytes - 4 * output, .output_bytes = output };
+    try std.testing.expect(try CudaCompute.audioWorkspaceLowerBoundFits(recipe, &clips, 37, bindings));
+    bindings.input_bytes += @import("../../execution/stream_workspace.zig").alignment;
+    try std.testing.expect(bindings.fitsArena());
+    try std.testing.expect(!try CudaCompute.audioWorkspaceLowerBoundFits(recipe, &clips, 37, bindings));
+
+    recipe.source_bf16 = false;
+    recipe.intermediate = 4096;
+    const ffn_bytes = 37 * recipe.intermediate * @sizeOf(f32);
+    bindings.input_bytes = CudaCompute.AudioPlan.limit - ffn_bytes;
     try std.testing.expect(try CudaCompute.audioWorkspaceLowerBoundFits(recipe, &clips, 37, bindings));
     bindings.input_bytes += @import("../../execution/stream_workspace.zig").alignment;
     try std.testing.expect(bindings.fitsArena());
