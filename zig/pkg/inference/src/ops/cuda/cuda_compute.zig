@@ -60830,6 +60830,23 @@ test "CUDA audio depthwise cold inventory validates actual floating source layou
     var packed_builder = Cache.Builder{ .storage = &requests };
     try compute.appendAudioCacheWorkload(recipe, &packed_builder);
     try std.testing.expectEqual(@as(usize, 53), packed_builder.len); // 38+3frontend+12QKV
+
+    recipe.chunk = 12;
+    recipe.source_bf16 = true;
+    recipe.graph_allowed = true;
+    recipe.host_ops_empty = true;
+    compute.embedding_gemma2_policy.audio_graph = true;
+    const output_bytes = (try recipe.rows()) * recipe.hidden * @sizeOf(f32);
+    const events = [_]CudaCompute.AudioPlan.Plan.Declaration{.{ .allocate = output_bytes }};
+    recipe.workspace = .{ .events = &events, .published_slot = 0 };
+    var declared_builder = Cache.Builder{ .storage = &requests };
+    try compute.appendAudioCacheWorkload(recipe, &declared_builder);
+    const work = declared_builder.workload().requests;
+    const metadata = work[work.len - 2];
+    const arena_request = work[work.len - 1];
+    try std.testing.expect(metadata.audio_learning.declared_cold);
+    try std.testing.expectEqual(output_bytes, arena_request.arena.sizes[1]);
+    try std.testing.expectEqual(@as(u64, 0), compute.audio_plans.clock);
 }
 
 test "cooperative decode batches preserve quantized routing without changing prefill mirrors" {

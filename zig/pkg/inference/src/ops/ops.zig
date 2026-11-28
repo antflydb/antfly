@@ -5945,6 +5945,7 @@ pub const ComputeBackend = struct {
             .cleanup = cleanup,
             .control = self.execution_control,
             .defer_arena = defer_arena,
+            .workspace = if (geometry) |group| group.recipe.workspace else null,
             .geometry = geometry,
         };
         const result = try self.observeBackendEntry(.audio_execution, op, .{ self.ptr, key, inputs, context, run, dispatch });
