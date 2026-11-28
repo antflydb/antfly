@@ -3036,6 +3036,26 @@ matched eager vectors exactly at each width. Five focused checks also
 passed, including the released BF16 checkpoint and borrowed input
 rejection. F32 still learns its workspace schedule.
 
+The production Spark server at `fca741e4b5` compared eager CUDA and
+the F32 graph policy in one binary with cuDNN unavailable and RMS
+mirrors enabled. All 576 measured HTTP requests matched canonical
+outputs across AA, ABBA and BB, with 32 samples per side per width
+and eight warmups per arm. The two policies each reported a stable,
+distinct model identity. An unrelated CUDA context held 184 MiB
+throughout.
+
+| Clips | Eager p50 / p95 (ms) | Graph policy p50 / p95 (ms) |
+| --- | ---: | ---: |
+| 2 | 21.54 / 22.23 | 19.56 / 19.97 |
+| 3 | 24.03 / 24.75 | 22.53 / 23.33 |
+| 4 | 26.77 / 27.66 | 24.74 / 26.21 |
+
+The paired median improvements ranged from 6.2% to 9.2%. The
+largest same-policy median spread was 0.39 ms. The untimed replay
+witness reported 15 arena executions and six graph replays in
+each of its four processes. These results cover the opt-in
+policy on the tested clip cohorts.
+
 The Spark serving comparison used the prior grouped-audio server
 from `54b7bbb92d` and the compact-input server with declared graphs on
 both. All 576 measured requests completed and matched output hashes
