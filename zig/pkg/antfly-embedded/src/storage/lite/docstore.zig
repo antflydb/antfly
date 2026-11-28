@@ -2925,6 +2925,7 @@ const MutationRequest = struct {
     scope_delete_exact_key: ?[]const u8 = null,
     scope_delete_only: bool = false,
     scope_delete_redo_bytes: ?*const fn (*anyopaque, *const native.NativeFile) usize = null,
+    document_batch: ?*const fn (*anyopaque) []const native.DocumentMutation = null,
     /// Never closes a group by becoming its leader, and never durable on
     /// its own: it joins whichever group a foreground (non-ride-along)
     /// member next forms, or `forceDrainDurable`'s forced group if none
@@ -5735,6 +5736,10 @@ pub const Store = struct {
         scope_delete_exact_key: ?[]const u8 = null,
         scope_delete_only: bool = false,
         scope_delete_redo_bytes: ?*const fn (*anyopaque, *const native.NativeFile) usize = null,
+        /// The document mutations this member writes, when known before it
+        /// applies: lets the leader settle the redo overlay first when the
+        /// group's transaction will cross the large-transaction fallback.
+        document_batch: ?*const fn (*anyopaque) []const native.DocumentMutation = null,
         /// Estimated size of this member's writes. Used only to bound group
         /// formation (`group_max_bytes`); never required to be exact. Also
         /// what `stageRideAlong` tracks against `ride_along_byte_threshold`.
@@ -5938,6 +5943,7 @@ pub const Store = struct {
             .scope_delete_exact_key = plan.scope_delete_exact_key,
             .scope_delete_only = plan.scope_delete_only,
             .scope_delete_redo_bytes = plan.scope_delete_redo_bytes,
+            .document_batch = plan.document_batch,
             .ride_along = ride_along,
             .estimated_bytes = plan.estimated_bytes,
         };
@@ -6508,6 +6514,29 @@ pub const Store = struct {
         self.last_redo_fold_ns = now;
     }
 
+    /// Whether the group's transaction will cross the large-transaction
+    /// fallback while the redo overlay holds an unfolded version of a key it
+    /// writes. Past the fallback its later private batches are written into
+    /// the tree, where such a version would stay the newest and the commit's
+    /// fold would write it back over them. Settled by folding first, as a
+    /// large scope deletion is (`planIndexScopeDeletion`). Members that do
+    /// not expose their documents count by their estimated size.
+    fn groupNeedsFoldFirst(self: *Store, head: *MutationRequest) bool {
+        const redo = if (self.file.redo) |*redo| redo else return false;
+        var bytes: usize = 0;
+        var member: ?*MutationRequest = head;
+        while (member) |item| : (member = item.next) {
+            bytes +|= if (item.document_batch) |batch| native.NativeFile.documentBatchWireBytes(batch(item.context)) else item.estimated_bytes;
+        }
+        if (bytes < redo.large_txn_fallback_bytes) return false;
+        member = head;
+        while (member) |item| : (member = item.next) {
+            const batch = item.document_batch orelse continue;
+            if (self.file.documentBatchHoldsUnfoldedKey(batch(item.context))) return true;
+        }
+        return false;
+    }
+
     /// Enqueue `plan` and return a ticket resolved once its group is durable.
     /// `plan.context` must stay valid until `Ticket.wait` returns: the group
     /// leader (this caller, or another thread already draining the queue)
@@ -7032,6 +7061,7 @@ pub const Store = struct {
                 .fold_first => try self.file.checkpointRedoLog(),
             }
         }
+        if (!artifact_lease_only and self.groupNeedsFoldFirst(head)) try self.file.checkpointRedoLog();
         if (artifact_lease_only) {
             try self.file.beginArtifactLeaseTransaction();
         } else {
@@ -7983,6 +8013,11 @@ pub const Txn = struct {
             return file.indexScopeCompanionRedoBytes(context.mutations, context.index_catalog_mutations);
         }
 
+        fn documentBatch(ptr: *anyopaque) []const native.DocumentMutation {
+            const context: *@This() = @ptrCast(@alignCast(ptr));
+            return context.mutations;
+        }
+
         fn apply(ptr: *anyopaque, file: *native.NativeFile) !void {
             const context: *@This() = @ptrCast(@alignCast(ptr));
             errdefer if (context.queued) |queued| queued.reject(queued.ptr);
@@ -8181,6 +8216,7 @@ pub const Txn = struct {
             .complete = if (context.queued != null) PrimaryCommitContext.complete else null,
             .estimated_bytes = estimated_bytes,
             .scope_delete_redo_bytes = if (self.index_catalog_delete_prefix != null) PrimaryCommitContext.scopeDeleteRedoBytes else null,
+            .document_batch = PrimaryCommitContext.documentBatch,
             .scope_delete_prefix = self.index_catalog_delete_prefix,
         };
         var ride_along_ticket: ?Store.Ticket = null;
@@ -11633,7 +11669,9 @@ test "lite transaction indexed overlay preserves borrowed versions and sorted mu
     try seed.put("c", "disk-c");
     try seed.commit();
     var txn = try store.beginWrite();
-    errdefer txn.abort();
+    // Disarmed by the commit, which ends the transaction.
+    var txn_open = true;
+    errdefer if (txn_open) txn.abort();
     try txn.put("a", "first");
     const borrowed = try txn.get("a");
     var cursor = try txn.openCursor();
@@ -11659,6 +11697,7 @@ test "lite transaction indexed overlay preserves borrowed versions and sorted mu
         try std.testing.expect(values[3] == null and values[4] == null);
     }
     try std.testing.expectEqual(@as(usize, 4098), txn.pending_count);
+    txn_open = false;
     try txn.commit();
     var read = try store.beginRead();
     defer read.abort();
@@ -11668,6 +11707,47 @@ test "lite transaction indexed overlay preserves borrowed versions and sorted mu
     try std.testing.expectEqualStrings("final", values[0].?);
     for (values[1..5]) |value| try std.testing.expectEqualStrings("value", value.?);
     try std.testing.expect(values[5] == null and values[6] == null);
+}
+
+// A transaction large enough to write the document tree directly still
+// deletes and overwrites keys whose current versions are only in the redo
+// overlay, as a small one staged key by key does, and as either does once
+// those versions are folded.
+test "lite large transaction supersedes versions still only in the redo overlay" {
+    const alloc = std.testing.allocator;
+    for ([_]usize{ 1000, 4096 }) |puts| for ([_]bool{ false, true }) |fold_seed| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try testPath(alloc, tmp, "large-supersede.aflite");
+        defer alloc.free(path);
+        var store = try Store.createWithOptions(alloc, path, .{ .no_sync = true, .io = std.testing.io });
+        defer store.close();
+        var seed = try store.beginWrite();
+        try seed.put("a", "disk-a");
+        try seed.put("c", "disk-c");
+        try seed.commit();
+        if (fold_seed) try store.checkpointRedoLog();
+        var txn = try store.beginWrite();
+        var txn_open = true;
+        errdefer if (txn_open) txn.abort();
+        for (0..puts) |i| {
+            var buf: [32]u8 = undefined;
+            try txn.put(try std.fmt.bufPrint(&buf, "b{d:0>6}", .{i}), "value");
+        }
+        try txn.put("a", "final");
+        try txn.delete("c");
+        txn_open = false;
+        try txn.commit();
+        // Once as committed, and again after everything is folded.
+        for (0..2) |pass| {
+            if (pass == 1) try store.checkpointRedoLog();
+            var read = try store.beginRead();
+            defer read.abort();
+            errdefer std.debug.print("puts={d} folded seed={} pass={d}\n", .{ puts, fold_seed, pass });
+            try std.testing.expectError(error.NotFound, read.get("c"));
+            try std.testing.expectEqualStrings("final", try read.get("a"));
+        }
+    };
 }
 
 test "lite online vacuum retires generations without waiting for pinned readers" {

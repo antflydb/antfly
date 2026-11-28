@@ -3587,7 +3587,7 @@ const IndexEditor = struct {
         previous: ?*Node = null,
         next: ?*Node = null,
         sealed_before: usize = 0,
-        compact_at: usize = 128 * 1024,
+        compact_at: usize = node_compact_floor,
         page: u64 = 0,
         original_page: u64 = 0,
         dirty: bool = true,
@@ -3678,6 +3678,14 @@ const IndexEditor = struct {
 
     // A repeatedly merged node must not accumulate dead arena allocations for
     // the entire batch. Repack geometrically, preserving child ownership.
+    /// A streaming node's arena keeps every key it ever retained, separators
+    /// replaced by rebalancing included, until compaction copies out the live
+    /// ones. It runs once waste is three times the live bytes, so its cost is
+    /// amortized per retained byte; this floor only skips tiny arenas. A
+    /// larger floor let each frontier node carry that much dead key bytes
+    /// through a long deletion, whatever its live size.
+    const node_compact_floor = 16 * 1024;
+
     fn compactNode(self: *IndexEditor, node: *Node) !void {
         const arena = if (node.arena) |*value| value else return;
         const capacity = arena.queryCapacity();
@@ -3698,7 +3706,7 @@ const IndexEditor = struct {
         node.arena = fresh.arena;
         node.keys = fresh.keys;
         node.links = fresh.links;
-        node.compact_at = @max(128 * 1024, node.arena.?.queryCapacity() * 2);
+        node.compact_at = @max(node_compact_floor, node.arena.?.queryCapacity() * 2);
     }
 
     fn advance(self: *IndexEditor, key: []const u8) !void {
@@ -14913,6 +14921,29 @@ pub const NativeFile = struct {
 
     /// A keys-only preflight with the same byte threshold used by private
     /// flushes. Caller holds writer admission and the store mutation mutex.
+    /// The logical redo bytes a document batch would log if diverted: what
+    /// `RedoCommitState.overLargeTransactionThreshold` measures.
+    pub fn documentBatchWireBytes(mutations: []const DocumentMutation) usize {
+        var bytes: usize = 0;
+        for (mutations) |m| {
+            const external = m.external_value_root_page != 0;
+            bytes +|= logicalMutationWireBytes(m.key.len, if (external or m.is_delete) 0 else m.value.len, external);
+        }
+        return bytes;
+    }
+
+    /// Whether the redo overlay holds a version of one of `mutations`' keys
+    /// that the tree does not. A transaction past the large-transaction
+    /// fallback writes its later private batches into the tree, where such a
+    /// version would stay the newest and its commit's fold would write it
+    /// back (a delete undone, an overwrite reverted). The caller folds before
+    /// the transaction, as for a large scope deletion
+    /// (`planIndexScopeDeletion`).
+    pub fn documentBatchHoldsUnfoldedKey(self: *NativeFile, mutations: []const DocumentMutation) bool {
+        const redo = if (self.redo) |*redo| redo else return false;
+        return redo.shared.holdsUnfoldedKey(self.runtimeIo(), @backingInt(TransactionWrites.Root.documents), DocumentMutation, mutations, self.activeCheckpoint().redo_folded_through);
+    }
+
     pub fn planIndexScopeDeletion(self: *NativeFile, prefix: []const u8, exact_key: ?[]const u8, other_bytes: usize, probe_hooks: ?SyncLockHooks) !IndexScopeDeletion {
         if (self.checkpoint_publication_uncertain) try self.reconcilePublicationUncertainty();
         try self.refreshIfWriterBaseStale(true);

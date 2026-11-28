@@ -1026,6 +1026,20 @@ pub const SharedRedoOverlay = struct {
     /// for `root` (a key count, not a version count -- matches
     /// `std.HashMap.count`'s own meaning). Used by `check()`'s
     /// `record_count` accounting; see `NativeFile.redoOverlayEntryCount`.
+    /// Whether any of `items`' keys has a version under `root` newer than
+    /// `fold_floor`: one the tree does not hold yet.
+    pub fn holdsUnfoldedKey(self: *SharedRedoOverlay, io: std.Io, root: u8, comptime T: type, items: []const T, fold_floor: u64) bool {
+        std.debug.assert(root < 3);
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        if (self.maps[root].count() == 0) return false;
+        for (items) |item| {
+            const head = self.maps[root].get(item.key) orelse continue;
+            if (head.sequence > fold_floor) return true;
+        }
+        return false;
+    }
+
     pub fn count(self: *SharedRedoOverlay, io: std.Io, root: u8) usize {
         std.debug.assert(root < 3);
         self.mutex.lockUncancelable(io);

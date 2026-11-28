@@ -107,6 +107,7 @@ class TestRunnerSelection(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("1 passed", result.stderr)
+        traced = {**os.environ, "ANTFLY_TEST_ALLOC_TRACES": "1"}
         for name, diagnostic in (
             ("diagnostic assertion failure", "FAIL"),
             ("diagnostic memory leak", "1 leaked"),
@@ -116,10 +117,23 @@ class TestRunnerSelection(unittest.TestCase):
                 text=True,
                 capture_output=True,
                 timeout=15,
+                env=traced,
             )
             self.assertNotEqual(result.returncode, 0, result.stderr)
             self.assertIn(diagnostic, result.stderr)
             self.assertIn("selection.zig", result.stderr)
+        # Without the option a leak still fails, naming how to get its trace.
+        untraced = {k: v for k, v in os.environ.items() if k not in ("ANTFLY_TEST_ALLOC_TRACES", "ANTFLY_TEST_DEEP_ALLOC_TRACES")}
+        result = subprocess.run(
+            [str(self.binary), "--test-filter", "diagnostic memory leak"],
+            text=True,
+            capture_output=True,
+            timeout=15,
+            env=untraced,
+        )
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertIn("1 leaked", result.stderr)
+        self.assertIn("ANTFLY_TEST_ALLOC_TRACES=1", result.stderr)
 
     def test_required_execution_rejects_skips_but_inventory_still_lists(self):
         for required, owner, expected in (

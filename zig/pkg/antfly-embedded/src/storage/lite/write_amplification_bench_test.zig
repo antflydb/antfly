@@ -91,16 +91,6 @@ const algebraic_overwrite_key_cycle: usize = 8;
 var counted_vtable: std.Io.VTable = undefined;
 var counted_vtable_ready = std.atomic.Value(bool).init(false);
 
-/// The harness allocator: leak-checked like `std.testing.allocator`, but
-/// without its stack trace per allocation, whose unwinding dominated these
-/// write loops in Debug.
-const HarnessAllocator = std.heap.DebugAllocator(.{ .stack_trace_frames = 0 });
-
-/// A leak fails the run (`deinit` has already logged what leaked).
-fn checkHarness(harness: *HarnessAllocator) void {
-    if (harness.deinit() == .leak) @panic("write amplification harness leaked memory");
-}
-
 /// These harnesses gate on counts (syncs, commits and bytes per write), not
 /// on how long a barrier takes, so a barrier is counted and not performed:
 /// the commit path is unchanged, only the syscall is skipped. Set
@@ -1810,9 +1800,7 @@ const ReportJson = struct {
 };
 
 test "lite write amplification report" {
-    var harness: HarnessAllocator = .init;
-    defer checkHarness(&harness);
-    const alloc = harness.allocator();
+    const alloc = std.testing.allocator;
     const updates = default_updates;
 
     const primary = try measureSingleWriter(alloc, "lite-write-amp-primary", false, updates);
@@ -1961,9 +1949,7 @@ test "lite write amplification report" {
 // as the "indexed" and "dense-vector-visible" modes in the main report.
 test "lite write amplification diagnostic: dense vector mode alone" {
     if (!reportsRequested()) return error.SkipZigTest;
-    var harness: HarnessAllocator = .init;
-    defer checkHarness(&harness);
-    const alloc = harness.allocator();
+    const alloc = std.testing.allocator;
     const dense = try measureSingleWriterVector(alloc, "lite-write-amp-diag-dense-alone", false, default_updates);
     printStageTable("diagnostic: dense-vector-visible alone", dense);
 }
@@ -1976,9 +1962,7 @@ test "lite write amplification diagnostic: dense vector mode alone" {
 // above) just as readily.
 test "lite write amplification diagnostic: full text then dense vector mode" {
     if (!reportsRequested()) return error.SkipZigTest;
-    var harness: HarnessAllocator = .init;
-    defer checkHarness(&harness);
-    const alloc = harness.allocator();
+    const alloc = std.testing.allocator;
     const indexed = try measureSingleWriter(alloc, "lite-write-amp-diag-indexed-first", true, default_updates);
     printStageTable("diagnostic: full-text-visible (indexed)", indexed);
     const dense = try measureSingleWriterVector(alloc, "lite-write-amp-diag-dense-after-indexed", false, default_updates);
@@ -1993,9 +1977,7 @@ test "lite write amplification diagnostic: full text then dense vector mode" {
 // reproduce, or reproduces already in the two simpler diagnostics above.
 test "lite write amplification diagnostic: full mode lineup plus dense concurrent" {
     if (!reportsRequested()) return error.SkipZigTest;
-    var harness: HarnessAllocator = .init;
-    defer checkHarness(&harness);
-    const alloc = harness.allocator();
+    const alloc = std.testing.allocator;
     const updates = default_updates;
     const primary = try measureSingleWriter(alloc, "lite-write-amp-diag2-primary", false, updates);
     printStageTable("diagnostic2: primary-only", primary);
@@ -2017,9 +1999,7 @@ test "lite write amplification diagnostic: full mode lineup plus dense concurren
 // this test never touches a dense (or sparse) index at all.
 test "lite write amplification diagnostic: primary then indexed then graph only" {
     if (!reportsRequested()) return error.SkipZigTest;
-    var harness: HarnessAllocator = .init;
-    defer checkHarness(&harness);
-    const alloc = harness.allocator();
+    const alloc = std.testing.allocator;
     const updates = default_updates;
     const primary = try measureSingleWriter(alloc, "lite-write-amp-diag3-primary", false, updates);
     printStageTable("diagnostic3: primary-only", primary);
@@ -2099,9 +2079,7 @@ fn measureSingleWriterEnrichment(alloc: std.mem.Allocator, comptime name: []cons
 
 test "lite write amplification: TTL-scheduled document writes" {
     if (!reportsRequested()) return error.SkipZigTest;
-    var harness: HarnessAllocator = .init;
-    defer checkHarness(&harness);
-    const alloc = harness.allocator();
+    const alloc = std.testing.allocator;
     const ttl = try measureSingleWriterTtl(alloc, "lite-write-amp-ttl", default_updates);
     printStageTable("TTL-scheduled (sync_level write)", ttl);
     const json_text = try std.json.Stringify.valueAlloc(alloc, modeJson(ttl), .{ .whitespace = .indent_2 });
@@ -2111,9 +2089,7 @@ test "lite write amplification: TTL-scheduled document writes" {
 
 test "lite write amplification: enrichment-backed index with a deterministic copy producer" {
     if (!reportsRequested()) return error.SkipZigTest;
-    var harness: HarnessAllocator = .init;
-    defer checkHarness(&harness);
-    const alloc = harness.allocator();
+    const alloc = std.testing.allocator;
     const enrichment = try measureSingleWriterEnrichment(alloc, "lite-write-amp-enrichment", default_updates);
     printStageTable("enrichment-backed (deterministic copy producer, drained via runUntilIdle)", enrichment);
     const json_text = try std.json.Stringify.valueAlloc(alloc, modeJson(enrichment), .{ .whitespace = .indent_2 });
@@ -2153,9 +2129,7 @@ test "lite write amplification: enrichment-backed index with a deterministic cop
 // commit protocol), which is `native.zig` commit/manifest territory, out
 // of WS4's scope.
 test "lite write amplification report: full_text sync level (WS4 phase 2 round 2)" {
-    var harness: HarnessAllocator = .init;
-    defer checkHarness(&harness);
-    const alloc = harness.allocator();
+    const alloc = std.testing.allocator;
     const updates = default_updates;
 
     const full_text = try measureSingleWriterWithSyncLevel(alloc, "lite-write-amp-fulltext", true, "full_text", updates);
@@ -2185,9 +2159,7 @@ test "lite write amplification report: full_text sync level (WS4 phase 2 round 2
 // might if some other change shifted the ratio without reintroducing a
 // literal alternation.
 test "lite write amplification: full_text inline fast path engages every write in steady state" {
-    var harness: HarnessAllocator = .init;
-    defer checkHarness(&harness);
-    const alloc = harness.allocator();
+    const alloc = std.testing.allocator;
     const updates: usize = 20;
 
     const full_text = try measureSingleWriterWithSyncLevel(alloc, "lite-write-amp-fulltext-steady", true, "full_text", updates);
@@ -2217,9 +2189,7 @@ test "lite write amplification: full_text inline fast path engages every write i
 // after it the same ~1.03 commits/write steady state as the `full_text`
 // sync-level test above.
 test "lite write amplification report: full_index with text index (sparse-text-inline round 1)" {
-    var harness: HarnessAllocator = .init;
-    defer checkHarness(&harness);
-    const alloc = harness.allocator();
+    const alloc = std.testing.allocator;
     const updates = default_updates;
 
     const indexed = try measureSingleWriter(alloc, "lite-write-amp-fullindex-text", true, updates);
@@ -2247,9 +2217,7 @@ test "lite write amplification report: full_index with text index (sparse-text-i
 // the writer lease its waiting producer holds instead of timing out.
 test "lite write amplification: inline full-text writes stay within the merge runtime's pending segments" {
     if (@import("builtin").single_threaded) return error.SkipZigTest;
-    var harness: HarnessAllocator = .init;
-    defer checkHarness(&harness);
-    const alloc = harness.allocator();
+    const alloc = std.testing.allocator;
     var fixture = try Fixture.open(alloc, "lite-inline-text-merge-bound", .full_text);
     defer fixture.close();
     const max_pending_segments = 6;
@@ -2296,9 +2264,7 @@ test "lite write amplification: inline full-text writes stay within the merge ru
 // own `sync_targets.all_indexes` filter, which the `.full_text` steady-
 // state test above cannot see since it never takes that branch.
 test "lite write amplification: full_index text inline fast path engages every write in steady state" {
-    var harness: HarnessAllocator = .init;
-    defer checkHarness(&harness);
-    const alloc = harness.allocator();
+    const alloc = std.testing.allocator;
     const updates: usize = 20;
 
     const indexed = try measureSingleWriter(alloc, "lite-write-amp-fullindex-text-steady", true, updates);
@@ -2318,9 +2284,7 @@ test "lite write amplification: full_index text inline fast path engages every w
 // -- only for this write's OWN synchronous ack). Not chased here; see the
 // handback notes.
 test "lite write amplification report: sparse_vector with inline publication (sparse-text-inline round 2)" {
-    var harness: HarnessAllocator = .init;
-    defer checkHarness(&harness);
-    const alloc = harness.allocator();
+    const alloc = std.testing.allocator;
     const updates = default_updates;
 
     const sparse = try measureSingleWriterVector(alloc, "lite-write-amp-sparse-inline", true, updates);
@@ -2344,9 +2308,7 @@ test "lite write amplification report: sparse_vector with inline publication (sp
 // filtered-name comparison, or a counter left mutated between prepare and
 // install/abort) reappearing on the sparse branch specifically.
 test "lite write amplification: sparse_vector inline fast path engages every write in steady state" {
-    var harness: HarnessAllocator = .init;
-    defer checkHarness(&harness);
-    const alloc = harness.allocator();
+    const alloc = std.testing.allocator;
     const updates: usize = 20;
 
     const sparse = try measureSingleWriterVector(alloc, "lite-write-amp-sparse-inline-steady", true, updates);
@@ -2362,9 +2324,7 @@ test "lite write amplification: sparse_vector inline fast path engages every wri
 // commit_participant to the SAME transaction, and the other's presence
 // must never push either one onto its own slower, separate-commit path.
 test "lite write amplification: mixed text+sparse write engages both inline fast paths in one commit" {
-    var harness: HarnessAllocator = .init;
-    defer checkHarness(&harness);
-    const alloc = harness.allocator();
+    const alloc = std.testing.allocator;
     const updates = default_updates;
 
     var fixture = try Fixture.open(alloc, "lite-write-amp-mixed-text-sparse", .full_text);
@@ -2411,9 +2371,7 @@ test "lite write amplification: mixed text+sparse write engages both inline fast
 // per mode isolates each concern's own cost, exactly like the graph/dense/
 // sparse sections above isolate theirs.
 test "lite write amplification report: relational write surface" {
-    var harness: HarnessAllocator = .init;
-    defer checkHarness(&harness);
-    const alloc = harness.allocator();
+    const alloc = std.testing.allocator;
     const updates = default_updates;
 
     const secondary_index = try measureSingleWriterRelational(alloc, "lite-write-amp-rel-secondary", .secondary_index, updates);
@@ -2556,9 +2514,7 @@ const race_writers: usize = 8;
 // single-store fast path. Exactly one must win; the rest must see a
 // conflict, never a silently-dropped write or a duplicate committed row.
 test "lite write amplification concurrency: concurrent conflicting UNIQUE inserts, exactly one wins" {
-    var harness: HarnessAllocator = .init;
-    defer checkHarness(&harness);
-    const alloc = harness.allocator();
+    const alloc = std.testing.allocator;
     var fixture = try openRelationalFixture(alloc, "lite-write-amp-rel-unique-race", .unique_index);
     defer fixture.close();
 
@@ -2602,9 +2558,7 @@ test "lite write amplification concurrency: concurrent conflicting UNIQUE insert
 // durable without its parent foreign-key check holding, concurrently or
 // otherwise.
 test "lite write amplification concurrency: concurrent FK child inserts against a missing parent all fail" {
-    var harness: HarnessAllocator = .init;
-    defer checkHarness(&harness);
-    const alloc = harness.allocator();
+    const alloc = std.testing.allocator;
     var fixture = try openRelationalFixture(alloc, "lite-write-amp-rel-fk-race", .foreign_key);
     defer fixture.close();
     const missing_parent: usize = relational_fk_parent_cardinality + 1000;
@@ -2655,9 +2609,7 @@ test "lite write amplification concurrency: concurrent FK child inserts against 
 // deleted may never leave a live child row still referencing it,
 // regardless of how the two kinds of operations interleaved.
 test "lite write amplification concurrency: parent DELETE races child INSERT, no orphan and no lost reject" {
-    var harness: HarnessAllocator = .init;
-    defer checkHarness(&harness);
-    const alloc = harness.allocator();
+    const alloc = std.testing.allocator;
     var fixture = try openRelationalFixture(alloc, "lite-write-amp-rel-fk-parent-race", .foreign_key);
     defer fixture.close();
     const parent_id: usize = 0;
@@ -2738,9 +2690,7 @@ test "lite write amplification concurrency: parent DELETE races child INSERT, no
 // path's direct `core.apply_mutex` locking (ascending `table_id`) and the
 // two-phase path's own lock acquisition.
 test "lite write amplification concurrency: mutual FK tables, concurrent writers in both directions complete without deadlock" {
-    var harness: HarnessAllocator = .init;
-    defer checkHarness(&harness);
-    const alloc = harness.allocator();
+    const alloc = std.testing.allocator;
     var fixture = try Fixture.open(alloc, "lite-write-amp-rel-fk-mutual", .primary_only);
     defer fixture.close();
 
