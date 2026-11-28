@@ -3380,6 +3380,15 @@ before the first completed replay. The cleanup change passed the
 ownership fixture, while wide replay under profiled chunking remains
 unqualified.
 
+The graph owner now applies the same dependency check to managed
+cleanup and the remaining raw release callbacks. Spark passed all 13
+focused checks without skips. The physical fixture kept a parked and
+restored graph replayable while unrelated sequence and recurrent
+addresses were released. Releasing a referenced sequence retired it.
+Released LightOnOCR-3-0.8B replayed a declared two-row graph with zero
+workspace events. The change was qualified for custody and released
+output behavior. Wide throughput and dependent page churn remain open.
+
 The M4 Max focused cohort at `061f213135` passed all seven checks
 with zero skips. It exercised the shared installed Whisper Small
 checkpoint with the Metal backend required, verified assigned packed

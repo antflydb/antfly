@@ -877,17 +877,32 @@ pub const Module = struct {
             .arena_quota = self.arena_quota,
         };
     }
+    pub const Dependency = union(enum) { recurrent: u64, sequence: u64 };
+
     pub fn invalidate(self: *Module, ctx: *context.CudaContext) void {
+        self.invalidateMatching(ctx, null);
+    }
+
+    pub fn invalidateMatching(self: *Module, ctx: *context.CudaContext, dependency: ?Dependency) void {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
         defer self.mutex.unlock();
+        if (!self.retirementPending() or !self.references(dependency)) return;
         self.clear(ctx) catch @import("antfly_platform").inference_process_supervisor.restartWorker();
     }
-    /// Production keys include the recurrent address of every bound layer.
-    /// A matching word elsewhere in a key can only cause conservative retirement.
+
+    pub fn references(self: *const Module, dependency: ?Dependency) bool {
+        return if (dependency) |value| switch (value) {
+            .recurrent => |address| self.referencesRecurrentAddress(address),
+            .sequence => |sequence| self.referencesSequence(sequence),
+        } else true;
+    }
+
     pub fn referencesSequence(self: *const Module, sequence: u64) bool {
         return self.sequence_count == 0 or std.mem.indexOfScalar(u64, self.sequences[0..self.sequence_count], sequence) != null;
     }
 
+    /// Production keys include the recurrent address of every bound layer.
+    /// A matching word elsewhere in a key can only cause conservative retirement.
     pub fn referencesRecurrentAddress(self: *const Module, address: u64) bool {
         return self.sequence_count == 0 or (address != 0 and std.mem.indexOfScalar(u64, self.key, address) != null);
     }

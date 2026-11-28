@@ -4107,7 +4107,7 @@ pub const CudaCompute = struct {
         return invalidateLightOnDecodeGraphMatching(cb, current, reason, null);
     }
 
-    fn invalidateLightOnDecodeGraphMatching(cb: *const ops.ComputeBackend, current: CacheCleanup, reason: GraphRetirement, dependency: ?union(enum) { recurrent: u64, sequence: u64 }) !void {
+    fn invalidateLightOnDecodeGraphMatching(cb: *const ops.ComputeBackend, current: CacheCleanup, reason: GraphRetirement, dependency: ?@import("bounded_decode_graph.zig").Module.Dependency) !void {
         if (!acceptsPhysicalImplementation(cb.vtable)) return error.UnsupportedReaderEpochBackend;
         const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
         if (!self.lighton_decode_graph_enabled and self.bounded_decode_graph.metadata.ptr == 0 and self.bounded_decode_graph.arena.ptr == 0 and self.bounded_decode_graph.head.ptr == 0 and self.bounded_decode_graph.graph == null and self.bounded_decode_graph.pending_graph == null) return;
@@ -4121,11 +4121,7 @@ pub const CudaCompute = struct {
         if (!self.bounded_decode_graph.mutex.tryLock()) return error.ReaderEpochBackendBusy;
         defer self.bounded_decode_graph.mutex.unlock();
         const owner = &self.bounded_decode_graph;
-        if (!owner.retirementPending()) return;
-        if (dependency) |value| switch (value) {
-            .recurrent => |address| if (!owner.referencesRecurrentAddress(address)) return,
-            .sequence => |sequence| if (!owner.referencesSequence(sequence)) return,
-        };
+        if (!owner.retirementPending() or !owner.references(dependency)) return;
         if (owner.phase != .disabled and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
             std.debug.print("LIGHTONOCR3 cuda_model_graph_retired reason={s} phase={s} epoch={d} rows={d} progress={d}\n", .{
                 @tagName(reason), @tagName(owner.phase), owner.epoch_id, owner.rows, owner.progress,
@@ -12171,7 +12167,7 @@ const CudaKvDeviceStorage = struct {
 
     fn releaseSequence(ctx: *anyopaque, sequence_id: kv_storage_runtime.SequenceId) void {
         const self: *CudaKvDeviceStorage = @ptrCast(@alignCast(ctx));
-        if (self.compute.lighton_decode_graph_enabled) self.compute.bounded_decode_graph.invalidate(&self.compute.ctx);
+        if (self.compute.lighton_decode_graph_enabled) self.compute.bounded_decode_graph.invalidateMatching(&self.compute.ctx, .{ .sequence = sequence_id });
         self.releaseSequenceStorage(sequence_id);
     }
 
@@ -12180,10 +12176,8 @@ const CudaKvDeviceStorage = struct {
         const backend = self.compute.computeBackend();
         if (current.boundary != null or current.outside_execution) {
             try CudaCompute.invalidateLightOnDecodeGraphMatching(&backend, current, .page_state_cleanup, .{ .sequence = sequence_id });
-        } else if (self.compute.lighton_decode_graph_enabled) {
-            self.compute.bounded_decode_graph.invalidate(&self.compute.ctx);
-        }
-        self.releaseSequenceStorage(sequence_id);
+            self.releaseSequenceStorage(sequence_id);
+        } else releaseSequence(ctx, sequence_id);
     }
 
     fn releaseSequenceStorage(self: *CudaKvDeviceStorage, sequence_id: kv_storage_runtime.SequenceId) void {
@@ -18606,7 +18600,7 @@ fn prepareLightOnStateReleaseWithCleanup(context: *anyopaque, state: *const @imp
     if (current.boundary != null or current.outside_execution) {
         try CudaCompute.invalidateLightOnDecodeGraphMatching(&backend, current, .state_mutation, .{ .recurrent = state.recurrent.ptr });
     } else if (self.lighton_decode_graph_enabled) {
-        self.bounded_decode_graph.invalidate(&self.ctx);
+        self.bounded_decode_graph.invalidateMatching(&self.ctx, .{ .recurrent = state.recurrent.ptr });
     }
 }
 fn recycleLightOnStateBufferWithCleanup(context: *anyopaque, buffer: *buffer_mod.DeviceBuffer, recycle: bool, current: CacheCleanup) !void {
@@ -59411,6 +59405,8 @@ test "captured graph prefunded nonempty program and learned workspace replay aft
     try std.testing.expectEqual(workspace_pointer, compute.cublaslt_workspace_scratch.buffer.ptr);
     try std.testing.expect(compute.run_budget == &budget);
     try std.testing.expectEqualDeep(exact_owned, domain.controller.snapshot());
+    owner.invalidateMatching(&compute.ctx, .{ .sequence = 9 });
+    owner.invalidateMatching(&compute.ctx, .{ .recurrent = 0x7000 });
     try CudaCompute.invalidateLightOnDecodeGraphMatching(&raw, .{ .boundary = &epoch }, .page_state_cleanup, .{ .sequence = 9 });
     try CudaCompute.invalidateLightOnDecodeGraphMatching(&raw, .{ .boundary = &epoch }, .state_mutation, .{ .recurrent = 0x7000 });
     try std.testing.expectEqual(graph_pointer, owner.graph);
