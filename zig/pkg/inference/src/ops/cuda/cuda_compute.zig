@@ -29995,6 +29995,36 @@ pub fn tryCapturedSplitQueryGate(cb: *const ops.ComputeBackend, input: CT, rows:
     return .{ query.intoTensor(), gate.intoTensor() };
 }
 
+/// Both the attention result and its gate are exclusive to this epilogue.
+pub fn tryCapturedAttentionGate(cb: *const ops.ComputeBackend, attention: CT, gate: CT, activated: bool) !bool {
+    if (!acceptsPhysicalImplementation(cb.vtable)) return false;
+    const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
+    const owner = &self.bounded_decode_graph;
+    if (!owner.active or self.capability_profile != .lightonocr3 or self.gliner_bf16_reference) return false;
+    const layout = owner.storage_layout orelse return error.InvalidExecutionPlan;
+    if (layout.attention_output == null or layout.attention_inputs == null) return false;
+    const result = tensorFromCt(attention);
+    const multiplier = tensorFromCt(gate);
+    if (result.dtype != .f32 or multiplier.dtype != .f32 or result.strict_resident_training or multiplier.strict_resident_training or
+        result.bf16_mirror.ptr != 0 or multiplier.bf16_mirror.ptr != 0 or !sameShape(result.shape, multiplier.shape) or
+        result.elem_count != multiplier.elem_count or owner.rows == 0 or result.elem_count % owner.rows != 0) return false;
+    const bytes = try checkedMul(result.elem_count, @sizeOf(f32));
+    const output = try owner.bindLayerOutput(.attention, owner.rows, result.elem_count / owner.rows);
+    const gate_slots = (try owner.bindSplitQueryGate(bytes)) orelse return false;
+    const gate_storage = gate_slots[1];
+    if (result.buffer.ptr != output.ptr or result.buffer.len != output.len or
+        multiplier.buffer.ptr != gate_storage.ptr or multiplier.buffer.len != gate_storage.len or
+        kernel_geometry.byteRangesOverlap(output.ptr, output.len, gate_storage.ptr, gate_storage.len)) return false;
+
+    if (!activated) {
+        try self.kernels.launchElementwiseF32(&self.ctx, gate_storage, gate_storage, .{}, result.elem_count, .sigmoid);
+        self.stats.launch_elementwise += 1;
+    }
+    try self.kernels.launchElementwiseF32(&self.ctx, output, output, gate_storage, result.elem_count, .multiply);
+    self.stats.launch_elementwise += 1;
+    return true;
+}
+
 pub fn tryCapturedQkvProjection(cb: *const ops.ComputeBackend, input: CT, weight: CT, rows: usize, in_dim: usize, out_dim: usize, kind: @import("bounded_decode_graph.zig").Module.AttentionProjection) !?CT {
     if (!acceptsPhysicalImplementation(cb.vtable)) return null;
     const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
@@ -48205,13 +48235,40 @@ test "LightOnOCR3 CUDA graph warm input and wide head write their assigned buffe
             defer a.free(actual_values);
             try std.testing.expectEqualSlices(f32, values, actual_values);
         }
+
+        owner.storage_layout.?.attention_output = .{ .offset = norm_offset, .bytes = norm_bytes };
+        defer owner.storage_layout.?.attention_output = null;
+        const output_buffer = try owner.bindLayerOutput(.attention, 3, 2);
+        const output = try compute.allocLightOnF32Tensor(3, 2, output_buffer);
+        defer cb.free(output);
+        try copyFromDeviceTracked(&compute, output_buffer, tensorFromCt(k).buffer, norm_bytes);
+        const sigmoid_gate = try cb.sigmoid(q_and_gate[1]);
+        defer cb.free(sigmoid_gate);
+        const ordinary_gated = try cb.multiply(k, sigmoid_gate);
+        defer cb.free(ordinary_gated);
+        const ordinary_gated_values = try cb.toFloat32(ordinary_gated, a);
+        defer a.free(ordinary_gated_values);
+        const before_gate = compute.stats.device_alloc_calls;
+        try std.testing.expect(!try tryCapturedAttentionGate(&cb, k, q_and_gate[1], false));
+        try std.testing.expect(try tryCapturedAttentionGate(&cb, output, q_and_gate[1], false));
+        const gated_values = try cb.toFloat32(output, a);
+        defer a.free(gated_values);
+        try std.testing.expectEqualSlices(f32, ordinary_gated_values, gated_values);
+        try copyFromDeviceTracked(&compute, output_buffer, tensorFromCt(k).buffer, norm_bytes);
+        try std.testing.expect(try tryCapturedAttentionGate(&cb, output, q_and_gate[1], true));
+        const prepared_values = try cb.toFloat32(output, a);
+        defer a.free(prepared_values);
+        try std.testing.expectEqualSlices(f32, ordinary_gated_values, prepared_values);
+        try std.testing.expectEqual(before_gate, compute.stats.device_alloc_calls);
     }
 
     {
         // The preceding attention layer released its projections before this layer.
+        owner.storage_layout.?.metadata_bytes = metadata.len;
         owner.storage_layout.?.input_projections = .{ .offset = projection_offset, .bytes = 4 * norm_bytes };
         owner.storage_layout.?.recurrent_projection_bytes = @splat(norm_bytes);
         defer {
+            owner.storage_layout.?.metadata_bytes = layout.metadata_bytes;
             owner.storage_layout.?.input_projections = null;
             owner.storage_layout.?.recurrent_projection_bytes = @splat(0);
         }

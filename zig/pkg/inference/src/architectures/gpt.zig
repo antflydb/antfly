@@ -7529,6 +7529,9 @@ fn decoderBlockImpl(
         try maybeDumpGatedLayerStageStats(cb, allocator, layer, "attn-raw", attn_out, num_heads * head_dim);
         const gated_attn_out = if (q_gate) |gate| blk_gate: {
             try maybeDumpGatedLayerStageStats(cb, allocator, layer, "gate", gate, num_heads * head_dim);
+            if (comptime build_options.enable_cuda) {
+                if (try @import("../ops/cuda/cuda_compute.zig").tryCapturedAttentionGate(cb, attn_out, gate, projected.gate_sigmoid)) break :blk_gate attn_out;
+            }
             const sigmoid_gate = if (projected.gate_sigmoid) gate else try cb.sigmoid(gate);
             defer if (sigmoid_gate != gate) freeTensorWithCleanup(cb, sigmoid_gate, raw_overrides.cleanup);
             break :blk_gate try cb.multiply(attn_out, sigmoid_gate);
