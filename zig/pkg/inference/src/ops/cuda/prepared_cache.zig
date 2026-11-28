@@ -1546,7 +1546,17 @@ fn qualifyAudioMetadataRetirement(comptime adopt_warm_plan: bool) !void {
         try std.testing.expect(raw.plan.finish(0x1000));
         try token.fundAudioLearning(raw);
         break :warm raw;
-    } else try token.publishAudioLearning();
+    } else declared: {
+        const bindings: plan_mod.Bindings = .{ .key = 93, .input_bytes = 256, .output_bytes = 256 };
+        const events: []const plan_mod.Plan.Declaration = &.{.{ .allocate = 256 }};
+        var mismatched = bindings;
+        mismatched.key += 1;
+        try std.testing.expectError(error.InvalidPreparedCacheState, token.publishAudioDeclaration(mismatched, events, 0));
+        try std.testing.expectError(error.InvalidExecutionPlan, token.publishAudioDeclaration(bindings, events, 1));
+        const declared = try token.publishAudioDeclaration(bindings, events, 0);
+        try std.testing.expect(declared.executableFor(bindings) != null);
+        break :declared declared;
+    };
     var cache: plan_mod.Cache = .{};
     defer cache.clearWithCleanup(.{ .outside_execution = true }) catch unreachable;
     cache.entries[0] = .{ .key = 93, .stamp = 1, .warmed = true, .owner = owner };
