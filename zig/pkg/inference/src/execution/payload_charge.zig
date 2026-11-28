@@ -88,7 +88,7 @@ pub const Deferred = struct {
     prepared: ?PreparedOwned = null,
     /// Immutable whole-source task deadline, never refreshed by retry policy.
     deadline_ns: ?u64,
-    cleanup_epoch: ?@import("retirement_sink.zig").Epoch = null,
+    cleanup_seal: ?@import("retirement_sink.zig").SealWitness = null,
     ticket: @import("completion_retirement.zig").Ticket,
     node: @import("completion_retirement.zig").Node = undefined,
     pub fn create(deadline_ns: ?u64) !?*Deferred {
@@ -131,18 +131,18 @@ pub const Deferred = struct {
     pub fn retire(self: *Deferred, boundary: ?*const @import("retirement_sink.zig").Epoch) void {
         std.debug.assert(self.prepared == null);
         const actual = boundary orelse @import("antfly_platform").inference_process_supervisor.restartWorker();
-        self.cleanup_epoch = actual.retain() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+        self.cleanup_seal = actual.sealWitness() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
         self.node = .{ .context = self, .ready_fn = ready, .retire_fn = release, .deadline_ns = self.deadline_ns };
         self.ticket.submit(&self.node);
     }
     fn ready(raw: *anyopaque) !bool {
         const self: *Deferred = @ptrCast(@alignCast(raw));
-        return try self.cleanup_epoch.?.isSealed();
+        return try self.cleanup_seal.?.wasSealed();
     }
     fn release(raw: *anyopaque) void {
         const self: *Deferred = @ptrCast(@alignCast(raw));
         self.charge.?.release();
-        self.cleanup_epoch.?.release();
+        self.cleanup_seal.?.release();
         @import("antfly_platform").allocator.processAllocator(@import("antfly_platform").allocator.concurrentFallback()).destroy(self);
     }
 };
