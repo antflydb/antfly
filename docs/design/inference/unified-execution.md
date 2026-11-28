@@ -2952,6 +2952,25 @@ layer workspace remained 2,004,992 bytes. The replay readback, including
 GPU completion, took 17.15–17.35 ms. This fixture measured correctness
 and physical ownership. It did not compare request latency distributions.
 
+A separate four-arm same-binary control at `4a5809a18b` matched all
+80 measured HTTP outputs, with six warmups per arm. Each request
+completed one warm burst, one learning burst, one recorded burst and
+six replays. End-to-end median/p95 was 470.43/478.83 ms. The two pooled
+control sides measured 470.71/479.24 and 468.36/475.74 ms.
+
+| Per-request phase | Median / p95 (ms) |
+| --- | ---: |
+| CPU preprocessing | 19.96 / 26.10 |
+| Decoder host submission | 6.41 / 6.73 |
+| Graph instantiation, included in submission | 0.60 / 0.72 |
+| Decoder readback, including GPU completion | 156.52 / 157.85 |
+| HTTP time outside the measured phases | 287.48 / 293.93 |
+
+Readback stayed within 1.33 ms from median to p95. The remaining HTTP
+interval includes vision, prefill, singleton decode, and request
+overhead. The control does not identify their individual contributions
+or assign the earlier paired p95 difference to a decoder revision.
+
 ### Metal validation of the grouped audio follow-up
 
 The M4 Max production HTTP server built from `78a42df545` served the
