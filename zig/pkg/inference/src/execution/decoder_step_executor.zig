@@ -1135,6 +1135,11 @@ pub const Executor = struct {
         try graph.read(&burst, first, second);
         try self.context.cb.checkExecutionControl();
         burst.noteCompleted();
+        if (graph.launch_route == .recorded_and_launched and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) {
+            var terminal_rows: usize = 0;
+            for (first, second) |one, two| terminal_rows += @intFromBool(config.isEosToken(one) or config.isEosToken(two));
+            std.debug.print("LIGHTONOCR3 cuda_model_graph_recorded_eos_rows={d} rows={d} minimum_remaining_tokens={d}\n", .{ terminal_rows, claimed.len, recipe.minimum_remaining_tokens });
+        }
         return .{ .logits = null, .greedy_tokens = first, .second_greedy_tokens = second, .max_query_seq_len = 1 };
     }
 
