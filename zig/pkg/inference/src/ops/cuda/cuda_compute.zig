@@ -4326,6 +4326,7 @@ pub const CudaCompute = struct {
         }) catch |err| switch (err) {
             error.InvalidShape, error.Overflow => return .unsupported,
         };
+        phase.insufficient_replay_horizon = false;
         phase.vendor_workspace = self.currentGraphVendorWorkspace() orelse return .unsupported;
         const owner = &self.bounded_decode_graph;
         if (!owner.mutex.tryLock()) return error.ReaderEpochBackendBusy;
@@ -4334,7 +4335,14 @@ pub const CudaCompute = struct {
         phase.expected_compute = @intFromPtr(self);
         phase.admission = self.ctx.video_cache_budget.admission;
         phase.old = owner.snapshot();
-        if (!phase.matchesOwner(owner)) {
+        const matches_owner = phase.matchesOwner(owner);
+        const next_phase: @import("bounded_decode_graph.zig").Phase = if (matches_owner) owner.phase else .warm;
+        if (next_phase == .disabled) return .unsupported;
+        if (!next_phase.canReachReplay(descriptor.minimum_remaining_tokens)) {
+            phase.insufficient_replay_horizon = true;
+            return .unsupported;
+        }
+        if (!matches_owner) {
             if (try self.ctx.streamCaptureActive()) return .unsupported;
             if (owner.resets_logged < 12 and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) {
                 var mismatch: usize = 0;
@@ -4356,7 +4364,6 @@ pub const CudaCompute = struct {
             phase.mode = .storage;
             return .outside;
         }
-        if (owner.phase == .disabled) return .unsupported;
         if (owner.phase == .capture and owner.admitted_arena_layout == null) {
             if (try self.ctx.streamCaptureActive()) return .unsupported;
             const layout = try owner.arenaLayout();
@@ -4407,7 +4414,7 @@ pub const CudaCompute = struct {
         const vendor = self.currentGraphVendorWorkspace() orelse return error.PreparedCachePlanChanged;
         if (!std.meta.eql(vendor, graph_phase.vendor_workspace)) return error.PreparedCachePlanChanged;
         const descriptor = graph_phase.descriptor;
-        if (graph_phase.expected_compute != @intFromPtr(self) or descriptor.epoch != epoch or descriptor.rows != rows or descriptor.hidden != hidden or descriptor.vocab != vocab or descriptor.future_tokens != future_tokens or !std.meta.eql(descriptor.attention_geometry, expected.attention_geometry) or !std.meta.eql(descriptor.recurrent_heads, expected.recurrent_heads) or !std.meta.eql(descriptor.recurrent_projection_widths, expected.recurrent_projection_widths) or descriptor.attention_layers != expected.attention_layers or descriptor.recurrent_layers != expected.recurrent_layers or descriptor.ffn_intermediate != expected.ffn_intermediate or descriptor.attention_q_gate != expected.attention_q_gate or descriptor.norm_weight_offset != expected.norm_weight_offset or !std.meta.eql(descriptor.head_storage, expected.head_storage) or !std.mem.eql(u64, descriptor.key, key) or !std.mem.eql(u32, descriptor.positions, positions) or !std.mem.eql(u64, descriptor.sequences, expected.sequences)) return error.PreparedCachePlanChanged;
+        if (graph_phase.expected_compute != @intFromPtr(self) or descriptor.epoch != epoch or descriptor.rows != rows or descriptor.hidden != hidden or descriptor.vocab != vocab or descriptor.future_tokens != future_tokens or descriptor.minimum_remaining_tokens != expected.minimum_remaining_tokens or !std.meta.eql(descriptor.attention_geometry, expected.attention_geometry) or !std.meta.eql(descriptor.recurrent_heads, expected.recurrent_heads) or !std.meta.eql(descriptor.recurrent_projection_widths, expected.recurrent_projection_widths) or descriptor.attention_layers != expected.attention_layers or descriptor.recurrent_layers != expected.recurrent_layers or descriptor.ffn_intermediate != expected.ffn_intermediate or descriptor.attention_q_gate != expected.attention_q_gate or descriptor.norm_weight_offset != expected.norm_weight_offset or !std.meta.eql(descriptor.head_storage, expected.head_storage) or !std.mem.eql(u64, descriptor.key, key) or !std.mem.eql(u32, descriptor.positions, positions) or !std.mem.eql(u64, descriptor.sequences, expected.sequences)) return error.PreparedCachePlanChanged;
         const owner = &self.bounded_decode_graph;
         while (!owner.mutex.tryLock()) std.atomic.spinLoopHint();
         var claimed = false;

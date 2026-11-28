@@ -290,7 +290,24 @@ test "LightOnOCR3 CUDA graph canonical cohorts restore both token columns after 
     try std.testing.expectError(error.InvalidPagedKvBatch, canonicalOrder(&.{ 7, 29, 7, 43 }, &order));
     try std.testing.expectError(error.InvalidPagedKvBatch, canonicalOrder(&.{ 7, 0, 29, 43 }, &order));
 }
-pub const Phase = enum { warm, learn, capture, replay, disabled };
+pub const Phase = enum {
+    warm,
+    learn,
+    capture,
+    replay,
+    disabled,
+
+    pub fn canReachReplay(self: Phase, remaining_tokens: usize) bool {
+        // Warmup can declare a plan directly or require a separate learning
+        // burst. Each completed burst consumes two output tokens.
+        return switch (self) {
+            .warm, .learn => remaining_tokens >= 6,
+            .capture => remaining_tokens >= 4,
+            .replay => remaining_tokens >= 2,
+            .disabled => false,
+        };
+    }
+};
 /// Borrowed only through one final-address Executor phase. Full key/positions
 /// remain synchronous under the held worker step; no such borrow enters Module.
 pub const Descriptor = struct {
@@ -302,6 +319,7 @@ pub const Descriptor = struct {
     hidden: usize,
     vocab: usize,
     future_tokens: usize,
+    minimum_remaining_tokens: usize = std.math.maxInt(usize),
     head_storage: HeadStorage = .full_bank,
     attention_geometry: ?DecodeScratch.Geometry = null,
     attention_q_gate: bool = false,
@@ -407,6 +425,7 @@ pub const GraphPhase = struct {
     expected_compute: usize = 0,
     old: Snapshot = undefined,
     admission_pressure: ?memory.AdmissionPressure = null,
+    insufficient_replay_horizon: bool = false,
     admission: ?@import("video_cache_budget.zig").Admission = null,
     cold: ?*ColdPhase = null,
     bound: bool = false,
@@ -1948,6 +1967,17 @@ test "CUDA bounded decoder binds zero scratch without reserving a device arena" 
     try std.testing.expectEqual(@as(usize, 0), owner.arena.len);
     try std.testing.expect(owner.arena_quota == .none);
     try std.testing.expect((try owner.bindArena()).complete());
+}
+
+test "bounded CUDA decoder skips recording without a remaining replay burst" {
+    try std.testing.expect(!Phase.warm.canReachReplay(5));
+    try std.testing.expect(Phase.warm.canReachReplay(6));
+    try std.testing.expect(!Phase.learn.canReachReplay(5));
+    try std.testing.expect(Phase.learn.canReachReplay(6));
+    try std.testing.expect(!Phase.capture.canReachReplay(3));
+    try std.testing.expect(Phase.capture.canReachReplay(4));
+    try std.testing.expect(Phase.replay.canReachReplay(2));
+    try std.testing.expect(!Phase.replay.canReachReplay(1));
 }
 
 test "CUDA bounded decoder validates dispatch geometry before preparing storage" {

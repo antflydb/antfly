@@ -616,6 +616,7 @@ pub const CudaDecoderDeclines = struct {
     unstable_recurrent_state: u64 = 0,
     admission_or_revalidation: u64 = 0,
     workspace_admission: u64 = 0,
+    insufficient_replay_horizon: u64 = 0,
 
     pub const Reason = @import("std").meta.FieldEnum(CudaDecoderDeclines);
     pub const Counts = [@typeInfo(CudaDecoderDeclines).@"struct".field_names.len]u64;
