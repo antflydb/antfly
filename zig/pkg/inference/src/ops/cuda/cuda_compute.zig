@@ -48031,6 +48031,17 @@ test "LightOnOCR3 CUDA graph warm input and wide head write their assigned buffe
         const attention_values = try cb.toFloat32(attention_norm, a);
         defer a.free(attention_values);
         try std.testing.expectEqualSlices(f32, ordinary_values, attention_values);
+
+        try std.testing.expect((try tryCapturedAttentionOutputProjection(&cb, attention_norm, weight, 3, 2, 2)) == null);
+        const projection_allocations = compute.stats.device_alloc_calls;
+        const reused = (try tryCapturedAttentionOutputProjection(&cb, input, weight, 3, 2, 2)) orelse return error.TestUnexpectedResult;
+        defer cb.free(reused);
+        try std.testing.expectEqual(projection_allocations, compute.stats.device_alloc_calls);
+        try std.testing.expectEqual(tensorFromCt(attention_norm).buffer.ptr, tensorFromCt(reused).buffer.ptr);
+        try std.testing.expect(!tensorFromCt(reused).owns_buffer);
+        const reuse_values = try cb.toFloat32(reused, a);
+        defer a.free(reuse_values);
+        try std.testing.expectEqualSlices(f32, &.{ 2, 3, 5, 7, 11, 13 }, reuse_values);
     }
 
     var observation = @import("../../execution/runtime_observation.zig").Scope.init();
