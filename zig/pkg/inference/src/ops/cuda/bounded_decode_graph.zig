@@ -1226,6 +1226,29 @@ test "bounded CUDA decoder shares declared attention and recurrent workspace" {
     try std.testing.expectEqual(reused.attention_workspace.?.offset, reused.final_norm_mirror.?.offset);
     try std.testing.expectEqual(composed.metadata_bytes, reused.metadata_bytes);
 
+    for ([_]bool{ false, true }) |gated| {
+        var projected = descriptor;
+        projected.attention_q_gate = gated;
+        try phase.initInto(projected);
+        var projection_policy = mirror_policy;
+        projection_policy.layer_norm = true;
+        try phase.prepareWorkspace(projection_policy);
+        const layout = phase.storage_layout;
+        const projection_owner: Module = .{
+            .storage_layout = layout,
+            .metadata = .{ .ptr = 0x20000, .len = layout.metadata_bytes },
+        };
+        const q_bytes = attention_output.len * @as(usize, if (gated) 2 else 1);
+        const kv_bytes = rows * 2 * 256 * @sizeOf(f32);
+        const q_dst = (try projection_owner.bindAttentionProjection(.query, q_bytes)).?;
+        const k_dst = (try projection_owner.bindAttentionProjection(.key, kv_bytes)).?;
+        const v_dst = (try projection_owner.bindAttentionProjection(.value, kv_bytes)).?;
+        try std.testing.expectEqual(q_dst.ptr + q_dst.len, k_dst.ptr);
+        try std.testing.expectEqual(k_dst.ptr + k_dst.len, v_dst.ptr);
+        try std.testing.expect(v_dst.ptr + v_dst.len <= projection_owner.metadata.ptr + layout.projection_staging.?.offset);
+        try std.testing.expectError(error.InvalidExecutionPlan, projection_owner.bindAttentionProjection(.query, q_bytes - @sizeOf(f32)));
+    }
+
     var fused = descriptor;
     fused.hidden = 1024;
     fused.head_storage = .fused_top1;
