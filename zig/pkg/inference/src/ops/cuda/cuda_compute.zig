@@ -21288,6 +21288,12 @@ test "CUDA audio graph staging refreshes mutable inputs and retains completed co
     try std.testing.expectEqual(2 * span, replaced.copied_bytes);
     try std.testing.expectEqual(@as(usize, 0), replaced.reused_bytes);
     try std.testing.expectEqual(start + 5 * span, compute.stats.d2d_bytes);
+    try std.testing.expectError(error.InvalidShape, stageAudioGraphInputs(&compute, &arena, try bank.borrowRange(0, span), &.{ input, constant }, &spans));
+    try std.testing.expectEqual(start + 5 * span, compute.stats.d2d_bytes);
+    try std.testing.expect(arena.audio_staged_inputs[1] == null);
+    const reset = try stageAudioGraphInputs(&compute, &arena, bank, &.{ replacement, new_constant }, &spans);
+    try std.testing.expectEqual(2 * span, reset.copied_bytes);
+    try std.testing.expectEqual(@as(usize, 0), reset.reused_bytes);
     var result: [2]f32 = undefined;
     for (spans) |copy| {
         try (try bank.borrowRange(copy.offset, copy.bytes)).copyToHost(&compute.ctx, std.mem.asBytes(&result));
