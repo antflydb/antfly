@@ -400,13 +400,28 @@ pub const GraphPhase = struct {
             self.storage_layout.attention_residual = try self.storage_layout.declareLayerRegion(offset, bytes);
         }
         if (policy.projection_staging) try self.declareProjectionStaging();
-        if (policy.final_norm_mirror) {
-            const rows = self.descriptor.rows;
-            const width = self.descriptor.hidden;
-            const bytes = try std.math.mul(usize, try std.math.mul(usize, rows, width), @sizeOf(u16));
-            const offset = try StorageLayout.aligned(self.storage_layout.layerWorkspaceBytes());
-            self.storage_layout.final_norm_mirror = try self.storage_layout.declareLayerRegion(offset, bytes);
+        if (policy.final_norm_mirror) try self.declareFinalNormMirror();
+    }
+
+    fn declareFinalNormMirror(self: *GraphPhase) !void {
+        const layout = &self.storage_layout;
+        const elements = try std.math.mul(usize, self.descriptor.rows, self.descriptor.hidden);
+        const bytes = try std.math.mul(usize, elements, @sizeOf(u16));
+        const prefix = try layout.layerWorkspaceOffset();
+        const head_bytes = @max(
+            if (layout.shared_head_workspace) |span| span.bytes else 0,
+            if (layout.fused_head_workspace) |span| span.bytes else 0,
+        );
+        // Layer outputs are dead when the final norm runs. Only the terminal
+        // head bank and any projection staging remain concurrent with its mirror.
+        var offset = try StorageLayout.aligned(head_bytes);
+        if (layout.projection_staging) |span| {
+            const staging_start = span.offset - prefix;
+            const staging_end = try std.math.add(usize, staging_start, span.bytes);
+            if (offset < staging_end and try std.math.add(usize, offset, bytes) > staging_start)
+                offset = try StorageLayout.aligned(staging_end);
         }
+        layout.final_norm_mirror = try layout.declareLayerRegion(offset, bytes);
     }
 
     pub fn declareAttentionScratch(self: *GraphPhase, chunk128_override: ?bool) !void {
@@ -1112,12 +1127,19 @@ test "bounded CUDA decoder shares declared attention and recurrent workspace" {
     const mirror_layout = phase.storage_layout;
     const mirror = mirror_layout.final_norm_mirror.?;
     try std.testing.expectEqual(rows * descriptor.hidden * @sizeOf(u16), mirror.bytes);
-    try std.testing.expect(mirror.offset >= shared_staging.offset + shared_staging.bytes);
+    try std.testing.expect(mirror.offset >= shared_head.offset + shared_head.bytes);
+    try std.testing.expect(mirror.offset + mirror.bytes <= shared_staging.offset or mirror.offset >= shared_staging.offset + shared_staging.bytes);
     var mirror_owner = output_owner;
     mirror_owner.storage_layout = mirror_layout;
     mirror_owner.metadata.len = mirror_layout.metadata_bytes;
     try std.testing.expectEqual(mirror_owner.metadata.ptr + mirror.offset, (try mirror_owner.bindFinalNormMirror(mirror.bytes)).?.ptr);
     try std.testing.expectError(error.InvalidExecutionPlan, mirror_owner.bindFinalNormMirror(mirror.bytes - 2));
+
+    try phase.initInto(descriptor);
+    try phase.prepareWorkspace(mirror_policy);
+    const reused = phase.storage_layout;
+    try std.testing.expectEqual(reused.attention_workspace.?.offset, reused.final_norm_mirror.?.offset);
+    try std.testing.expectEqual(composed.metadata_bytes, reused.metadata_bytes);
 
     var fused = descriptor;
     fused.hidden = 1024;

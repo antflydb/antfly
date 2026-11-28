@@ -4006,6 +4006,7 @@ pub const CudaCompute = struct {
                     .declared_attention_norm_bytes = if (layout.attention_norm) |span| span.bytes else 0,
                     .declared_attention_norm_mirror_bytes = if (layout.attention_norm_mirror) |span| span.bytes else 0,
                     .declared_final_norm_mirror_bytes = if (layout.final_norm_mirror) |span| span.bytes else 0,
+                    .declared_final_norm_mirror_offset = if (layout.final_norm_mirror) |span| span.offset - (layout.metadata_bytes - layout.layerWorkspaceBytes()) else 0,
                     .head_bytes = layout.head_bytes,
                     .shared_head_scratch_bytes = if (layout.shared_head_workspace) |span| span.bytes else 0,
                     .head_packet_rows = layout.headPacketRows(owner.rows, owner.vocab),

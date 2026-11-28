@@ -553,6 +553,7 @@ pub const CudaDecoderWorkspace = struct {
     declared_attention_norm_bytes: usize = 0,
     declared_attention_norm_mirror_bytes: usize = 0,
     declared_final_norm_mirror_bytes: usize = 0,
+    declared_final_norm_mirror_offset: usize = 0,
     /// Bytes in the independently admitted bank. Arena-backed packets are
     /// already accounted for by bound_scratch_bytes.
     head_bytes: usize,

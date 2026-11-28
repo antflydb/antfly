@@ -48834,7 +48834,16 @@ test "LightOnOCR3 real checkpoint transcribes the invoice fixture" {
             const through_head_bytes = @max(layer_and_staging_bytes, report.shared_head_scratch_bytes, report.fused_head_scratch_bytes);
             const mirror_bytes = report.declared_final_norm_mirror_bytes;
             if (mirror_bytes != 0) try std.testing.expectEqual(report.rows * geometry.hidden_size * @sizeOf(u16), mirror_bytes);
-            const shared_bytes = if (mirror_bytes != 0) std.mem.alignForward(usize, through_head_bytes, alignment) + mirror_bytes else through_head_bytes;
+            const mirror_offset = report.declared_final_norm_mirror_offset;
+            if (mirror_bytes != 0) {
+                try std.testing.expectEqual(@as(usize, 0), mirror_offset % alignment);
+                try std.testing.expect(mirror_offset >= @max(report.shared_head_scratch_bytes, report.fused_head_scratch_bytes));
+                if (report.declared_projection_staging_bytes != 0) {
+                    const staging_start = layer_and_staging_bytes - report.declared_projection_staging_bytes;
+                    try std.testing.expect(mirror_offset + mirror_bytes <= staging_start or mirror_offset >= layer_and_staging_bytes);
+                }
+            }
+            const shared_bytes = @max(through_head_bytes, mirror_offset + mirror_bytes);
             try std.testing.expectEqual(shared_bytes, report.shared_layer_workspace_bytes);
             std.debug.print("LIGHTONOCR3 observed_cuda_workspace rows={d} readback_bytes={d} backing={s} route={s} attention_scratch_bytes={d} recurrent_scratch_bytes={d} shared_layer_workspace_bytes={d} attention_output_bytes={d} recurrent_output_bytes={d}\n", .{ report.rows, report.readback_bytes, @tagName(report.readback_backing), @tagName(report.route), report.attention_scratch_bytes, report.recurrent_scratch_bytes, report.shared_layer_workspace_bytes, report.declared_attention_output_bytes, report.declared_recurrent_output_bytes });
         }
