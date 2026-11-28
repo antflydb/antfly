@@ -5899,6 +5899,7 @@ pub const ComputeBackend = struct {
         return self.audioExecutionWithArenaFunding(key, inputs, context, run, false);
     }
 
+    /// The callback borrows read-only inputs and returns an independent output.
     pub fn audioExecutionWithArenaFunding(self: *const ComputeBackend, key: u64, inputs: []const CT, context: *anyopaque, run: *const fn (*anyopaque, []const CT) anyerror!CT, defer_arena: bool) !?CT {
         const op = self.vtable.regions.audio_execution.execute orelse return null;
         const previous = if (self.vtable.regions.audio_execution.setControl) |set| set(self.ptr, self.execution_control) else null;

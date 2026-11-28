@@ -21201,35 +21201,88 @@ fn submitUnorderedDeviceCopies(self: *CudaCompute, submit: driver_mod.MemcpyBatc
     self.stats.d2d_bytes += bytes;
 }
 
-fn stageAudioGraphInputs(self: *CudaCompute, input_bank: buffer_mod.DeviceBuffer, inputs: []const CT, spans: []const CudaCompute.AudioInputSpan) !void {
+const AudioArena = @import("../../backends/embedding_gemma2_cuda.zig").Arena;
+
+fn audioInputStamp(tensor: *const CudaTensor) ?AudioArena.AudioInputStamp {
+    const owner = tensor.resident_parent orelse tensor;
+    if (!owner.model_constant or owner.gemma4_projector_constant or owner.buffer.ptr != tensor.buffer.ptr)
+        return null;
+    return .{ .allocation = owner.buffer.allocation_token orelse return null, .address = owner.buffer.ptr };
+}
+
+fn stageAudioGraphInputs(self: *CudaCompute, arena: *AudioArena, input_bank: buffer_mod.DeviceBuffer, inputs: []const CT, spans: []const CudaCompute.AudioInputSpan) !void {
     // The caller proves every source is outside the arena and the placement
     // gives each destination a separate slice. A batch has no internal order.
-    try self.ctx.makeCurrent();
-    if (self.ctx.stream != null and inputs.len > 1) batch: {
-        const submit = self.ctx.driver.fns.cuMemcpyBatchAsync orelse break :batch;
-        var destinations: [CudaCompute.AudioPlan.max_inputs]driver_mod.CUdeviceptr = undefined;
-        var sources: [CudaCompute.AudioPlan.max_inputs]driver_mod.CUdeviceptr = undefined;
-        var sizes: [CudaCompute.AudioPlan.max_inputs]usize = undefined;
-        var count: usize = 0;
-        var bytes: usize = 0;
-        for (inputs, spans) |ct, span| {
-            if (span.bytes == 0) continue;
+    var next_stamps = arena.audio_staged_inputs;
+    // A failed batch can have submitted part of its work. Clear all receipts
+    // so the next request restages every source regardless of old identity.
+    errdefer arena.audio_staged_inputs = @splat(null);
+    var destinations: [CudaCompute.AudioPlan.max_inputs]driver_mod.CUdeviceptr = undefined;
+    var sources: [CudaCompute.AudioPlan.max_inputs]driver_mod.CUdeviceptr = undefined;
+    var sizes: [CudaCompute.AudioPlan.max_inputs]usize = undefined;
+    var count: usize = 0;
+    var bytes: usize = 0;
+    for (inputs, spans, 0..) |ct, span, index| {
+        const tensor = tensorFromCt(ct);
+        const stamp = if (span.bytes == 0) null else audioInputStamp(tensor);
+        if (span.bytes != 0 and (stamp == null or !std.meta.eql(arena.audio_staged_inputs[index], stamp))) {
             destinations[count] = (try input_bank.borrowRange(span.offset, span.bytes)).ptr;
-            sources[count] = tensorFromCt(ct).buffer.ptr;
+            sources[count] = tensor.buffer.ptr;
             sizes[count] = span.bytes;
             count += 1;
             bytes += span.bytes;
         }
-        if (count <= 1) break :batch;
-        try submitUnorderedDeviceCopies(self, submit, destinations[0..count], sources[0..count], sizes[0..count], bytes);
-        return;
+        next_stamps[index] = stamp;
     }
-    for (inputs, spans) |ct, span| {
-        if (span.bytes == 0) continue;
-        const destination = try input_bank.borrowRange(span.offset, span.bytes);
-        const source = tensorFromCt(ct).buffer;
-        try destination.copyFromCurrentDevice(&self.ctx, source, span.bytes);
-        self.stats.d2d_bytes += span.bytes;
+    if (count != 0) {
+        try self.ctx.makeCurrent();
+        const submit = if (self.ctx.stream != null and count > 1) self.ctx.driver.fns.cuMemcpyBatchAsync else null;
+        if (submit) |copy| {
+            try submitUnorderedDeviceCopies(self, copy, destinations[0..count], sources[0..count], sizes[0..count], bytes);
+        } else {
+            for (destinations[0..count], sources[0..count], sizes[0..count]) |destination_ptr, source_ptr, size| {
+                const destination: buffer_mod.DeviceBuffer = .{ .ptr = destination_ptr, .len = size };
+                const source: buffer_mod.DeviceBuffer = .{ .ptr = source_ptr, .len = size };
+                try destination.copyFromCurrentDevice(&self.ctx, source, size);
+                self.stats.d2d_bytes += size;
+            }
+        }
+    }
+    arena.audio_staged_inputs = next_stamps;
+}
+
+test "CUDA audio graph staging refreshes mutable inputs and retains completed constants" {
+    if (comptime !cuda_enabled) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var compute = try CudaCompute.testing.init(a);
+    defer compute.deinit();
+    compute.capability_profile = .embedding_gemma2;
+    const cb = compute.computeBackend();
+    const input = try cb.fromFloat32Shape(&.{ 1, 2 }, &.{2});
+    defer cb.free(input);
+    const replacement = try cb.fromFloat32Shape(&.{ 3, 4 }, &.{2});
+    defer cb.free(replacement);
+    const constant = (try cb.modelConstant("audio_tower.prepared.test.first", input)) orelse return error.TestUnexpectedResult;
+    defer cb.free(constant);
+    const new_constant = (try cb.modelConstant("audio_tower.prepared.test.second", replacement)) orelse return error.TestUnexpectedResult;
+    defer cb.free(new_constant);
+    const alignment = @import("../../execution/stream_workspace.zig").alignment;
+    const span: usize = 2 * @sizeOf(f32);
+    var bank = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, alignment + span);
+    defer bank.free(&compute.ctx);
+    var arena: AudioArena = .{ .kind = .audio };
+    const spans = [_]CudaCompute.AudioInputSpan{ .{ .bytes = span }, .{ .offset = alignment, .bytes = span } };
+    const start = compute.stats.d2d_bytes;
+    try stageAudioGraphInputs(&compute, &arena, bank, &.{ input, constant }, &spans);
+    try std.testing.expectEqual(start + 2 * span, compute.stats.d2d_bytes);
+    try stageAudioGraphInputs(&compute, &arena, bank, &.{ replacement, constant }, &spans);
+    try std.testing.expectEqual(start + 3 * span, compute.stats.d2d_bytes);
+    try stageAudioGraphInputs(&compute, &arena, bank, &.{ replacement, new_constant }, &spans);
+    try std.testing.expectEqual(start + 5 * span, compute.stats.d2d_bytes);
+    var result: [2]f32 = undefined;
+    for (spans) |copy| {
+        try (try bank.borrowRange(copy.offset, copy.bytes)).copyToHost(&compute.ctx, std.mem.asBytes(&result));
+        try std.testing.expectEqualSlices(f32, &.{ 3, 4 }, &result);
     }
 }
 
@@ -21565,7 +21618,7 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
     if (replay or capture) {
         // Capture only records the stable addresses. Stage bytes after a
         // successful recording and immediately before the common launch.
-        try stageAudioGraphInputs(self, input_bank, inputs, spans);
+        try stageAudioGraphInputs(self, arena, input_bank, inputs, spans);
         try arena.launch(&self.ctx);
         if (replay) self.audio_graph_replays += 1;
     }

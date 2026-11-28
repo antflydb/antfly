@@ -78,6 +78,11 @@ pub fn Program(comptime Recipe: type) type {
         };
 
         pub const Arena = struct {
+            pub const AudioInputStamp = struct {
+                allocation: @import("allocation_ledger.zig").Token,
+                address: driver.CUdeviceptr,
+            };
+
             kind: enum { encoder, vision, audio } = .encoder,
             grid_x: usize = 0,
             grid_y: usize = 0,
@@ -98,6 +103,7 @@ pub fn Program(comptime Recipe: type) type {
             quota: CacheQuota = .none,
             output_quota: CacheQuota = .none,
             retained_output: ?RetainedOutput = null,
+            audio_staged_inputs: [@import("audio_execution_plan.zig").max_inputs]?AudioInputStamp = @splat(null),
             graph: driver.CUgraphExec = null,
             warm: bool = false,
             disabled: bool = false,
