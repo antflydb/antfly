@@ -3251,8 +3251,14 @@ of 550 MiB (29.1%). These numbers are the shared workspace lease sizes.
 Pooled paired throughput was 6.32 versus 6.34 pages/s. All four baseline
 arms recorded declared replay at 107 rows. Two candidate arms reached
 113 rows and two reached only 30 or 32 rows. The lower reservation
-preserved throughput in this comparison. Consistent wide replay under
-chunked prefill remains open.
+preserved throughput in this comparison. All eight arms reached the
+128-page registration limit. In one candidate miss, a 113-row graph
+hit park and scratch admission denials, then retired before a replay
+during page cleanup. In the other miss, a 111-row graph recorded
+successfully and foreground vision retired it before replay. That arm
+had no graph scratch-funding denials. Consistent wide replay under
+chunked prefill therefore also depends on graph lifetime across foreground
+work and page transitions.
 
 ### Released Inkling Metal checkpoint at `7f0ff56ff8`
 
