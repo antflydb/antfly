@@ -4497,8 +4497,9 @@ pub const CudaCompute = struct {
     pub const LightOnAttentionInputs = struct { query: CT, key: CT, gate: CT };
 
     pub fn lightOnAttentionInputs(cb: *const ops.ComputeBackend, query_gate: CT, key: CT, query_weight: CT, key_weight: CT, positions: []const u32, rows: usize, query_heads: usize, key_heads: usize) !?LightOnAttentionInputs {
+        const InputLayout = @import("bounded_decode_graph.zig").AttentionInputs;
         if (!lightOnProjectionResidualEnabled(cb) or rows == 0 or rows > 8192 or
-            !((query_heads == 8 and key_heads == 2) or (query_heads == 16 and key_heads == 4))) return null;
+            !InputLayout.supports(query_heads, key_heads, 256)) return null;
         const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
         if (positions.len != rows * 3) return error.InvalidShape;
         const inputs = [_]*const CudaTensor{ tensorFromCt(query_gate), tensorFromCt(key), tensorFromCt(query_weight), tensorFromCt(key_weight) };
@@ -4514,7 +4515,7 @@ pub const CudaCompute = struct {
         const q_count = rows * query_heads * 256;
         const k_count = rows * key_heads * 256;
         const destinations = if (self.bounded_decode_graph.active)
-            try self.bounded_decode_graph.bindAttentionInputs(try @import("bounded_decode_graph.zig").AttentionInputs.init(rows, query_heads, key_heads, 256))
+            try self.bounded_decode_graph.bindAttentionInputs(try InputLayout.init(rows, query_heads, key_heads, 256))
         else
             null;
         const query = try self.allocLightOnF32Tensor(rows, query_heads * 256, if (destinations) |value| value[0] else null);

@@ -57,6 +57,10 @@ pub const AttentionInputs = struct {
     key_bytes: usize,
     bytes: usize,
 
+    pub fn supports(heads: usize, kv_heads: usize, dim: usize) bool {
+        return dim == 256 and ((heads == 8 and kv_heads == 2) or (heads == 16 and kv_heads == 4));
+    }
+
     pub fn init(rows: usize, heads: usize, kv_heads: usize, dim: usize) !AttentionInputs {
         const row_bytes = try std.math.mul(usize, try std.math.mul(usize, rows, dim), @sizeOf(f32));
         const q = try std.math.mul(usize, row_bytes, heads);
@@ -425,9 +429,11 @@ pub const GraphPhase = struct {
         }
         if (policy.fused_attention_inputs and self.descriptor.attention_layers != 0) {
             const geometry = self.descriptor.attention_geometry orelse return error.InvalidShape;
-            const inputs = try AttentionInputs.init(self.descriptor.rows, geometry.heads, geometry.kv_heads, geometry.dim);
-            const offset = try StorageLayout.aligned(try self.storage_layout.layerLiveBytes());
-            self.storage_layout.attention_inputs = try self.storage_layout.declareLayerRegion(offset, inputs.bytes);
+            if (AttentionInputs.supports(geometry.heads, geometry.kv_heads, geometry.dim)) {
+                const inputs = try AttentionInputs.init(self.descriptor.rows, geometry.heads, geometry.kv_heads, geometry.dim);
+                const offset = try StorageLayout.aligned(try self.storage_layout.layerLiveBytes());
+                self.storage_layout.attention_inputs = try self.storage_layout.declareLayerRegion(offset, inputs.bytes);
+            }
         }
         if (policy.projection_staging) try self.declareProjectionStaging();
         if (policy.final_norm_mirror) try self.declareFinalNormMirror();
