@@ -7954,8 +7954,12 @@ pub const CudaCompute = struct {
         if (segments.len > schedule.GroupedRows.max_clips) return error.InvalidPreparedAudioRecipe;
         var clips: [schedule.GroupedRows.max_clips]Source.Plan = undefined;
         const context = try schedule.attentionContextRows(recipe.chunk, recipe.context_left, recipe.context_right);
-        const group = try Source.planGroup(clips[0..segments.len], segments, rows, recipe.heads, recipe.hidden / recipe.heads, recipe.chunk, context, recipe.context_left);
-        return group.bytes <= AudioPlan.limit - base.input_bytes - base.output_bytes;
+        const group = Source.planGroup(clips[0..segments.len], segments, rows, recipe.heads, recipe.hidden / recipe.heads, recipe.chunk, context, recipe.context_left) catch return false;
+        // Q, K and V are owning BF16-rounded F32 projections. All three
+        // stay live while attention writes its fourth matrix into the region.
+        const matrices = std.math.mul(usize, 4, base.output_bytes) catch return false;
+        const mandatory = std.math.add(usize, group.bytes, matrices) catch return false;
+        return mandatory <= AudioPlan.limit - base.input_bytes;
     }
 
     pub fn appendAudioCacheWorkload(self: *const CudaCompute, recipe: CacheFunding.AudioRecipe, builder: *CacheFunding.Builder) !void {
@@ -60392,7 +60396,7 @@ test "CUDA grouped audio admission rejects an impossible mandatory workspace bef
     recipe.context_left = 13;
     recipe.context_right = 0;
     const output = 37 * 1024 * @sizeOf(f32);
-    var bindings: CudaCompute.AudioCacheBase = .{ .key = 0, .input_bytes = CudaCompute.AudioPlan.limit - layout.bytes - output, .output_bytes = output };
+    var bindings: CudaCompute.AudioCacheBase = .{ .key = 0, .input_bytes = CudaCompute.AudioPlan.limit - layout.bytes - 4 * output, .output_bytes = output };
     try std.testing.expect(try CudaCompute.audioWorkspaceLowerBoundFits(recipe, &clips, 37, bindings));
     bindings.input_bytes += @import("../../execution/stream_workspace.zig").alignment;
     try std.testing.expect(bindings.fitsArena());
