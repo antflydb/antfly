@@ -21436,7 +21436,7 @@ fn runAudioWithWorkspace(
     return run(context, inputs);
 }
 
-fn cachedGroupedAudioWorkspace(ctx: *anyopaque, recipe: CacheFunding.AudioRecipe) anyerror!?ops.ComputeBackend.AudioWorkspaceDeclaration {
+fn cachedGroupedAudioWorkspace(ctx: *anyopaque, recipe: CudaCompute.CacheFunding.AudioRecipe) anyerror!?ops.ComputeBackend.AudioWorkspaceDeclaration {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     const schedule = @import("../../execution/audio_schedule.zig");
     var segments: [schedule.GroupedRows.max_clips]usize = undefined;
