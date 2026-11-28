@@ -5028,6 +5028,14 @@ const GroupedAudioDeclaration = struct {
         } }));
     }
 
+    fn projectionScratch(self: *GroupedAudioDeclaration, logical: []const u8, geometry: AudioProjectionGeometry) !usize {
+        var name_buffer: [128]u8 = undefined;
+        const logical_weight = try fmt(&name_buffer, "{s}.weight", .{logical});
+        var resolved: [256]u8 = undefined;
+        const name = try hf_weights.resolve(&resolved, logical_weight);
+        return self.scratch(.{ .linear = .{ .name = name, .rows = self.rows, .width = geometry.width, .columns = geometry.columns, .source_bf16 = self.recipe.source_bf16 } });
+    }
+
     pub fn linear(self: *GroupedAudioDeclaration, kind: grouped_audio_block.Projection, second: bool, input: Value) !Value {
         var buffer: [128]u8 = undefined;
         const logical = try groupedProjectionName(&buffer, self.layer, kind, second);
@@ -5036,11 +5044,7 @@ const GroupedAudioDeclaration = struct {
             .unsupported => return error.UnsupportedGroupedAudioWorkspace,
         };
         const geometry = groupedProjectionGeometry(self.recipe.hidden, self.recipe.intermediate, kind);
-        var name_buffer: [128]u8 = undefined;
-        const logical_weight = try fmt(&name_buffer, "{s}.weight", .{logical});
-        var resolved: [256]u8 = undefined;
-        const name = try hf_weights.resolve(&resolved, logical_weight);
-        const bytes = try self.scratch(.{ .linear = .{ .name = name, .rows = self.rows, .width = geometry.width, .columns = geometry.columns } });
+        const bytes = try self.projectionScratch(logical, geometry);
         const projected = project: {
             const clipped = if (spec.clipsInput()) try self.allocate(input.width, 0) else null;
             defer if (clipped) |value| self.release(value);
@@ -5145,9 +5149,12 @@ const F32AudioDeclaration = struct {
         const recipe = self.plan.recipe;
         const spec = try self.bounds(kind, second);
         const geometry = groupedProjectionGeometry(recipe.hidden, recipe.intermediate, kind);
+        var logical: [128]u8 = undefined;
+        const prefix = try groupedProjectionName(&logical, self.plan.layer, kind, second);
+        const scratch_bytes = try self.plan.projectionScratch(prefix, geometry);
         const clipped_input = if (spec.clipsInput()) try self.make(input.width) else null;
         defer if (clipped_input) |value| self.release(value);
-        const projected = try self.make(geometry.columns);
+        const projected = try self.plan.allocate(geometry.columns, scratch_bytes);
         if (kind == .ffn_up) {
             const clamped = if (spec.clipsOutput()) try self.make(projected.width) else null;
             defer if (clamped) |value| self.release(value);
@@ -5259,7 +5266,9 @@ fn groupedProjectionName(buffer: *[128]u8, layer: usize, kind: grouped_audio_blo
     return fmt(buffer, "a.blk.{d}.{s}{s}", .{ layer, stem, if (second) "_1" else "" });
 }
 
-fn groupedProjectionGeometry(hidden: usize, intermediate: usize, kind: grouped_audio_block.Projection) struct { width: usize, columns: usize } {
+const AudioProjectionGeometry = struct { width: usize, columns: usize };
+
+fn groupedProjectionGeometry(hidden: usize, intermediate: usize, kind: grouped_audio_block.Projection) AudioProjectionGeometry {
     const width = if (kind == .ffn_down) intermediate else hidden;
     const columns = switch (kind) {
         .ffn_up => intermediate,

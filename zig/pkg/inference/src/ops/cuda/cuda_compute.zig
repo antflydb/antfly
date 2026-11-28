@@ -21835,7 +21835,8 @@ fn groupedAudioWorkspaceBytes(ctx: *anyopaque, physical: @import("../../executio
                 var storage: [3][128]u8 = undefined;
                 const names = try audioPackedQkvNames(&storage, layer);
                 const request = try CudaCompute.packedNamedCacheRequest(&names, &widths, recipe.hidden);
-                if (self.embedding_gemma2_execution.findPacked(request.packed_weight.name.slice()) == null) return null;
+                const pack = self.embedding_gemma2_execution.findPacked(request.packed_weight.name.slice()) orelse return null;
+                if (pack.ptr == 0 or pack.len != request.packed_weight.bytes) return null;
             }
             return 0;
         },
@@ -21855,6 +21856,14 @@ fn groupedAudioWorkspaceBytes(ctx: *anyopaque, physical: @import("../../executio
                 (weight.dtype != .f32 and weight.dtype != .bf16) or weight.buffer.ptr == 0 or
                 weight.elem_count != geometry.weight_count or
                 !std.mem.eql(i64, weight.shape, &.{ @intCast(value.columns), @intCast(value.width) })) return null;
+            const element_bytes: usize = if (weight.dtype == .bf16) @sizeOf(u16) else @sizeOf(f32);
+            if (weight.buffer.len < try checkedMul(geometry.weight_count, element_bytes)) return null;
+            if (!value.source_bf16) {
+                if (boundaryMixedWeight(self, weight) != null) return null;
+                // Dense F32 output uses the model-owned vendor staging bank
+                // when needed. No allocation belongs to the scoped operation.
+                return 0;
+            }
             return (try sourceLinearLayout(self.ctx.info.compute_major, geometry.rows, value.width, value.columns, weight.dtype != .bf16, false)).bytes;
         },
         .norm => |value| {
@@ -61499,6 +61508,32 @@ test "CUDA audio learning cache state uses actual warm no-plan eligibility and o
     compute.audio_plans.entries[0].owner = null;
     compute.audio_plans.entries[0].disabled = true;
     try std.testing.expect(!(try compute.cacheRequestState(request)).miss);
+}
+
+test "CUDA grouped F32 audio declaration requires a resident dense projection span" {
+    var compute = metadataOnlyTestCompute();
+    compute.resident_weights = .empty;
+    defer compute.resident_weights.deinit(std.testing.allocator);
+    const physical: @import("../../execution/grouped_audio_block.zig").Physical = .{ .linear = .{
+        .name = "audio.projection",
+        .rows = 3,
+        .width = 32,
+        .columns = 16,
+        .source_bf16 = false,
+    } };
+    try std.testing.expect(try groupedAudioWorkspaceBytes(&compute, physical) == null);
+    var shape = [_]i64{ 16, 32 };
+    const weight = try compute.resident_weights.getOrPut(std.testing.allocator, physical.linear.name);
+    weight.value_ptr.* = .{ .dtype = .bf16, .shape = &shape, .elem_count = 512, .buffer = .{ .ptr = 256, .len = 1024 } };
+    try std.testing.expectEqual(@as(?usize, 0), try groupedAudioWorkspaceBytes(&compute, physical));
+    weight.value_ptr.buffer.len -= 1;
+    try std.testing.expect(try groupedAudioWorkspaceBytes(&compute, physical) == null);
+    weight.value_ptr.buffer.len = 1024;
+    weight.value_ptr.dtype = .f16;
+    try std.testing.expect(try groupedAudioWorkspaceBytes(&compute, physical) == null);
+    weight.value_ptr.dtype = .bf16;
+    shape = .{ 32, 16 };
+    try std.testing.expect(try groupedAudioWorkspaceBytes(&compute, physical) == null);
 }
 
 test "CUDA grouped audio admission rejects an impossible mandatory workspace before execution" {

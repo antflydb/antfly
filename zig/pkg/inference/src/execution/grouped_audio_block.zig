@@ -25,7 +25,7 @@ pub const Physical = union(enum) {
     admit: struct { source_bf16: bool },
     f32_plan: @import("audio_schedule.zig").AudioRecipe,
     f32_norm: struct { name: []const u8, rows: usize, width: usize },
-    linear: struct { name: []const u8, rows: usize, width: usize, columns: usize },
+    linear: struct { name: []const u8, rows: usize, width: usize, columns: usize, source_bf16: bool },
     norm: struct { name: []const u8, rows: usize, width: usize, segments: []const usize },
     attention: struct { rows: usize, heads: usize, head_dim: usize, chunk: usize, context: usize, left: usize, segments: []const usize },
 };
