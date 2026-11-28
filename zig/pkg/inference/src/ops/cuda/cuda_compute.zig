@@ -49110,6 +49110,54 @@ test "LightOnOCR3 CUDA fused attention inputs preserve original F32 partial Mrop
                 defer a.free(observed);
                 for (expected, observed) |x, y| try std.testing.expectApproxEqAbs(x, y, 2e-4);
             }
+            if (rows == 2) {
+                const Graph = @import("bounded_decode_graph.zig");
+                var phase: Graph.GraphPhase = undefined;
+                try phase.initInto(.{
+                    .epoch = 1,
+                    .key = &.{1},
+                    .positions = positions,
+                    .rows = rows,
+                    .hidden = if (qh == 8) 1024 else 2560,
+                    .vocab = 8,
+                    .future_tokens = 128,
+                    .attention_geometry = .{ .heads = qh, .kv_heads = kh, .dim = 256 },
+                    .attention_layers = 1,
+                    .recurrent_layers = 0,
+                });
+                try phase.prepareWorkspace(.{ .recurrent_scratch = false, .compact_ffn = null, .projection_staging = false, .fused_attention_inputs = true });
+                var metadata = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, phase.storage_layout.metadata_bytes);
+                defer metadata.free(&compute.ctx);
+                const owner = &compute.bounded_decode_graph;
+                owner.storage_layout = phase.storage_layout;
+                owner.metadata = metadata;
+                owner.rows = rows;
+                owner.active = true;
+                defer {
+                    owner.active = false;
+                    owner.metadata = .{};
+                    owner.storage_layout = null;
+                }
+                @memcpy(owner.next_positions[0..positions.len], positions);
+                try copyFromHostTracked(&compute, owner.positions(), std.mem.sliceAsBytes(positions));
+                const before_allocations = compute.stats.device_alloc_calls;
+                const assigned = (try CudaCompute.lightOnAttentionInputs(&cb, input, key, norm, norm, positions, rows, qh, kh)) orelse return error.TestUnexpectedResult;
+                defer cb.free(assigned.query);
+                defer cb.free(assigned.key);
+                defer cb.free(assigned.gate);
+                try std.testing.expectEqual(before_allocations, compute.stats.device_alloc_calls);
+                const shape = try Graph.AttentionInputs.init(rows, qh, kh, 256);
+                const expected_addresses = (try owner.bindAttentionInputs(shape)).?;
+                for ([_]CT{ fused.query, fused.key, fused.gate }, [_]CT{ assigned.query, assigned.key, assigned.gate }, expected_addresses) |original, actual, buffer| {
+                    try std.testing.expectEqual(buffer.ptr, tensorFromCt(actual).buffer.ptr);
+                    try std.testing.expect(!tensorFromCt(actual).owns_buffer);
+                    const expected = try cb.toFloat32(original, a);
+                    defer a.free(expected);
+                    const observed = try cb.toFloat32(actual, a);
+                    defer a.free(observed);
+                    try std.testing.expectEqualSlices(f32, expected, observed);
+                }
+            }
             const input_after = try cb.toFloat32(input, a);
             defer a.free(input_after);
             const keys_after = try cb.toFloat32(key, a);
@@ -49127,7 +49175,7 @@ test "LightOnOCR3 CUDA fused attention inputs preserve original F32 partial Mrop
             try std.testing.expectEqual(launches, compute.ctx.stats.kernel_launches);
         }
     }
-    try std.testing.expectEqual(@as(usize, 16), compute.lighton_attention_inputs.calls);
+    try std.testing.expectEqual(@as(usize, 18), compute.lighton_attention_inputs.calls);
     const norm_after = try cb.toFloat32(norm, a);
     defer a.free(norm_after);
     try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&norm_host), std.mem.sliceAsBytes(norm_after));
