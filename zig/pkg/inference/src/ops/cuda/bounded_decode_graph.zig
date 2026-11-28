@@ -999,8 +999,8 @@ pub const Module = struct {
             .key => layout.attention_projection_bytes[0],
             .value => try std.math.add(usize, layout.attention_projection_bytes[0], layout.attention_projection_bytes[1]),
         };
-        const bank = try self.bindLayerWorkspace(layout, span, span.bytes);
-        return try bank.borrowRange(offset, bytes);
+        const projection_bank = try self.bindLayerWorkspace(layout, span, span.bytes);
+        return try projection_bank.borrowRange(offset, bytes);
     }
 
     pub fn bindAttentionInputs(self: *const Module, inputs: AttentionInputs) !?[3]buffer.DeviceBuffer {
@@ -1233,10 +1233,10 @@ test "bounded CUDA decoder shares declared attention and recurrent workspace" {
         var projection_policy = mirror_policy;
         projection_policy.layer_norm = true;
         try phase.prepareWorkspace(projection_policy);
-        const layout = phase.storage_layout;
+        const projection_layout = phase.storage_layout;
         const projection_owner: Module = .{
-            .storage_layout = layout,
-            .metadata = .{ .ptr = 0x20000, .len = layout.metadata_bytes },
+            .storage_layout = projection_layout,
+            .metadata = .{ .ptr = 0x20000, .len = projection_layout.metadata_bytes },
         };
         const q_bytes = attention_output.len * @as(usize, if (gated) 2 else 1);
         const kv_bytes = rows * 2 * 256 * @sizeOf(f32);
@@ -1245,7 +1245,7 @@ test "bounded CUDA decoder shares declared attention and recurrent workspace" {
         const v_dst = (try projection_owner.bindAttentionProjection(.value, kv_bytes)).?;
         try std.testing.expectEqual(q_dst.ptr + q_dst.len, k_dst.ptr);
         try std.testing.expectEqual(k_dst.ptr + k_dst.len, v_dst.ptr);
-        try std.testing.expect(v_dst.ptr + v_dst.len <= projection_owner.metadata.ptr + layout.projection_staging.?.offset);
+        try std.testing.expect(v_dst.ptr + v_dst.len <= projection_owner.metadata.ptr + projection_layout.projection_staging.?.offset);
         try std.testing.expectError(error.InvalidExecutionPlan, projection_owner.bindAttentionProjection(.query, q_bytes - @sizeOf(f32)));
     }
 
