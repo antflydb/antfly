@@ -3463,6 +3463,8 @@ const ScopedReplay = struct {
     lease_epoch: u64 = 0,
     generation: u64 = 0,
     unsaved: bool = false,
+    prune_pending: bool = false,
+    discovery_blocked: bool = false,
     mutex: Io.Mutex = .init,
     hints: std.AutoHashMapUnmanaged(u64, u64) = .empty,
     recorded_requests: std.AutoHashMapUnmanaged(u64, void) = .empty,
@@ -3794,30 +3796,37 @@ const ScopedReplay = struct {
         if (removed or delayed.changed) try self.saveAssumeLocked(runtime, publication.store(runtime).*, publication.retry_fence);
         return delayed.delayed;
     }
-    /// Deletions are absent from enrichment replay groups. Check the bounded
-    /// ticket set against primary storage before admitting new source work.
-    fn pruneObsoleteSources(self: *@This(), runtime: *EnrichmentRuntime) !void {
+    const discovery_wave = scoped_retries.max_documents / 2;
+
+    fn observeTicket(self: *@This(), runtime: *EnrichmentRuntime, ticket: scoped_retries.Ticket, retained_key: []const u8) !retry_source.Observation {
+        if (ticket.source_stamp != null) if (ticket.document_location) |location| {
+            var read = try runtime.store.beginProbe();
+            defer read.abort();
+            if (try retry_source.observeLocation(&read, location, ticket.source_stamp)) |value| return value;
+        };
+        if (retained_key.len != 0) return observeSource(runtime, retained_key, ticket.source_stamp, ticket.source_stamp == null);
+        const key = try self.state.documentAlloc(runtime.alloc, ticket.document, ticket.document_bytes, documentResolver(runtime));
+        defer runtime.alloc.free(key);
+        return observeSource(runtime, key, ticket.source_stamp, ticket.source_stamp == null);
+    }
+
+    fn ticketCurrent(ticket: scoped_retries.Ticket, observed: retry_source.Observation) bool {
+        const current = observed.stamp orelse return false;
+        return current.incarnation <= ticket.sequence and
+            (if (ticket.source_stamp) |old| old.sameInput(current) else std.meta.eql(ticket.source_digest, observed.logical_digest));
+    }
+
+    /// Deletions are absent from enrichment replay groups. Check the active
+    /// workset and reclaim a bounded page of sleeping debt after primary writes.
+    fn pruneObsoleteSources(self: *@This(), runtime: *EnrichmentRuntime, target: u64) !void {
         var i: usize = 0;
         while (i < self.state.tickets.items.len) {
             const ticket = &self.state.tickets.items[i];
-            const observed = metadata: {
-                if (ticket.source_stamp != null) if (ticket.document_location) |location| {
-                    var read = try runtime.store.beginProbe();
-                    defer read.abort();
-                    if (try retry_source.observeLocation(&read, location, ticket.source_stamp)) |value| break :metadata value;
-                };
-                const key = try self.state.documentAlloc(runtime.alloc, ticket.document, ticket.document_bytes, documentResolver(runtime));
-                defer runtime.alloc.free(key);
-                break :metadata try observeSource(runtime, key, ticket.source_stamp, ticket.source_stamp == null);
-            };
-            const same = if (observed.stamp) |current| current.incarnation <= ticket.sequence and
-                (if (ticket.source_stamp) |old| old.sameInput(current) else std.meta.eql(ticket.source_digest, observed.logical_digest)) else false;
-            if (!same) {
+            const observed = try self.observeTicket(runtime, ticket.*, "");
+            if (!ticketCurrent(ticket.*, observed)) {
                 self.unsaved = true;
                 self.state.removeTicket(runtime.alloc, i);
             } else {
-                // Migrate v1 tickets once. Cache a fallback observation as well
-                // so unchanged old rows do not require repeated primary reads.
                 if (ticket.source_stamp == null or (ticket.source_stamp.?.mutation_revision != observed.stamp.?.mutation_revision and observed.primary_read)) {
                     ticket.source_stamp = observed.stamp;
                     ticket.dirty = true;
@@ -3826,7 +3835,144 @@ const ScopedReplay = struct {
                 i += 1;
             }
         }
+        const sleeping = &self.state.sleeping;
+        if (sleeping.entries.items.len != 0 and target > sleeping.prune_through) {
+            if (sleeping.prune_target == sleeping.prune_through) sleeping.prune_target = target;
+            i = sleeping.lowerBound(sleeping.prune_after);
+            if (i < sleeping.entries.items.len and scoped_retries.backlog.Identity.order(sleeping.entries.items[i].id, sleeping.prune_after) == .eq) i += 1;
+            var visited: usize = 0;
+            var bytes: usize = 0;
+            while (i < sleeping.entries.items.len and visited < discovery_wave) : (visited += 1) {
+                try runtime.active_provider_guard.check();
+                const entry = sleeping.entries.items[i];
+                if (visited != 0 and entry.bytes > 4 * 1024 * 1024 -| bytes) break;
+                bytes += entry.bytes;
+                if (entry.id.sequence <= runtime.appliedSequence()) {
+                    try sleeping.remove(runtime.alloc, i);
+                } else {
+                    const raw = try enrichment_state.loadScopedRetryBacklogRow(runtime.alloc, runtime.store, entry);
+                    defer runtime.alloc.free(raw);
+                    var decoded = try scoped_retries.State.readSleeping(runtime.alloc, entry, raw);
+                    defer decoded.ticket.deinit(runtime.alloc);
+                    if (ticketCurrent(decoded.ticket, try self.observeTicket(runtime, decoded.ticket, decoded.key))) {
+                        i += 1;
+                    } else {
+                        try sleeping.remove(runtime.alloc, i);
+                    }
+                }
+                sleeping.prune_after = entry.id;
+                sleeping.dirty = true;
+                self.unsaved = true;
+            }
+            if (i == sleeping.entries.items.len) {
+                sleeping.prune_through = sleeping.prune_target;
+                sleeping.prune_after = scoped_retries.backlog.empty_identity;
+                sleeping.dirty = true;
+                self.unsaved = true;
+            }
+        }
+        self.prune_pending = sleeping.entries.items.len != 0 and sleeping.prune_through < target;
         if (self.unsaved) try self.save(runtime);
+    }
+
+    fn activeSlots(self: @This()) usize {
+        return scoped_retries.max_documents - self.state.tickets.items.len;
+    }
+
+    fn spillForWave(self: *@This(), runtime: *EnrichmentRuntime, want: usize) !void {
+        var index: usize = 0;
+        var pending_bytes: usize = 0;
+        while (index < self.state.tickets.items.len and self.state.discoverySlots() < want) {
+            try runtime.active_provider_guard.check();
+            if (!try self.state.spill(runtime.alloc, index, documentResolver(runtime))) {
+                index += 1;
+                continue;
+            }
+            self.unsaved = true;
+            pending_bytes += self.state.sleeping.puts.getLast().bytes.len;
+            if (pending_bytes >= 4 * 1024 * 1024) {
+                try self.save(runtime);
+                pending_bytes = 0;
+            }
+        }
+        if (self.unsaved) try self.save(runtime);
+    }
+
+    fn activateSleeping(self: *@This(), runtime: *EnrichmentRuntime, index: usize) !void {
+        const entry = self.state.sleeping.entries.items[index];
+        const raw = try enrichment_state.loadScopedRetryBacklogRow(runtime.alloc, runtime.store, entry);
+        defer runtime.alloc.free(raw);
+        self.state.activate(runtime.alloc, index, raw) catch |err| switch (err) {
+            error.MemoryBudgetExceeded => {
+                if (!self.unsaved) return err;
+                try self.save(runtime);
+                try self.state.activate(runtime.alloc, index, raw);
+            },
+            else => return err,
+        };
+        self.unsaved = true;
+        // Ensure a delayed predecessor still matches the live primary after
+        // it moves out of the disk index, including a concurrent deletion.
+        const ticket = self.state.tickets.getLast();
+        if (!ticketCurrent(ticket, try self.observeTicket(runtime, ticket, "")))
+            self.state.removeTicket(runtime.alloc, self.state.tickets.items.len - 1);
+    }
+
+    fn activateDueSleeperPage(self: *@This(), runtime: *EnrichmentRuntime) !void {
+        const now = runtime.clock.nowRealtimeMs();
+        const Older = struct {
+            fn lessThan(_: void, left: scoped_retries.backlog.Entry, right: scoped_retries.backlog.Entry) bool {
+                const l = if (left.replan) 0 else left.deadline_ms;
+                const r = if (right.replan) 0 else right.deadline_ms;
+                if (l != r) return l < r;
+                if (left.id.sequence != right.id.sequence) return left.id.sequence < right.id.sequence;
+                return scoped_retries.backlog.Identity.order(left.id, right.id) == .lt;
+            }
+        };
+        var page: [discovery_wave]scoped_retries.backlog.Entry = undefined;
+        var count: usize = 0;
+        for (self.state.sleeping.entries.items) |entry| {
+            if (!entry.replan and entry.deadline_ms > now) continue;
+            if (count == page.len and !Older.lessThan({}, entry, page[count - 1])) continue;
+            if (count < page.len) count += 1;
+            var i = count - 1;
+            while (i > 0 and Older.lessThan({}, entry, page[i - 1])) : (i -= 1) {
+                page[i] = page[i - 1];
+            }
+            page[i] = entry;
+        }
+        if (count == 0) return;
+        try self.spillForWave(runtime, count);
+        var bytes: usize = 0;
+        for (page[0..count]) |entry| {
+            if (self.activeSlots() == 0) break;
+            if (bytes != 0 and entry.bytes > 4 * 1024 * 1024 -| bytes) break;
+            const index = self.state.sleeping.lowerBound(entry.id);
+            std.debug.assert(scoped_retries.backlog.Identity.order(self.state.sleeping.entries.items[index].id, entry.id) == .eq);
+            try self.activateSleeping(runtime, index);
+            bytes += entry.bytes;
+        }
+        if (self.unsaved) try self.save(runtime);
+    }
+
+    fn activateDiscoveryPrefix(self: *@This(), runtime: *EnrichmentRuntime, groups: []const enrichment_worker.PendingDocumentGroup) !usize {
+        if (self.state.sleeping.entries.items.len == 0) return @min(self.state.discoverySlots(), groups.len);
+        var admitted: usize = 0;
+        for (groups) |group| {
+            const key = try documentKey(runtime.alloc, group.doc_key);
+            defer runtime.alloc.free(key);
+            const id = scoped_retries.backlog.Identity.init(key, 0);
+            const sleeping = &self.state.sleeping;
+            const first = sleeping.lowerBound(id);
+            var end = first;
+            while (end < sleeping.entries.items.len and std.mem.eql(u8, &sleeping.entries.items[end].id.document, &id.document)) : (end += 1) {}
+            const required = end - first + 1;
+            const slots = if (admitted == 0 and required > 1) self.activeSlots() else self.state.discoverySlots();
+            if (required + admitted > slots) break;
+            for (first..end) |_| try self.activateSleeping(runtime, first);
+            admitted += 1;
+        }
+        return admitted;
     }
     fn retireSuperseded(self: *@This(), runtime: *EnrichmentRuntime, groups: []const enrichment_worker.PendingDocumentGroup) !void {
         for (groups) |group| {
@@ -4027,11 +4173,12 @@ const ScopedReplay = struct {
     fn refreshRuntime(self: *@This(), runtime: *EnrichmentRuntime) void {
         const scheduler_io = concurrencyIo(runtime);
         self.mutex.lockUncancelable(scheduler_io);
-        const pending = self.state.tickets.items.len != 0;
+        const pending = self.state.hasDebt();
         const scanned = self.state.scanned_sequence;
-        const full = self.state.tickets.items.len >= scoped_retries.max_documents;
+        const full = self.discovery_blocked or self.state.discoverySaturated();
         const has_tail = self.state.hasScanDocument();
         const deadline = self.state.deadline();
+        const prune_pending = self.prune_pending;
         self.mutex.unlock(scheduler_io);
         const io = lockRuntime(runtime);
         defer unlockRuntime(runtime, io);
@@ -4039,6 +4186,7 @@ const ScopedReplay = struct {
         runtime.scoped_retry_scan_sequence = scanned;
         runtime.scoped_retry_observed_target = @max(runtime.scoped_retry_observed_target, scanned);
         runtime.scoped_retry_full = full;
+        runtime.scoped_retry_maintenance = prune_pending;
         runtime.scoped_retry_has_tail = has_tail;
         runtime.scoped_retry_wait = pending;
         if (pending) {
@@ -4920,7 +5068,7 @@ fn runtimeStatusSnapshot(runtime: *EnrichmentRuntime) enrichment_state.RuntimeSt
 fn restoreScopedRetryCache(runtime: anytype) !void {
     var state = try enrichment_state.loadScopedRetries(runtime.alloc, runtime.store);
     defer state.deinit(runtime.alloc);
-    const had_scoped_debt = state.tickets.items.len != 0;
+    const had_scoped_debt = state.hasDebt();
     // A certified repair checkpoint can supersede persisted retry tickets.
     // Ignore that stale debt immediately on reopen rather than waiting for
     // an obsolete server deadline before the next pass can clean it up.
@@ -4934,12 +5082,13 @@ fn restoreScopedRetryCache(runtime: anytype) !void {
     runtime.scoped_retry_scan_sequence = @max(state.scanned_sequence, runtime.applied_sequence);
     runtime.target_sequence = @max(runtime.target_sequence, state.scanned_sequence);
     runtime.scoped_retry_observed_target = runtime.scoped_retry_scan_sequence;
-    runtime.scoped_retry_pending = state.tickets.items.len != 0;
+    runtime.scoped_retry_pending = state.hasDebt();
     if (had_scoped_debt and !runtime.scoped_retry_pending and runtime.retry_failure_fingerprint == 0 and runtime.consecutive_retry_count == 0) {
         runtime.retrying = false;
         runtime.next_retry_at_ms = 0;
     }
-    runtime.scoped_retry_full = state.tickets.items.len >= scoped_retries.max_documents;
+    runtime.scoped_retry_full = state.discoverySaturated();
+    runtime.scoped_retry_maintenance = state.sleeping.entries.items.len != 0 and state.sleeping.prune_through < runtime.target_sequence;
     runtime.scoped_retry_has_tail = state.hasScanDocument();
     runtime.scoped_retry_wait = runtime.scoped_retry_pending and runtime.retry_failure_fingerprint == 0 and runtime.consecutive_retry_count == 0;
     if (runtime.scoped_retry_wait) {
@@ -9017,6 +9166,7 @@ const UnsupportedEnrichmentRuntime = struct {
     pending_scoped_retries: ?PendingScopedRetries = null,
     scoped_retry_pending: bool = false,
     scoped_retry_full: bool = false,
+    scoped_retry_maintenance: bool = false,
     scoped_retry_has_tail: bool = false,
     scoped_retry_wait: bool = false,
     scoped_retry_scan_sequence: u64 = 0,
@@ -9584,6 +9734,7 @@ const PlatformEnrichmentRuntime = struct {
     pending_scoped_retries: ?PendingScopedRetries = null,
     scoped_retry_pending: bool = false,
     scoped_retry_full: bool = false,
+    scoped_retry_maintenance: bool = false,
     /// Produced outputs submitted for ordered publication and not yet seen
     /// accepted, keyed by their exact producer input. A replay retry before
     /// the owner applies the publication resubmits these bytes instead of
@@ -10183,7 +10334,7 @@ const PlatformEnrichmentRuntime = struct {
     }
 
     fn catchUpDecisionAssumeLocked(self: *EnrichmentRuntime, sequence: u64) ForegroundCatchUpDecision {
-        const new_work = self.scoped_retry_wait and (self.graph_stage_recovery_pending or sequence > self.scoped_retry_observed_target or
+        const new_work = self.scoped_retry_wait and (self.graph_stage_recovery_pending or self.scoped_retry_maintenance or sequence > self.scoped_retry_observed_target or
             (!self.scoped_retry_full and (sequence > self.scoped_retry_scan_sequence or self.scoped_retry_has_tail)));
         const retry_due = self.retrying and (new_work or self.clock.nowRealtimeMs() >= self.next_retry_at_ms);
         const failed = self.worker_failed or self.last_error_name != null;
@@ -12124,7 +12275,7 @@ test "rejected chunk embedding publication records its request for stale cleanup
 
 fn workerRetryDelayAssumeLocked(runtime: *EnrichmentRuntime) u64 {
     if (!runtime.retrying) return 0;
-    const new_work = runtime.scoped_retry_wait and (runtime.graph_stage_recovery_pending or runtime.target_sequence > runtime.scoped_retry_observed_target or
+    const new_work = runtime.scoped_retry_wait and (runtime.graph_stage_recovery_pending or runtime.scoped_retry_maintenance or runtime.target_sequence > runtime.scoped_retry_observed_target or
         (!runtime.scoped_retry_full and (runtime.target_sequence > runtime.scoped_retry_scan_sequence or runtime.scoped_retry_has_tail)));
     return if (new_work) 0 else runtime.next_retry_at_ms -| runtime.clock.nowRealtimeMs();
 }
@@ -12213,7 +12364,7 @@ fn beginReplayPass(
         runtime.mutex.unlock(io);
         return false;
     }
-    const new_work = runtime.scoped_retry_wait and (runtime.graph_stage_recovery_pending or target_sequence > runtime.scoped_retry_observed_target or
+    const new_work = runtime.scoped_retry_wait and (runtime.graph_stage_recovery_pending or runtime.scoped_retry_maintenance or target_sequence > runtime.scoped_retry_observed_target or
         (!runtime.scoped_retry_full and (target_sequence > runtime.scoped_retry_scan_sequence or runtime.scoped_retry_has_tail)));
     if (runtime.retrying and !new_work and runtime.clock.nowRealtimeMs() < runtime.next_retry_at_ms) {
         runtime.mutex.unlock(io);
@@ -12436,7 +12587,10 @@ fn runForegroundCatchUpPassOwned(
     }
     if (scheduler.generation != generation) return error.EnrichmentSourceChanged;
     if (scheduler.unsaved) try scheduler.save(runtime);
-    try scheduler.pruneObsoleteSources(runtime);
+    runtime.mutex.lockUncancelable(io);
+    const prune_target = @max(target_sequence, runtime.target_sequence);
+    runtime.mutex.unlock(io);
+    try scheduler.pruneObsoleteSources(runtime, prune_target);
     const config_hash = try enrichmentCatalogConfigHash(runtime.alloc, runtime.index_manager);
     const config_changed = scheduler.state.config_hash != 0 and scheduler.state.config_hash != config_hash;
     if (config_changed) {
@@ -12455,6 +12609,7 @@ fn runForegroundCatchUpPassOwned(
     }
     runtime.retry_scheduler = &scheduler;
     defer runtime.retry_scheduler = null;
+    try scheduler.activateDueSleeperPage(runtime);
     const due = try scheduler.state.dueWithReferences(runtime.alloc, runtime.clock.nowRealtimeMs(), ScopedReplay.documentResolver(runtime), 4 * 1024 * 1024);
     defer due.deinit(runtime.alloc);
     var processed_request_count: u64 = 0;
@@ -12475,9 +12630,11 @@ fn runForegroundCatchUpPassOwned(
         scheduler.state.retire(runtime.alloc, due.tokens);
         try scheduler.save(runtime);
     }
-    const available_documents = scoped_retries.max_documents - scheduler.state.tickets.items.len;
-    // No new window is admitted while every durable scheduling slot is in use.
-    // One slot is reserved per document before any external invocation begins.
+    // Reserve a slot per newly scanned document before any provider call. A
+    // sleeping ticket occupies disk capacity and cannot consume that slot.
+    if (target_sequence > scheduler.state.scanned_sequence or scheduler.state.hasScanDocument() or scheduler.activeSlots() == 0)
+        try scheduler.spillForWave(runtime, ScopedReplay.discovery_wave);
+    const available_documents = scheduler.state.discoverySlots();
     const replay_window: @import("../derived/replay_source.zig").Source.EnrichmentWindow = if (available_documents != 0)
         try runtime.replay_source.collectEnrichmentDocumentGroupsWindow(runtime.alloc, scheduler.state.scanned_sequence -| @as(u64, if (scheduler.state.hasScanDocument()) 1 else 0), .{
             .max_records = 4096,
@@ -12495,7 +12652,7 @@ fn runForegroundCatchUpPassOwned(
         if (group.sequence > scheduler.state.scanned_sequence or
             (group.sequence == scheduler.state.scanned_sequence and std.mem.order(u8, group.doc_key, scan_key) == .gt)) break;
     };
-    const end = start + @min(available_documents, replay_window.groups.len - start);
+    const end = start + try scheduler.activateDiscoveryPrefix(runtime, replay_window.groups[start..]);
     const pending = replay_window.groups[start..end];
     const replay_applied = runtime.appliedSequence();
     var replay_cursor_assets = if (config_changed) null else try loadReplayCursorForPass(runtime, replay_applied, .assets, config_hash, generation);
@@ -12524,7 +12681,7 @@ fn runForegroundCatchUpPassOwned(
     };
     try drain_result;
     try replay_lease_guard.check();
-    if (available_documents != 0) {
+    if (available_documents != 0 and (end != start or end == replay_window.groups.len)) {
         if (end < replay_window.groups.len) {
             try scheduler.state.setScanDocument(runtime.alloc, pending[pending.len - 1]);
         } else {
@@ -12544,7 +12701,7 @@ fn runForegroundCatchUpPassOwned(
     runtime.mutex.lockUncancelable(io);
     // A full queue still checks a newly notified primary revision once, so
     // deletion/replacement can release slots without a busy polling loop.
-    runtime.scoped_retry_observed_target = @max(runtime.scoped_retry_observed_target, target_sequence);
+    runtime.scoped_retry_observed_target = @max(runtime.scoped_retry_observed_target, prune_target);
     runtime.processed_requests += processed_request_count;
     runtime.retrying = false;
     clearScheduledIndexEmbeddingRetriesAssumeLocked(runtime);
@@ -20532,7 +20689,7 @@ fn flushTextAssetProducerBatchItems(
     for (items, 0..) |*item, idx| requests[idx] = item.asRequest();
 
     const can_batch = assetProducerCanBatchGuarded(runtime, producer, runtime.alloc, requests) catch |err| {
-        if (err == error.ProviderInvocationCanceled) return deferCanceledAssetBatch(runtime, producer, items, window, scope);
+        if (deferWholeAssetBatch(err)) return parkAssetBatch(runtime, producer, items, window, scope, err);
         if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) == .fatal_worker) return err;
         return try flushAssetProducerBatchSequential(runtime, producer, items, window, scope);
     };
@@ -20541,7 +20698,7 @@ fn flushTextAssetProducerBatchItems(
 
     var produced_batch = assetProducerProduceBatchReportedGuarded(runtime, producer, runtime.alloc, requests) catch |err| {
         if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) == .fatal_worker) return err;
-        if (err == error.ProviderInvocationCanceled) return deferCanceledAssetBatch(runtime, producer, items, window, scope);
+        if (deferWholeAssetBatch(err)) return parkAssetBatch(runtime, producer, items, window, scope, err);
         // Batch execution is an optimization boundary, not a logical repair
         // identity. Fall back immediately so durable retry ownership belongs to
         // each source request and cannot oscillate between batch and singleton
@@ -20598,8 +20755,13 @@ fn noteParkedRequests(runtime: *EnrichmentRuntime, scheduler: *ScopedReplay, err
     scheduler.refreshRuntime(runtime);
 }
 
-fn deferCanceledAssetBatch(runtime: *EnrichmentRuntime, producer: asset_producer_mod.Producer, items: []AssetProducerBatchItem, window: *GeneratedReplayWindow, scope: *FailureScope) !void {
-    const cause = error.ProviderInvocationCanceled;
+fn deferWholeAssetBatch(err: anyerror) bool {
+    // A whole invocation refused admission. Trying each item immediately
+    // would repeat the same overloaded call without isolating bad input.
+    return err == error.ProviderInvocationCanceled or err == error.QueueFull or err == error.InferenceCapacityUnavailable;
+}
+
+fn parkAssetBatch(runtime: *EnrichmentRuntime, producer: asset_producer_mod.Producer, items: []AssetProducerBatchItem, window: *GeneratedReplayWindow, scope: *FailureScope, cause: anyerror) !void {
     var outcome: AssetBatchOutcome = .{};
     var pending: std.ArrayListUnmanaged(ScopedReplay.ParkMember) = .empty;
     defer pending.deinit(runtime.alloc);
@@ -42148,6 +42310,7 @@ fn reconcileRuntimeObservation(runtime: *EnrichmentRuntime, observed: enrichment
         runtime.scoped_retry_pending = false;
         runtime.scoped_retry_wait = false;
         runtime.scoped_retry_full = false;
+        runtime.scoped_retry_maintenance = false;
         runtime.scoped_retry_has_tail = false;
         runtime.scoped_retry_scan_sequence = observed.applied;
         runtime.scoped_retry_observed_target = observed.applied;
@@ -50339,6 +50502,18 @@ test "asset batch fallback keeps the logical request retry budget" {
     try std.testing.expectEqual(@as(usize, 2), producer_impl.single_count);
     try std.testing.expectEqual(@as(usize, 1), failure_capture.count);
 
+    producer_impl.negotiation_error = null;
+    producer_impl.batch_error = error.InferenceCapacityUnavailable;
+    for ([_][]const u8{ "doc:4", "doc:5" }) |key| {
+        try third.append(alloc, try TestItem.make(alloc));
+        third.items[third.items.len - 1].request.doc_key = key;
+    }
+    var capacity_scope = FailureScope{};
+    try std.testing.expectError(error.InferenceCapacityUnavailable, flushAssetProducerBatch(&runtime, &third, &window, &capacity_scope));
+    try std.testing.expectEqual(@as(usize, 4), producer_impl.batch_count);
+    try std.testing.expectEqual(@as(usize, 2), producer_impl.single_count);
+
+    producer_impl.batch_error = error.Cancelled;
     var scheduler = try ScopedReplay.load(&runtime);
     defer scheduler.deinit(alloc);
     runtime.retry_scheduler = &scheduler;

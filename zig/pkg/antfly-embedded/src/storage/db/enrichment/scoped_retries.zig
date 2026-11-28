@@ -16,6 +16,7 @@
 const std = @import("std");
 const A = std.mem.Allocator;
 const binary = @import("scoped_retry_encoding.zig");
+pub const backlog = @import("scoped_retry_backlog.zig");
 const Group = @import("enrichment_worker.zig").PendingDocumentGroup;
 
 /// A bounded durable workset, separate from the contiguous applied watermark.
@@ -143,6 +144,7 @@ pub const PreparedDocument = struct { delayed: []u64, changed: bool };
 const BudgetKey = struct { logical: u64, digest: ?[32]u8 };
 const BudgetCounts = struct { failures: u32 = 0, waits: u32 = 0 };
 pub const State = struct {
+    sleeping: backlog.Backlog = .{},
     config_hash: u64 = 0,
     scanned_sequence: u64 = 0,
     scan_document: []const u8 = "",
@@ -172,6 +174,8 @@ pub const State = struct {
         _ = self.tickets.swapRemove(index);
     }
     pub fn beginReplan(self: *State) void {
+        for (self.sleeping.entries.items) |*entry| entry.replan = true;
+        if (self.sleeping.entries.items.len != 0) self.sleeping.dirty = true;
         for (self.tickets.items) |ticket| self.pending_replan.set(ticket.slot);
     }
     pub fn completeReplan(self: *State, due_work: Due) void {
@@ -206,6 +210,7 @@ pub const State = struct {
     pub fn deinit(self: *State, a: A) void {
         for (self.tickets.items) |*ticket| ticket.deinit(a);
         self.tickets.deinit(a);
+        self.sleeping.deinit(a);
         self.logical_budgets.deinit(a);
         self.logical_present.deinit(a);
         self.releasePersistedDocuments(a);
@@ -492,10 +497,31 @@ pub const State = struct {
         try validateTicket(ticket);
         return ticket;
     }
+    fn ticketEncodedSize(ticket: Ticket) !usize {
+        const referenced = isReference(ticket.document);
+        const size = 4 + 4 + try binary.keyLength(wireIdentity(ticket.document)) + @as(usize, if (referenced) 9 + @as(usize, if (ticket.document_location != null) 37 else 0) else 0) + 8 + 1 + @as(usize, if (ticket.source_digest != null) 32 else 0) + 1 + @as(usize, if (ticket.source_stamp != null) 48 else 0) + 8 + 8 + 2 + ticket.budgets.items.len * 40;
+        return size;
+    }
+
+    pub fn discoverySlots(self: State) usize {
+        // Retain a promotion slot even at the durable disk bound.
+        return (max_documents - 1) -| self.tickets.items.len;
+    }
+
+    pub fn discoverySaturated(self: State) bool {
+        if (self.discoverySlots() != 0) return false;
+        if (self.sleeping.entries.items.len >= backlog.max_entries) return true;
+        for (self.tickets.items) |ticket| {
+            const allowance = backlogAllowance(ticket) catch continue;
+            if (self.sleeping.canAdd(allowance)) return false;
+        }
+        return true;
+    }
+
     fn encodeTicket(ticket: Ticket, a: A) ![]u8 {
         try validateTicket(ticket);
         const referenced = isReference(ticket.document);
-        const size = 4 + 4 + try binary.keyLength(wireIdentity(ticket.document)) + @as(usize, if (referenced) 9 + @as(usize, if (ticket.document_location != null) 37 else 0) else 0) + 8 + 1 + @as(usize, if (ticket.source_digest != null) 32 else 0) + 1 + @as(usize, if (ticket.source_stamp != null) 48 else 0) + 8 + 8 + 2 + ticket.budgets.items.len * 40;
+        const size = try ticketEncodedSize(ticket);
         const bytes = try a.alloc(u8, size);
         errdefer a.free(bytes);
         var writer = binary.Writer{ .bytes = bytes };
@@ -637,6 +663,88 @@ pub const State = struct {
         };
         return result;
     }
+    pub fn hasDebt(self: State) bool {
+        return self.tickets.items.len != 0 or self.sleeping.entries.items.len != 0;
+    }
+
+    // Reserve the maximum metadata for this same document so promoting and
+    // rescheduling a sleeper cannot consume the last slot at the disk bound.
+    fn backlogAllowance(ticket: Ticket) !usize {
+        const key_bytes = try binary.keyLength(wireIdentity(ticket.document));
+        const reference_metadata: usize = if (isReference(ticket.document)) 9 + 37 else 0;
+        const document_bytes = std.math.cast(usize, ticket.document_bytes) orelse return error.InvalidEnrichmentState;
+        return (4 + max_ticket_bytes - max_document_key_bytes + reference_metadata + key_bytes) +| document_bytes;
+    }
+
+    /// Encode the retry payload with its own large-ID bytes so ordinary
+    /// working-set reference collection can proceed independently.
+    pub fn spill(self: *State, a: A, index: usize, resolver: DocumentResolver) !bool {
+        const ticket = self.tickets.items[index];
+        const allowance = try backlogAllowance(ticket);
+        if (!self.sleeping.canAdd(allowance)) return false;
+        const raw = try encodeTicket(ticket, a);
+        defer a.free(raw);
+        const size = 4 + raw.len + @as(usize, @intCast(ticket.document_bytes));
+        const bytes = try a.alloc(u8, size);
+        errdefer a.free(bytes);
+        var writer = binary.Writer{ .bytes = bytes };
+        writer.int(u32, @intCast(raw.len));
+        writer.put(raw);
+        if (ticket.document_bytes != 0) {
+            const document = try self.documentAlloc(a, ticket.document, ticket.document_bytes, resolver);
+            defer a.free(document);
+            writer.put(document);
+        }
+        try self.sleeping.insert(a, .{
+            .id = backlog.Identity.init(ticket.document, ticket.sequence),
+            .bytes = size,
+            .charged_bytes = allowance,
+            .deadline_ms = ticket.deadline_ms,
+            .replan = self.pending_replan.isSet(ticket.slot),
+        }, bytes);
+        self.removeTicket(a, index);
+        return true;
+    }
+
+    pub fn readSleeping(a: A, entry: backlog.Entry, bytes: []const u8) !struct { ticket: Ticket, key: []const u8 } {
+        if (entry.bytes != bytes.len) return error.InvalidEnrichmentState;
+        var reader = binary.Reader{ .bytes = bytes };
+        var ticket = try decodeTicket(a, try reader.take(try reader.int(u32)), 0);
+        errdefer ticket.deinit(a);
+        if (backlog.Identity.order(entry.id, backlog.Identity.init(ticket.document, ticket.sequence)) != .eq or
+            entry.deadline_ms != ticket.deadline_ms) return error.InvalidEnrichmentState;
+        if (ticket.document_bytes != bytes.len - reader.offset) return error.InvalidEnrichmentState;
+        const key = bytes[reader.offset..];
+        if (key.len != 0) {
+            var digest: Reference = undefined;
+            std.crypto.hash.sha2.Sha256.hash(key, &digest, .{});
+            if (!std.mem.eql(u8, &digest, &(try referenceDigest(ticket.document)))) return error.InvalidEnrichmentState;
+        }
+        return .{ .ticket = ticket, .key = key };
+    }
+
+    pub fn activate(self: *State, a: A, index: usize, bytes: []const u8) !void {
+        const entry = self.sleeping.entries.items[index];
+        if (self.tickets.items.len == max_documents) return error.MemoryBudgetExceeded;
+        var decoded = try readSleeping(a, entry, bytes);
+        errdefer decoded.ticket.deinit(a);
+        decoded.ticket.slot = self.nextSlot();
+        try self.tickets.ensureUnusedCapacity(a, 1);
+        try self.rememberDocument(a, decoded.ticket.document, decoded.key);
+        try self.sleeping.remove(a, index);
+        self.tickets.appendAssumeCapacity(decoded.ticket);
+        if (entry.replan) self.pending_replan.set(decoded.ticket.slot);
+        self.invalidateBudgetIndex();
+    }
+
+    fn nextSlot(self: State) u8 {
+        var used: std.StaticBitSet(max_documents) = .empty;
+        for (self.tickets.items) |existing| used.set(existing.slot);
+        var slot: usize = 0;
+        while (used.isSet(slot)) : (slot += 1) {}
+        return @intCast(slot);
+    }
+
     pub fn priorAttempt(self: State, document: []const u8, logical: u64, fingerprint: u64, source_digest: ?[32]u8) Budget {
         var result = Budget{ .fingerprint = fingerprint, .logical_fingerprint = logical };
         for (self.tickets.items) |ticket| {
@@ -677,11 +785,7 @@ pub const State = struct {
         }
         if (selected == null) {
             if (self.tickets.items.len == max_documents) return error.MemoryBudgetExceeded;
-            var used: std.StaticBitSet(max_documents) = .empty;
-            for (self.tickets.items) |existing| used.set(existing.slot);
-            var slot: usize = 0;
-            while (used.isSet(slot)) : (slot += 1) {}
-            var ticket = Ticket{ .slot = @intCast(slot), .source_stamp = stamp, .document = try a.dupe(u8, encoded), .document_bytes = if (isReference(encoded)) group.doc_key.len else 0, .document_location = if (isReference(encoded)) location else null, .sequence = group.sequence, .source_digest = source_digest, .deadline_ms = deadline_ms, .revision = 1 };
+            var ticket = Ticket{ .slot = self.nextSlot(), .source_stamp = stamp, .document = try a.dupe(u8, encoded), .document_bytes = if (isReference(encoded)) group.doc_key.len else 0, .document_location = if (isReference(encoded)) location else null, .sequence = group.sequence, .source_digest = source_digest, .deadline_ms = deadline_ms, .revision = 1 };
             errdefer ticket.deinit(a);
             var next = budget;
             next.deadline_ms = deadline_ms;
@@ -739,11 +843,13 @@ pub const State = struct {
         if (self.pending_replan.count() != 0) return 0;
         var result: u64 = std.math.maxInt(u64);
         for (self.tickets.items) |ticket| result = @min(result, ticket.deadline_ms);
-        return if (self.tickets.items.len == 0) 0 else result;
+        for (self.sleeping.entries.items) |entry| result = @min(result, if (entry.replan) 0 else entry.deadline_ms);
+        return if (self.hasDebt()) result else 0;
     }
     pub fn appliedThrough(self: State, scanned: u64) u64 {
         var result = scanned;
         for (self.tickets.items) |ticket| result = @min(result, ticket.sequence -| 1);
+        for (self.sleeping.entries.items) |entry| result = @min(result, entry.id.sequence -| 1);
         return result;
     }
     pub fn due(self: State, a: A, now_ms: u64) !Due {

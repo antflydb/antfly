@@ -29640,7 +29640,7 @@ components:
           description: Latest enrichment replay watermark requested of the worker.
         retry_queue_full:
           type: boolean
-          description: Whether parked requests have filled the worker's bounded retry queue.
+          description: Whether retry debt is preventing the worker from admitting new source groups.
         retrying:
           type: boolean
           description: Whether the worker has retry work.

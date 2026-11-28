@@ -166487,32 +166487,67 @@ test "db scoped retry workset processes healthy batches across restart before a 
     try db.batch(.{ .deletes = &.{"gone"}, .sync_level = .write });
     try db.runEnrichmentUntil(db.core.nextEnrichmentSequence());
     try std.testing.expectEqual(before_delete, mock.bad_calls);
-    // Saturating the bounded workset applies backpressure to the unscanned
-    // tail. A deletion must release a slot before any long provider clock.
-    const capacity_writes = try a.alloc(types.BatchWrite, 129);
+    // Full active worksets move sleeping tickets to disk. A newer healthy
+    // document can publish while the oldest unresolved sequence pins replay.
+    try db.addEnrichment(.{ .name = "other_summary", .kind = .asset, .field = "other", .content_type = "application/json", .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"independent-generator\"}}" });
+    const deferred_count = 260;
+    const capacity_writes = try a.alloc(types.BatchWrite, deferred_count);
     defer a.free(capacity_writes);
     var capacity_initialized: usize = 0;
     defer for (capacity_writes[0..capacity_initialized]) |write| a.free(write.key);
     for (capacity_writes, 0..) |*write, i| {
-        write.* = .{ .key = try std.fmt.allocPrint(a, "capacity-{d:0>3}", .{i}), .value = if (i < 128) "{\"body\":\"bad\"}" else "{\"body\":\"healthy\"}" };
+        write.* = .{ .key = try std.fmt.allocPrint(a, "capacity-{d:0>3}", .{i}), .value = "{\"body\":\"bad\"}" };
         capacity_initialized += 1;
     }
     const before_capacity = mock.bad_calls;
     const healthy_before_capacity = mock.healthy_calls;
     try db.batch(.{ .writes = capacity_writes, .sync_level = .write });
-    try std.testing.expectError(error.EnrichmentRetryInProgress, db.runEnrichmentUntil(db.core.nextEnrichmentSequence()));
-    try std.testing.expectEqual(before_capacity + 128, mock.bad_calls);
-    try std.testing.expectEqual(healthy_before_capacity, mock.healthy_calls);
-    try std.testing.expect(db.enrichment_runtime.?.scoped_retry_full);
-    try db.batch(.{ .deletes = &.{capacity_writes[0].key}, .sync_level = .write });
-    try std.testing.expectError(error.EnrichmentRetryInProgress, db.runEnrichmentUntil(db.core.nextEnrichmentSequence()));
-    try std.testing.expectEqual(before_capacity + 128, mock.bad_calls);
+    const blocked_target = db.core.nextEnrichmentSequence();
+    try std.testing.expectError(error.EnrichmentRetryInProgress, db.runEnrichmentUntil(blocked_target));
+    try std.testing.expectEqual(before_capacity + deferred_count, mock.bad_calls);
+    const blocked_deadline = db.enrichment_runtime.?.next_retry_at_ms;
+    {
+        var queue = try enrichment_state.loadScopedRetries(a, db.enrichment_runtime.?.store);
+        defer queue.deinit(a);
+        try std.testing.expect(queue.sleeping.entries.items.len > 128);
+        try std.testing.expect(queue.tickets.items.len <= 128);
+        try std.testing.expectEqual(queue.deadline(), blocked_deadline);
+    }
+    db.close();
+    opened = false;
+    clock.advanceMs(30_000);
+    db = try DB.open(a, tmp.path(), options);
+    opened = true;
+    try db.batch(.{ .writes = &.{.{ .key = "after-backlog", .value = "{\"other\":\"healthy\"}" }}, .sync_level = .write });
+    const later_target = db.core.nextEnrichmentSequence();
+    try std.testing.expectError(error.EnrichmentRetryInProgress, db.runEnrichmentUntil(later_target));
+    try std.testing.expectEqual(before_capacity + deferred_count, mock.bad_calls);
     try std.testing.expectEqual(healthy_before_capacity + 1, mock.healthy_calls);
-    var deletes: [127][]const u8 = undefined;
-    for (&deletes, capacity_writes[1..128]) |*delete_key, write| delete_key.* = write.key;
+    try std.testing.expectEqual(blocked_deadline, db.enrichment_runtime.?.next_retry_at_ms);
+    try std.testing.expect(db.enrichment_runtime.?.applied_sequence < blocked_target);
+    try std.testing.expect(db.enrichment_runtime.?.scoped_retry_scan_sequence >= later_target);
+    try std.testing.expect(!db.enrichment_runtime.?.scoped_retry_full);
+    const later_key = try internal_keys.artifactNamedPrefixAlloc(a, "after-backlog", "asset", "other_summary");
+    defer a.free(later_key);
+    const later_value = try db.core.store.get(a, later_key);
+    defer a.free(later_value);
+    try std.testing.expect(std.mem.indexOf(u8, later_value, "healthy") != null);
+
+    // Delete many sleepers and let the survivors retry at their deadline.
+    var deletes: [deferred_count - 2][]const u8 = undefined;
+    for (&deletes, capacity_writes[0..deletes.len]) |*delete_key, write| delete_key.* = write.key;
     try db.batch(.{ .deletes = &deletes, .sync_level = .write });
+    try std.testing.expectError(error.EnrichmentRetryInProgress, db.runEnrichmentUntil(db.core.nextEnrichmentSequence()));
+    {
+        var queue = try enrichment_state.loadScopedRetries(a, db.enrichment_runtime.?.store);
+        defer queue.deinit(a);
+        try std.testing.expectEqual(@as(usize, 2), queue.tickets.items.len + queue.sleeping.entries.items.len);
+    }
+    try std.testing.expectEqual(before_capacity + deferred_count, mock.bad_calls);
+    mock.recover = true;
+    clock.advanceMs(3_600_000);
     try db.runEnrichmentUntil(db.core.nextEnrichmentSequence());
-    try std.testing.expectEqual(before_capacity + 128, mock.bad_calls);
+    try std.testing.expectEqual(before_capacity + deferred_count + 2, mock.bad_calls);
 }
 
 test "db scoped retry workset never parks committed earlier chunk requests" {

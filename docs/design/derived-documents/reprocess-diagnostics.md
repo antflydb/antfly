@@ -55,4 +55,23 @@ The artifact inspection and metrics are separate samples. While the target
 remains pending, maintain the published generation and source row. Provider
 retry hints continue to pace requests, including explicit reprocess requests.
 A new explicit request starts a fresh attempt budget for its extraction after
-the existing deadline. The shard's durable retry queue still bounds admission.
+the existing deadline.
+
+Native replay uses an active workset of at most 128 documents and stores
+overflow sleeping tickets in a durable per-shard backlog. A replay pass can
+process ready retries and scan fresh documents while older tickets wait. The
+worker keeps each ticket's retry deadline, attempt budget, source identity, and
+sequence across restarts. The scan frontier can move after its retry debt is
+durable. The applied frontier remains behind the oldest unresolved ticket, even
+if later documents have already published.
+
+The backlog allows up to 4,096 sleeping tickets subject to a separate
+256 MiB allowance. The byte allowance reserves each ticket's maximum producer
+metadata and its retained document identifier. If neither the active workset
+nor the backlog can take more work, `retry_queue_full` signals backpressure.
+Deleting or replacing sources can retire obsolete tickets on a bounded
+maintenance pass. Replay also frees capacity as retries finish.
+
+A runtime with backlog support can read older retry state. A downgrade to an
+older runtime requires draining the backlog first so the older runtime cannot
+advance past retry debt it cannot read.
