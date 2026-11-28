@@ -2843,6 +2843,15 @@ context held 184 MiB before and after the comparison. A separate untimed
 public serving run recorded 18 arena executions and nine graph replays
 across six requests at each group width.
 
+At `e10519eb17`, all 31 Spark focused checks passed with zero skips.
+The released LightOnOCR-3-0.8B public reader returned the same outputs as
+the serial reference for two pages. Its bounded CUDA decoder replayed
+two rows with a 44-byte admitted pinned receipt, a 2,004,992-byte shared
+layer workspace and 297,216 bytes of declared attention scratch. The
+fixture verified terminal logits storage reuse and the sizes of the
+attention normalization, mirror and residual regions. This is a
+correctness and storage receipt, with latency still to qualify.
+
 ### Isolated Metal E4B HTTP comparison at `58b3917a89`
 
 The local M4 Max used the same pinned binaries as the mixed serving
