@@ -927,7 +927,13 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
             serial_owned = false; // transferred to the returned metadata owner
             ctx.cleanup_owner.rotateAfterUnlock() catch |err| {
                 parked.restore() catch platform.inference_process_supervisor.restartWorker();
-                return err;
+                // The live boundary and all borrowed gates were restored.
+                // Optional graph preparation can decline, and required
+                // admission can retry when retained retirement records drain.
+                return switch (err) {
+                    error.RetirementEpochCapacityExceeded => error.ResourceTemporarilyUnavailable,
+                    else => err,
+                };
             };
             // Recovery is temporary. Every later outside opportunity retries
             // normal cache preparation instead of preserving a disabled policy.
