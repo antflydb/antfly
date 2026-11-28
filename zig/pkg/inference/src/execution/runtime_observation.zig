@@ -551,6 +551,7 @@ pub const CudaDecoderWorkspace = struct {
     /// Each layer's output is live alongside that layer's scratch.
     declared_attention_output_bytes: usize = 0,
     declared_recurrent_output_bytes: usize = 0,
+    declared_recurrent_joined_projection_bytes: usize = 0,
     declared_ffn_scratch_bytes: usize = 0,
     declared_ffn_output_bank_bytes: usize = 0,
     declared_projection_staging_bytes: usize = 0,

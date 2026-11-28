@@ -88,6 +88,7 @@ pub const StorageLayout = struct {
     attention_workspace: ?Span = null,
     attention_output: ?Span = null,
     recurrent_workspace: ?Span = null,
+    recurrent_projection_joined: ?Span = null,
     recurrent_output: ?Span = null,
     ffn_workspace: ?Span = null,
     ffn_outputs: ?Span = null,
@@ -214,6 +215,7 @@ pub const StorageLayout = struct {
             self.attention_workspace,
             self.attention_output,
             self.recurrent_workspace,
+            self.recurrent_projection_joined,
             self.recurrent_output,
             self.ffn_workspace,
             self.ffn_outputs,
@@ -406,6 +408,7 @@ pub const GraphPhase = struct {
         final_norm_mirror: bool = false,
         layer_norm: bool = false,
         fused_attention_inputs: bool = false,
+        fused_recurrent_projections: bool = false,
     };
 
     /// Resolve layer lifetimes in submission order from the descriptor. A
@@ -417,6 +420,15 @@ pub const GraphPhase = struct {
         try self.declareAttentionOutput();
         if (policy.recurrent_scratch) try self.declareRecurrentScratch();
         try self.declareRecurrentOutput();
+        // The joined GEMM result dies at the projection split, before either
+        // attention core or the FFN enters the serial scratch bank.
+        if (policy.fused_recurrent_projections and self.descriptor.recurrent_layers != 0) {
+            const widths = self.descriptor.recurrent_projection_widths orelse return error.InvalidShape;
+            var width: usize = 0;
+            for (widths) |part| width = try std.math.add(usize, width, part);
+            const elements = try std.math.mul(usize, self.descriptor.rows, width);
+            self.storage_layout.recurrent_projection_joined = try self.storage_layout.declareLayerWorkspace(try std.math.mul(usize, elements, @sizeOf(f32)));
+        }
         if (policy.compact_ffn) |compact| try self.declareFfnScratch(compact);
         if (policy.layer_norm and self.storage_layout.ffn_outputs == null) {
             const elements = try std.math.mul(usize, self.descriptor.rows, self.descriptor.hidden);
@@ -1021,6 +1033,13 @@ pub const Module = struct {
         return try projection_bank.borrowRange(offset, bytes);
     }
 
+    pub fn bindJoinedRecurrentProjection(self: *const Module, bytes: usize) !?buffer.DeviceBuffer {
+        const layout = self.storage_layout orelse return error.InvalidExecutionPlan;
+        const span = layout.recurrent_projection_joined orelse return null;
+        if (bytes != span.bytes) return error.InvalidExecutionPlan;
+        return try self.bindLayerWorkspace(layout, span, bytes);
+    }
+
     pub const RecurrentProjection = enum { mixed, gate, beta, decay };
 
     pub fn bindRecurrentProjection(self: *const Module, kind: RecurrentProjection, bytes: usize) !?buffer.DeviceBuffer {
@@ -1279,6 +1298,7 @@ test "bounded CUDA decoder shares declared attention and recurrent workspace" {
         try phase.initInto(projected);
         var projection_policy = mirror_policy;
         projection_policy.layer_norm = true;
+        projection_policy.fused_recurrent_projections = true;
         try phase.prepareWorkspace(projection_policy);
         const projection_layout = phase.storage_layout;
         const projection_owner: Module = .{
@@ -1294,6 +1314,12 @@ test "bounded CUDA decoder shares declared attention and recurrent workspace" {
         try std.testing.expectEqual(k_dst.ptr + k_dst.len, v_dst.ptr);
         try std.testing.expect(v_dst.ptr + v_dst.len <= projection_owner.metadata.ptr + projection_layout.projection_staging.?.offset);
         try std.testing.expectError(error.InvalidExecutionPlan, projection_owner.bindAttentionProjection(.query, q_bytes - @sizeOf(f32)));
+        const joined_bytes = rows * (recurrent_widths[0] + recurrent_widths[1] + recurrent_widths[2] + recurrent_widths[3]) * @sizeOf(f32);
+        const joined = (try projection_owner.bindJoinedRecurrentProjection(joined_bytes)).?;
+        try std.testing.expectEqual(projection_owner.metadata.ptr + projection_layout.attention_workspace.?.offset, joined.ptr);
+        try std.testing.expect(joined.ptr + joined.len <= projection_owner.metadata.ptr + projection_layout.ffn_outputs.?.offset);
+        try std.testing.expect(joined.ptr + joined.len <= q_dst.ptr);
+        try std.testing.expectError(error.InvalidExecutionPlan, projection_owner.bindJoinedRecurrentProjection(joined_bytes - 4));
         var next_ptr = q_dst.ptr;
         for (recurrent_widths, 0..) |width, index| {
             const bytes = rows * width * @sizeOf(f32);

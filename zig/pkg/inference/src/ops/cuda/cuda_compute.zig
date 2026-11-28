@@ -4022,6 +4022,7 @@ pub const CudaCompute = struct {
                     .attention_scratch_bytes = if (layout.attention_workspace) |span| span.bytes else 0,
                     .recurrent_scratch_bytes = owner.bound_recurrent_scratch_bytes,
                     .declared_attention_output_bytes = if (layout.attention_output) |span| span.bytes else 0,
+                    .declared_recurrent_joined_projection_bytes = if (layout.recurrent_projection_joined) |span| span.bytes else 0,
                     .declared_recurrent_output_bytes = if (layout.recurrent_output) |span| span.bytes else 0,
                     .declared_ffn_scratch_bytes = if (layout.ffn_workspace) |span| span.bytes else 0,
                     .declared_ffn_output_bank_bytes = if (layout.ffn_outputs) |span| span.bytes else 0,
@@ -4272,6 +4273,12 @@ pub const CudaCompute = struct {
             .projection_staging = cudaCublasLtEnabled() and self.cublaslt != null and self.ctx.info.compute_major >= 8,
             .layer_norm = true,
             .fused_attention_inputs = lightOnProjectionResidualEnabled(cb),
+            .fused_recurrent_projections = if (descriptor.recurrent_projection_widths) |widths|
+                lightOnProjectionFusionEnabled(cb) and self.lazy_host_store == null and lightOnDevice(self).portableKernels() and
+                    inputProjectionGeometry(descriptor.hidden, widths[0], widths[1], widths[2]) and widths[2] == widths[3] and
+                    cudaCublasLtEnabled() and self.cublaslt != null
+            else
+                false,
             .final_norm_mirror = cudaRmsNormBf16MirrorEnabled() and cudaCublasLtEnabled() and self.cublaslt != null and self.ctx.info.compute_major >= 8,
         }) catch |err| switch (err) {
             error.InvalidShape, error.Overflow => return .unsupported,
@@ -5216,21 +5223,23 @@ pub const CudaCompute = struct {
         const combined = combined_owner.buffer;
         const staged = (try stageBf16ActivationForCublasLt(self, input, rows, hidden)) orelse return null;
         const count = try checkedMul(rows, total_width);
-        var joined = try allocDeviceBuffer(self, try checkedMul(count, 4));
-        defer releaseDeviceBuffer(self, &joined);
+        const joined_bytes = try checkedMul(count, @sizeOf(f32));
+        const owner = &self.bounded_decode_graph;
+        const assigned = owner.active and rows == owner.rows and hidden == owner.hidden;
+        const destination = if (assigned) try owner.bindJoinedRecurrentProjection(joined_bytes) else null;
+        var joined = destination orelse try allocDeviceBuffer(self, joined_bytes);
+        defer if (destination == null) releaseDeviceBuffer(self, &joined);
         if (!try runCublasLtBf16Matmul(self, joined, staged, combined, cublasLtWorkspace(self), rows, hidden, total_width)) return null;
         self.stats.bf16_cublaslt_linear_calls += 1;
         var outputs: [4]CT = undefined;
         var created: usize = 0;
         errdefer for (outputs[0..created]) |output| cb.free(output);
-        const owner = &self.bounded_decode_graph;
-        const assigned = owner.active and rows == owner.rows and hidden == owner.hidden;
         for (widths, 0..) |width, i| {
             if (assigned) {
                 const elements = try checkedMul(rows, width);
                 const bytes = try checkedMul(elements, @sizeOf(f32));
-                const destination = try owner.bindRecurrentProjection(@fromBackingInt(@intCast(i)), bytes);
-                var output = try OwnedF32Output.fromOwnedShapeDestination(self, try allocShape2(self.allocator, rows, width), elements, bytes, destination);
+                const output_destination = try owner.bindRecurrentProjection(@fromBackingInt(@intCast(i)), bytes);
+                var output = try OwnedF32Output.fromOwnedShapeDestination(self, try allocShape2(self.allocator, rows, width), elements, bytes, output_destination);
                 outputs[i] = output.intoTensor();
             } else {
                 outputs[i] = (try cb.allocUninitF32Shape(&.{ @intCast(rows), @intCast(width) })).?;

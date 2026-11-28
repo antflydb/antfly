@@ -48817,7 +48817,12 @@ test "LightOnOCR3 real checkpoint transcribes the invoice fixture" {
                 try std.testing.expectEqual(ffn.scratch_bytes, report.declared_ffn_scratch_bytes);
                 try std.testing.expectEqual(2 * ffn.output_bytes, report.declared_ffn_output_bank_bytes);
             }
-            const serial_bytes = @max(attention_bytes, recurrent_bytes, report.declared_ffn_scratch_bytes);
+            const recurrent_key_width = @as(usize, geometry.qwen35_linear_num_key_heads) * geometry.qwen35_linear_key_head_dim;
+            const recurrent_value_width = @as(usize, geometry.qwen35_linear_num_value_heads) * geometry.qwen35_linear_value_head_dim;
+            const recurrent_projection_bytes = 2 * report.rows * (recurrent_key_width + recurrent_value_width + geometry.qwen35_linear_num_value_heads) * @sizeOf(f32);
+            if (report.declared_recurrent_joined_projection_bytes != 0 or platform.env.getenvBool("ANTFLY_CUDA_ENABLE_LIGHTON_FUSED_PROJECTIONS"))
+                try std.testing.expectEqual(recurrent_projection_bytes, report.declared_recurrent_joined_projection_bytes);
+            const serial_bytes = @max(attention_bytes, recurrent_bytes, report.declared_ffn_scratch_bytes, report.declared_recurrent_joined_projection_bytes);
             const layer_and_outputs_bytes = if (report.declared_ffn_output_bank_bytes != 0) std.mem.alignForward(usize, serial_bytes, alignment) + report.declared_ffn_output_bank_bytes else serial_bytes;
             const norm_bytes = report.rows * geometry.hidden_size * @sizeOf(f32);
             try std.testing.expectEqual(norm_bytes, report.declared_layer_norm_bytes);
@@ -48841,9 +48846,6 @@ test "LightOnOCR3 real checkpoint transcribes the invoice fixture" {
             const kv_projection_bytes = report.rows * geometry.effectiveKVHeads() * geometry.headDim() * @sizeOf(f32);
             const q_projection_bytes = attention_output * @as(usize, if (geometry.qwen35_attn_output_gate) 2 else 1);
             try std.testing.expectEqualDeep([3]usize{ q_projection_bytes, kv_projection_bytes, kv_projection_bytes }, projections);
-            const recurrent_key_width = @as(usize, geometry.qwen35_linear_num_key_heads) * geometry.qwen35_linear_key_head_dim;
-            const recurrent_value_width = @as(usize, geometry.qwen35_linear_num_value_heads) * geometry.qwen35_linear_value_head_dim;
-            const recurrent_projection_bytes = 2 * report.rows * (recurrent_key_width + recurrent_value_width + geometry.qwen35_linear_num_value_heads) * @sizeOf(f32);
             const layer_and_projections_bytes = std.mem.alignForward(usize, layer_and_inputs_bytes, alignment) + @max(q_projection_bytes + 2 * kv_projection_bytes, recurrent_projection_bytes);
             const layer_and_staging_bytes = if (report.declared_projection_staging_bytes != 0)
                 std.mem.alignForward(usize, @max(layer_and_projections_bytes, report.shared_head_scratch_bytes), alignment) + report.declared_projection_staging_bytes
