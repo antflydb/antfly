@@ -71,10 +71,13 @@ def parse_unicode_data(path: pathlib.Path) -> tuple[bytearray, bytearray]:
         )
 
         letter_case = (
-            1 if category == "Ll" else
-            2 if category in ("Lu", "Lt") else
-            3 if category.startswith("M") else
-            0
+            1
+            if category == "Ll"
+            else 2
+            if category in ("Lu", "Lt")
+            else 3
+            if category.startswith("M")
+            else 0
         )
 
         if name.endswith(", First>"):
@@ -164,7 +167,9 @@ def cased_ranges(cased: bytearray) -> list[int]:
     return result
 
 
-def render(version: str, indices: list[int], pages: list[bytes], cased: list[int]) -> str:
+def render(
+    version: str, indices: list[int], pages: list[bytes], cased: list[int]
+) -> str:
     rendered_pages = []
     for page in pages:
         rendered_pages.append(
@@ -231,7 +236,8 @@ def main() -> None:
     apply_whitespace(classes, pathlib.Path(prop_list_path))
     indices, pages = packed_pages(classes)
     pathlib.Path(output_path).write_text(
-        unicode_source_header(__file__) + render(version, indices, pages, cased_ranges(cased)),
+        unicode_source_header(__file__)
+        + render(version, indices, pages, cased_ranges(cased)),
         encoding="utf-8",
     )
     print(f"generated {len(indices)} page indices and {len(pages)} unique pages")
