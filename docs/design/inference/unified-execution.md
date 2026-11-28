@@ -3431,6 +3431,21 @@ a declared zero-event workspace. Inline attention reached 113 rows
 in one arm and 30 in the other. This comparison exercises wide replay
 inside an unchanged cohort. Replay after rebinding remains open.
 
+The opt-in guarded rebind can suspend a recorded graph when a
+referenced non-leader page departs. It requires the next cohort to
+retain the exact width, packet leaders, immutable weight pointers,
+global KV roots and physical workspace geometry. The new tables and
+positions must be staged before replay can resume. A packet leader
+or incompatible binding still retires the graph. Tests check the
+typed recurrent key and these rejection gates.
+
+With both device tables enabled, the Spark 4B ABBA comparison
+completed 1,024 pages with exact serial output. Paired throughput
+was 6.27 pages/s with rebinding off and 6.31 with it on. All four
+arms replayed at 113 rows. No arm exercised a completed rebind,
+so the timing comparison does not qualify changing-cohort replay.
+All four focused CUDA checks passed.
+
 The M4 Max focused cohort at `061f213135` passed all seven checks
 with zero skips. It exercised the shared installed Whisper Small
 checkpoint with the Metal backend required, verified assigned packed

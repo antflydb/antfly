@@ -311,6 +311,66 @@ pub const Phase = enum {
         };
     }
 };
+/// View of the recurrent section of a captured decoder key.
+pub const RecurrentPageKey = struct {
+    words: []const u64,
+    rows: usize,
+    layers: usize,
+    layer_words: usize,
+
+    const gdn = @import("gated_delta.zig");
+    const weight_words = 4;
+    const page_words = 3;
+
+    pub fn init(key: []const u64, start: usize, rows: usize, layers: usize) !RecurrentPageKey {
+        if (rows == 0 or layers == 0 or start > key.len) return error.InvalidShape;
+        const packets = (rows - 1) / gdn.max_packet_rows + 1;
+        const layer_words = try std.math.add(usize, try std.math.mul(usize, packets, weight_words), try std.math.mul(usize, rows, page_words));
+        const count = try std.math.mul(usize, layers, layer_words);
+        if (count > key.len - start) return error.InvalidShape;
+        return .{ .words = key[start..][0..count], .rows = rows, .layers = layers, .layer_words = layer_words };
+    }
+
+    pub fn page(self: RecurrentPageKey, layer: usize, row: usize) gdn.BatchPage {
+        std.debug.assert(layer < self.layers and row < self.rows);
+        const offset = layer * self.layer_words + row * page_words +
+            (row / gdn.max_packet_rows + 1) * weight_words;
+        const words = self.words[offset..][0..page_words];
+        return .{ .state = words[0], .history = words[1], .next_history = words[2] };
+    }
+
+    fn samePacketWeights(self: RecurrentPageKey, candidate: RecurrentPageKey) bool {
+        if (self.rows != candidate.rows or self.layers != candidate.layers) return false;
+        const packets = (self.rows - 1) / gdn.max_packet_rows + 1;
+        for (0..self.layers) |layer| {
+            for (0..packets) |packet| {
+                const offset = layer * self.layer_words + packet * (gdn.max_packet_rows * page_words + weight_words);
+                if (!std.mem.eql(u64, self.words[offset..][0..weight_words], candidate.words[offset..][0..weight_words])) return false;
+            }
+        }
+        return true;
+    }
+
+    fn packetLeaderState(self: RecurrentPageKey, address: u64) bool {
+        const packets = (self.rows - 1) / gdn.max_packet_rows + 1;
+        for (0..self.layers) |layer| {
+            for (0..packets) |packet| {
+                if (self.page(layer, packet * gdn.max_packet_rows).state == address) return true;
+            }
+        }
+        return false;
+    }
+
+    fn referencesState(self: RecurrentPageKey, address: u64) bool {
+        for (0..self.layers) |layer| {
+            for (0..self.rows) |row| {
+                if (self.page(layer, row).state == address) return true;
+            }
+        }
+        return false;
+    }
+};
+
 /// Borrowed only through one final-address Executor phase. Full key/positions
 /// remain synchronous under the held worker step; no such borrow enters Module.
 pub const Descriptor = struct {
@@ -351,7 +411,8 @@ pub const Descriptor = struct {
             .adaptive_bank, .shared_layer_packets => |rows| rows,
         };
         var storage = try StorageLayout.initWithHeadLimit(self.rows, self.hidden, self.vocab, self.key.len, packet_rows);
-        if (self.recurrent_page_key_start != null) {
+        if (self.recurrent_page_key_start) |start| {
+            _ = try RecurrentPageKey.init(self.key, start, self.rows, self.recurrent_layers);
             const count = try std.math.mul(usize, self.rows, self.recurrent_layers);
             const bytes = try std.math.mul(usize, count, @sizeOf(@import("gated_delta.zig").BatchPage));
             if (bytes == 0 or bytes > plan_mod.limit) return error.InvalidShape;
@@ -400,6 +461,7 @@ pub const Descriptor = struct {
 };
 
 pub const Snapshot = struct {
+    rebind_required: bool,
     invalidations: u64,
     epoch: u64,
     phase: Phase,
@@ -649,6 +711,14 @@ pub const GraphPhase = struct {
 
     pub fn matchesOwner(self: *const GraphPhase, owner: *const Module) bool {
         if (!owner.matches(self.descriptor)) return false;
+        return self.matchesStorage(owner);
+    }
+
+    pub fn canRebind(self: *const GraphPhase, owner: *const Module) bool {
+        return owner.admitsRebind(self.descriptor) and self.matchesStorage(owner);
+    }
+
+    fn matchesStorage(self: *const GraphPhase, owner: *const Module) bool {
         var storage = owner.storage_layout orelse return false;
         const expected = self.storage_layout;
         if (self.descriptor.head_storage == .adaptive_bank and storage.head_bytes < expected.head_bytes) {
@@ -770,6 +840,7 @@ pub const GraphPhase = struct {
 };
 
 pub const Module = struct {
+    rebind_required: bool = false,
     mutex: std.atomic.Mutex = .unlocked,
     epoch_id: u64 = 0,
     sequences: [max_rows]u64 = undefined,
@@ -812,8 +883,10 @@ pub const Module = struct {
     capture_step: u32 = 0,
     recurrent_page_layer: usize = 0,
     recurrent_page_table_staged: bool = false,
+    recurrent_page_key_start: ?usize = null,
     attention_page_tables_staged: bool = false,
     attention_page_packet: usize = 0,
+    attention_page_size: u32 = 0,
     active: bool = false,
     captures: u64 = 0,
     replays: u64 = 0,
@@ -850,6 +923,7 @@ pub const Module = struct {
         const live = self.head.ptr != 0 or self.metadata.ptr != 0 or self.arena.ptr != 0 or self.graph != null or self.pending_graph != null;
         if (live and (ctx.driver.fns.cuStreamIsCapturing == null or try ctx.streamCaptureActive())) return error.CapturedGraphActive;
         self.phase = .disabled;
+        self.rebind_required = false;
         self.active = false;
         if (self.head.ptr != 0 or self.metadata.ptr != 0 or self.arena.ptr != 0 or self.graph != null or self.pending_graph != null) try ctx.synchronize();
         // Every failed SDK handle remains in this actual owner. Neither quota
@@ -887,6 +961,7 @@ pub const Module = struct {
         else
             null;
         return .{
+            .rebind_required = self.rebind_required,
             .invalidations = self.invalidations,
             .epoch = self.epoch_id,
             .phase = self.phase,
@@ -961,14 +1036,68 @@ pub const Module = struct {
         return self.sequence_count == 0 or std.mem.indexOfScalar(u64, self.sequences[0..self.sequence_count], sequence) != null;
     }
 
-    /// Production keys include the recurrent address of every bound layer.
-    /// A matching word elsewhere in a key can only cause conservative retirement.
+    /// The device-table route distinguishes state addresses from packet weights.
+    /// Legacy keys use conservative membership when their layout is unavailable.
     pub fn referencesRecurrentAddress(self: *const Module, address: u64) bool {
-        return self.sequence_count == 0 or (address != 0 and std.mem.indexOfScalar(u64, self.key, address) != null);
+        if (self.sequence_count == 0) return true;
+        if (address == 0) return false;
+        if (self.recurrent_page_key_start) |start| {
+            const bindings = RecurrentPageKey.init(self.key, start, self.rows, self.recurrent_layers) catch return true;
+            return bindings.referencesState(address);
+        }
+        return std.mem.indexOfScalar(u64, self.key, address) != null;
+    }
+
+    pub fn canSuspendBinding(self: *const Module, dependency: Dependency) bool {
+        if (self.active or self.phase != .replay or self.graph == null or !self.recurrent_page_table_staged or
+            !self.attention_page_tables_staged or self.sequence_count != self.rows) return false;
+        const start = self.recurrent_page_key_start orelse return false;
+        const pages = RecurrentPageKey.init(self.key, start, self.rows, self.recurrent_layers) catch return false;
+        return switch (dependency) {
+            .recurrent => |address| address != 0 and pages.referencesState(address) and !pages.packetLeaderState(address),
+            .sequence => |sequence| blk: {
+                const row = std.mem.indexOfScalar(u64, self.sequences[0..self.sequence_count], sequence) orelse break :blk false;
+                break :blk row % RecurrentPageKey.gdn.max_packet_rows != 0;
+            },
+        };
+    }
+
+    fn admitsRebind(self: *const Module, descriptor: Descriptor) bool {
+        if (!self.rebind_required or self.active or self.phase != .replay or self.graph == null or
+            self.epoch_id != descriptor.epoch or self.rows != descriptor.rows or self.hidden != descriptor.hidden or
+            self.vocab != descriptor.vocab or self.attention_layers != descriptor.attention_layers or
+            self.recurrent_layers != descriptor.recurrent_layers or self.key.len != descriptor.key.len or
+            self.sequence_count != self.rows or descriptor.sequences.len != self.rows or
+            descriptor.attention_page_key_start == null or descriptor.attention_tokens.len != self.rows or
+            self.attention_page_size == 0 or self.attention_page_size != descriptor.attention_page_size) return false;
+        const start = self.recurrent_page_key_start orelse return false;
+        if (descriptor.recurrent_page_key_start != start) return false;
+        const old = RecurrentPageKey.init(self.key, start, self.rows, self.recurrent_layers) catch return false;
+        const next = RecurrentPageKey.init(descriptor.key, start, descriptor.rows, descriptor.recurrent_layers) catch return false;
+        const kv_words = self.attention_layers * 3 + 1;
+        if (kv_words > self.key.len) return false;
+        const kv_start = self.key.len - kv_words;
+        if (kv_start < start + old.words.len or descriptor.attention_page_key_start != start + old.words.len) return false;
+        if (!std.mem.eql(u64, self.key[0..start], descriptor.key[0..start]) or
+            !std.mem.eql(u64, self.key[kv_start..], descriptor.key[kv_start..]) or
+            !old.samePacketWeights(next)) return false;
+        const packets = (self.rows - 1) / RecurrentPageKey.gdn.max_packet_rows + 1;
+        for (0..packets) |packet| {
+            const leader = packet * RecurrentPageKey.gdn.max_packet_rows;
+            if (self.sequences[leader] != descriptor.sequences[leader]) return false;
+        }
+        return true;
+    }
+
+    pub fn publishRebind(self: *Module, descriptor: Descriptor) void {
+        std.debug.assert(self.admitsRebind(descriptor));
+        @memcpy(self.key, descriptor.key);
+        @memcpy(self.sequences[0..self.sequence_count], descriptor.sequences);
+        self.rebind_required = false;
     }
 
     pub fn matches(self: *const Module, descriptor: Descriptor) bool {
-        return self.epoch_id == descriptor.epoch and self.rows == descriptor.rows and
+        return !self.rebind_required and self.epoch_id == descriptor.epoch and self.rows == descriptor.rows and
             self.hidden == descriptor.hidden and self.vocab == descriptor.vocab and
             self.attention_layers == descriptor.attention_layers and self.recurrent_layers == descriptor.recurrent_layers and
             self.key.len != 0 and std.mem.eql(u64, self.key, descriptor.key) and
@@ -982,7 +1111,9 @@ pub const Module = struct {
         self.vocab = vocab;
         self.storage_layout = layout;
         self.recurrent_page_table_staged = false;
+        self.recurrent_page_key_start = null;
         self.attention_page_tables_staged = false;
+        self.attention_page_size = 0;
         @memcpy(self.base_positions[0..positions_.len], positions_);
         @memcpy(self.next_positions[0..positions_.len], positions_);
         self.phase = .warm;
@@ -1035,6 +1166,8 @@ pub const Module = struct {
         self.epoch_id = descriptor.epoch;
         self.attention_layers = descriptor.attention_layers;
         self.recurrent_layers = descriptor.recurrent_layers;
+        self.recurrent_page_key_start = descriptor.recurrent_page_key_start;
+        self.attention_page_size = descriptor.attention_page_size;
         self.attention_scratch = phase.attention_scratch;
         self.vendor_workspace = phase.vendor_workspace;
         self.expected_attention_calls = dispatch.attention;
@@ -2080,6 +2213,96 @@ test "CUDA bounded decoder validates dispatch geometry before preparing storage"
     descriptor.recurrent_layers = std.math.maxInt(usize);
     var phase: GraphPhase = undefined;
     try std.testing.expectError(error.Overflow, phase.initInto(descriptor));
+}
+
+test "bounded CUDA decoder recurrent page key distinguishes packet weights and state" {
+    const rows = @import("gated_delta.zig").max_packet_rows + 2;
+    const layer_words = rows * 3 + 2 * 4;
+    var words: [2 * layer_words + 3]u64 = @splat(0);
+    words[0] = 11;
+    words[1] = 12;
+    words[2] = 13;
+    words[3 + 4] = 21;
+    words[3 + 64 * 3 + 8] = 22;
+    words[3 + layer_words + 64 * 3 + 8] = 23;
+    const pages = try RecurrentPageKey.init(&words, 3, rows, 2);
+    try std.testing.expectEqual(@as(u64, 21), pages.page(0, 0).state);
+    try std.testing.expectEqual(@as(u64, 22), pages.page(0, 64).state);
+    try std.testing.expectEqual(@as(u64, 23), pages.page(1, 64).state);
+    try std.testing.expect(!pages.referencesState(11));
+    try std.testing.expect(pages.referencesState(23));
+    try std.testing.expectError(error.InvalidShape, RecurrentPageKey.init(words[0 .. words.len - 1], 3, rows, 2));
+
+    var owner: Module = .{
+        .key = &words,
+        .rows = rows,
+        .recurrent_layers = 2,
+        .sequence_count = rows,
+        .recurrent_page_key_start = 3,
+    };
+    try std.testing.expect(owner.referencesRecurrentAddress(23));
+    try std.testing.expect(!owner.referencesRecurrentAddress(11));
+    owner.recurrent_page_key_start = null;
+    try std.testing.expect(owner.referencesRecurrentAddress(11));
+}
+
+test "bounded CUDA decoder rebind protects packet leaders and captured KV roots" {
+    // One prefix word, four weight pointers, two recurrent bindings, a
+    // representative mutable page word and one four-word global KV root.
+    var previous = [_]u64{ 100, 10, 11, 12, 13, 21, 22, 23, 31, 32, 33, 80, 90, 91, 92, 93 };
+    var next = previous;
+    next[8] = 41;
+    next[11] = 81;
+    var owner: Module = .{
+        .phase = .replay,
+        .graph = @ptrFromInt(16),
+        .epoch_id = 1,
+        .rows = 2,
+        .hidden = 1024,
+        .vocab = 128,
+        .attention_layers = 1,
+        .recurrent_layers = 1,
+        .recurrent_page_key_start = 1,
+        .recurrent_page_table_staged = true,
+        .attention_page_tables_staged = true,
+        .attention_page_size = 16,
+        .key = &previous,
+        .sequence_count = 2,
+    };
+    owner.sequences[0..2].* = .{ 3, 4 };
+    const descriptor: Descriptor = .{
+        .epoch = 1,
+        .key = &next,
+        .sequences = &.{ 3, 5 },
+        .positions = &.{ 1, 1, 1, 2, 2, 2 },
+        .rows = 2,
+        .hidden = 1024,
+        .vocab = 128,
+        .future_tokens = 32,
+        .attention_layers = 1,
+        .recurrent_layers = 1,
+        .recurrent_page_key_start = 1,
+        .attention_page_key_start = 11,
+        .attention_page_size = 16,
+        .attention_tokens = &.{ 5, 7 },
+    };
+    try std.testing.expect(owner.canSuspendBinding(.{ .sequence = 4 }));
+    try std.testing.expect(owner.canSuspendBinding(.{ .recurrent = 31 }));
+    try std.testing.expect(!owner.canSuspendBinding(.{ .sequence = 3 }));
+    try std.testing.expect(!owner.canSuspendBinding(.{ .recurrent = 21 }));
+    try std.testing.expect(!owner.admitsRebind(descriptor));
+    owner.rebind_required = true;
+    try std.testing.expect(owner.admitsRebind(descriptor));
+    next[1] += 1;
+    try std.testing.expect(!owner.admitsRebind(descriptor));
+    next[1] -= 1;
+    next[12] += 1;
+    try std.testing.expect(!owner.admitsRebind(descriptor));
+    next[12] -= 1;
+    owner.publishRebind(descriptor);
+    try std.testing.expect(!owner.rebind_required);
+    try std.testing.expect(owner.referencesSequence(5) and !owner.referencesSequence(4));
+    try std.testing.expect(owner.referencesRecurrentAddress(41) and !owner.referencesRecurrentAddress(31));
 }
 
 test "bounded decoder graph reuse requires the prepared dispatch geometry" {

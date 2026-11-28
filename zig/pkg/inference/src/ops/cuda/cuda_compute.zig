@@ -3739,15 +3739,10 @@ pub const CudaCompute = struct {
         const count = try checkedMul(descriptor.rows, descriptor.recurrent_layers);
         const bindings = try self.allocator.alloc(gdn.BatchPage, count);
         defer self.allocator.free(bindings);
-        var cursor = start;
+        const key = try @import("bounded_decode_graph.zig").RecurrentPageKey.init(descriptor.key, start, descriptor.rows, descriptor.recurrent_layers);
         for (bindings, 0..) |*binding, index| {
-            const row = index % descriptor.rows;
-            if (row % gdn.max_packet_rows == 0) cursor = try checkedAdd(cursor, 4);
-            if (cursor > descriptor.key.len or descriptor.key.len - cursor < 3) return error.InvalidExecutionPlan;
-            const page = descriptor.key[cursor..][0..3];
-            binding.* = .{ .state = page[0], .history = page[1], .next_history = page[2] };
+            binding.* = key.page(index / descriptor.rows, index % descriptor.rows);
             if (binding.state == 0 or binding.history == 0 or binding.next_history == 0) return error.InvalidExecutionPlan;
-            cursor += 3;
         }
         try copyFromHostTracked(self, table, std.mem.sliceAsBytes(bindings));
     }
@@ -3969,6 +3964,7 @@ pub const CudaCompute = struct {
             const compute = self.compute;
             const owner = &compute.bounded_decode_graph;
             if (owner.phase == .replay) {
+                if (owner.rebind_required) return error.InvalidExecutionPlan;
                 try compute.ctx.launchGraph(owner.graph);
                 self.launch_route = .replayed;
                 owner.replays += 1;
@@ -4200,6 +4196,18 @@ pub const CudaCompute = struct {
         defer self.bounded_decode_graph.mutex.unlock();
         const owner = &self.bounded_decode_graph;
         if (!owner.retirementPending() or !owner.references(dependency)) return;
+        if (dependency) |binding| {
+            if (platform.env.getenvBool("ANTFLY_CUDA_LIGHTON_GRAPH_REBIND") and owner.canSuspendBinding(binding)) {
+                try owner.validateCleanup(current);
+                if (!owner.rebind_required) {
+                    // The old tables remain in the graph, but no caller may
+                    // submit them after the departing row can recycle state.
+                    try self.ctx.synchronize();
+                    owner.rebind_required = true;
+                }
+                return;
+            }
+        }
         try self.retireCapturedGraph(current, reason);
     }
     pub fn externalPrefillEnabled(cb: *const ops.ComputeBackend) bool {
@@ -4407,13 +4415,14 @@ pub const CudaCompute = struct {
         phase.admission = self.ctx.video_cache_budget.admission;
         phase.old = owner.snapshot();
         const matches_owner = phase.matchesOwner(owner);
-        const next_phase: @import("bounded_decode_graph.zig").Phase = if (matches_owner) owner.phase else .warm;
+        const can_rebind = !matches_owner and phase.canRebind(owner);
+        const next_phase: @import("bounded_decode_graph.zig").Phase = if (matches_owner or can_rebind) owner.phase else .warm;
         if (next_phase == .disabled) return .unsupported;
         if (!next_phase.canReachReplay(descriptor.minimum_remaining_tokens)) {
             phase.insufficient_replay_horizon = true;
             return .unsupported;
         }
-        if (!matches_owner) {
+        if (!matches_owner and !can_rebind) {
             if (try self.ctx.streamCaptureActive()) return .unsupported;
             if (owner.resets_logged < 12 and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) {
                 var mismatch: usize = 0;
@@ -4511,7 +4520,8 @@ pub const CudaCompute = struct {
         var claimed = false;
         defer if (!claimed) owner.mutex.unlock();
         if (owner.disabled_epoch == epoch) return null;
-        if (!graph_phase.matchesOwner(owner)) {
+        const rebind = graph_phase.canRebind(owner);
+        if (!graph_phase.matchesOwner(owner) and !rebind) {
             owner.resetPrepared(&self.ctx, graph_phase) catch |err| switch (err) {
                 error.CudaMemoryLimitExceeded => {
                     owner.admission_denials += 1;
@@ -4533,7 +4543,7 @@ pub const CudaCompute = struct {
         }
         const head_destination = try owner.bindExecutionStorage();
         const capture_scope = if (owner.phase == .capture) try owner.bindArena() else null;
-        if (!owner.recurrent_page_table_staged and descriptor.recurrent_page_key_start != null) {
+        if ((rebind or !owner.recurrent_page_table_staged) and descriptor.recurrent_page_key_start != null) {
             try self.stageBoundedRecurrentPages(descriptor);
             owner.recurrent_page_table_staged = true;
         }
@@ -4541,7 +4551,7 @@ pub const CudaCompute = struct {
         try self.lighton_attention.init(&self.ctx);
         if (owner.phase == .warm and owner.storage_layout.?.fused_head_workspace != null)
             try self.lighton_head.init(&self.ctx);
-        if (owner.phase != .replay) {
+        if (owner.phase != .replay or rebind) {
             if (descriptor.attention_page_key_start != null) {
                 owner.attention_page_tables_staged = false;
                 try self.stageBoundedAttentionPages(descriptor, descriptor.attention_page_size);
@@ -4554,6 +4564,12 @@ pub const CudaCompute = struct {
             const zero = [_]u32{0};
             try copyFromHostTracked(self, owner.counter(), std.mem.sliceAsBytes(&zero));
         }
+        if (rebind) {
+            owner.publishRebind(descriptor);
+            if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
+                std.debug.print("LIGHTONOCR3 cuda_model_graph_rebound_rows={d}\n", .{rows});
+        }
+
         // Ensure the owned cohort can retain its warmed plans. Prefill shape
         // diversity may exhaust the cache between otherwise valid epochs.
         if (owner.phase == .warm) if (self.cublaslt) |*blas| {
