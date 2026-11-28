@@ -2995,3 +2995,19 @@ scratch after fused projection declined, audio admission and cancellation,
 Florence cache reuse and token selection, and resident merged ONNX cache
 handoff. The Debug executor microbatch target passed 84 of 86 checks on
 the same Mac, with two skips, after updating its compiler memory bound.
+
+### Native and Metal ownership checks at `c5eee3e0cd`
+
+The focused M4 Max run passed 11 tests with zero skips. It covered
+assigned Metal QKV and attention workspace, audio projection clamp
+storage and segmented audio, the GLiNER workspace fence, resident
+Whisper publication, and the synthetic Inkling decoder visit schedule.
+The installed DECIDE 1B safetensors model returned the expected
+classification through the HTTP handler with Metal required.
+
+The same executable passed three Native checks with zero skips using
+the shared installed models and no rebuild. On both providers, the
+released T5-small merged ONNX decoder retained all 12 self-cache and
+12 cross-cache slots independently at prefixes 1, 8, 32 and 64. The
+released microbatch fixture fused suffixes after encoder retirement.
+Native also passed the DECIDE HTTP classification fixture.
