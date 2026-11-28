@@ -1523,7 +1523,7 @@ fn audioCacheRecipe(cb: *const ComputeBackend, cfg: AudioConfig, prepared: []con
     recipe.host_ops_empty = std.meta.eql(host, AudioHostOps{});
     recipe.depthwise_cached = !host.dwconv and !host.resident and (cb.vtable.depthwiseCausalConv1d != null or (prepared.len > 1 and cb.vtable.depthwiseCausalConv1dSegmented != null));
     recipe.graph_allowed = platform.env.getenv("ANTFLY_EMBEDDINGGEMMA2_STAGES") == null;
-    if (recipe.source_bf16 or cb.vtable.linearPackedNamed == null or host.clamp or !audioQkvFits(try recipe.rows(), recipe.hidden)) return recipe;
+    if (recipe.source_bf16 or !cb.supportsLinearPackedNamed() or host.clamp or !audioQkvFits(try recipe.rows(), recipe.hidden)) return recipe;
     for (0..recipe.blocks) |layer| {
         var specs: [3]ClampSpec = undefined;
         var supported = true;
@@ -4972,7 +4972,7 @@ const grouped_audio_block = @import("../execution/grouped_audio_block.zig");
 const GroupedAudioDeclaration = struct {
     const Scope = @import("../execution/stream_workspace.zig");
     const Event = Scope.Plan.Declaration;
-    pub const Value = struct { slot: ?u15 = null, width: usize };
+    pub const Value = struct { slot: ?u15 = null, mirror: ?u15 = null, width: usize };
 
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
@@ -5010,6 +5010,7 @@ const GroupedAudioDeclaration = struct {
     }
 
     pub fn release(self: *GroupedAudioDeclaration, value: Value) void {
+        if (value.mirror) |slot| self.events.appendAssumeCapacity(.{ .release = slot });
         if (value.slot) |slot| self.events.appendAssumeCapacity(.{ .release = slot });
     }
 
@@ -5077,9 +5078,10 @@ const GroupedAudioDeclaration = struct {
     }
 
     fn compile(cb: *const ComputeBackend, a: std.mem.Allocator, recipe: AudioCacheRecipe) !?audio_schedule.WorkspaceDeclaration {
-        if (!recipe.source_bf16 or !recipe.depthwise_cached or !recipe.allowsCudaGroupedGraph()) return null;
+        if (!recipe.depthwise_cached or !recipe.allowsCudaGroupedGraph()) return null;
         const query = cb.vtable.regions.audio_execution.workspaceBytes orelse return null;
         if (try query(cb.ptr, .{ .admit = .{ .source_bf16 = recipe.source_bf16 } }) == null) return null;
+        if (!recipe.source_bf16 and try query(cb.ptr, .{ .f32_plan = recipe }) == null) return null;
         if (cb.vtable.regions.audio_execution.cachedWorkspace) |lookup| {
             if (try lookup(cb.ptr, recipe)) |cached| return cached;
         }
@@ -5092,11 +5094,175 @@ const GroupedAudioDeclaration = struct {
         for (0..recipe.blocks) |layer| {
             try cb.checkExecutionControl();
             self.layer = layer;
-            const next = try grouped_audio_block.run(&self, state);
+            const next = if (recipe.source_bf16)
+                try grouped_audio_block.run(&self, state)
+            else run: {
+                var f32_plan = F32AudioDeclaration{ .plan = &self };
+                break :run try grouped_audio_block.run(&f32_plan, state);
+            };
             self.release(state);
             state = next;
         }
+        // The last normalization publishes only its F32 plane.
+        if (state.mirror) |slot| self.events.appendAssumeCapacity(.{ .release = slot });
         return audio_schedule.WorkspaceDeclaration.init(try self.events.toOwnedSlice(a), state.slot.?);
+    }
+};
+
+const F32AudioDeclaration = struct {
+    pub const Value = GroupedAudioDeclaration.Value;
+    plan: *GroupedAudioDeclaration,
+
+    pub fn release(self: *F32AudioDeclaration, value: Value) void {
+        self.plan.release(value);
+    }
+
+    fn make(self: *F32AudioDeclaration, width: usize) !Value {
+        return self.plan.allocate(width, 0);
+    }
+
+    fn normalizeStage(self: *F32AudioDeclaration, kind: grouped_audio_block.Norm, second: bool) !Value {
+        var logical: [128]u8 = undefined;
+        var resolved: [256]u8 = undefined;
+        const name = try hf_weights.resolve(&resolved, try groupedNormName(&logical, self.plan.layer, kind, second));
+        const width = self.plan.recipe.hidden;
+        const bytes = try self.plan.scratch(.{ .f32_norm = .{ .name = name, .rows = self.plan.rows, .width = width } });
+        var result = try self.make(width);
+        if (bytes != 0) result.mirror = try self.plan.addSlot(.{ .allocate = bytes });
+        return result;
+    }
+
+    fn bounds(self: *F32AudioDeclaration, kind: grouped_audio_block.Projection, second: bool) !ClampSpec {
+        var logical: [128]u8 = undefined;
+        const prefix = try groupedProjectionName(&logical, self.plan.layer, kind, second);
+        return switch (try loadResidentScalarClampSpec(self.plan.cb, prefix)) {
+            .spec => |spec| spec,
+            .unsupported => error.UnsupportedGroupedAudioWorkspace,
+        };
+    }
+
+    fn linear(self: *F32AudioDeclaration, kind: grouped_audio_block.Projection, second: bool, input: Value) !Value {
+        const recipe = self.plan.recipe;
+        const spec = try self.bounds(kind, second);
+        const geometry = groupedProjectionGeometry(recipe.hidden, recipe.intermediate, kind);
+        const clipped_input = if (spec.clipsInput()) try self.make(input.width) else null;
+        defer if (clipped_input) |value| self.release(value);
+        const projected = try self.make(geometry.columns);
+        if (kind == .ffn_up) {
+            const clamped = if (spec.clipsOutput()) try self.make(projected.width) else null;
+            defer if (clamped) |value| self.release(value);
+            const activated = try self.make(projected.width);
+            self.release(projected);
+            return activated;
+        }
+        if (!spec.clipsOutput()) return projected;
+        const clamped = try self.make(projected.width);
+        self.release(projected);
+        return clamped;
+    }
+
+    pub fn feedForward(self: *F32AudioDeclaration, _: Value, second: bool) !Value {
+        const down = project: {
+            const up = activate: {
+                const pre = try self.normalizeStage(.ffn_pre, second);
+                defer self.release(pre);
+                break :activate try self.linear(.ffn_up, second, pre);
+            };
+            defer self.release(up);
+            break :project try self.linear(.ffn_down, second, up);
+        };
+        const scaled = scale: {
+            const post = normalize: {
+                defer self.release(down);
+                break :normalize try self.normalizeStage(.ffn_post, second);
+            };
+            defer self.release(post);
+            break :scale try self.make(post.width);
+        };
+        defer self.release(scaled);
+        return self.make(scaled.width);
+    }
+
+    pub fn normalize(self: *F32AudioDeclaration, kind: grouped_audio_block.Norm, _: Value) !Value {
+        return self.normalizeStage(kind, false);
+    }
+
+    fn packedQkv(self: *F32AudioDeclaration, width: usize) ![3]Value {
+        const kinds = [_]grouped_audio_block.Projection{ .query, .key, .value };
+        const first = try self.bounds(.query, false);
+        const clipped_input = if (first.clipsInput()) try self.make(width) else null;
+        defer if (clipped_input) |value| self.release(value);
+        const packed_rows = try self.make(3 * width);
+        defer self.release(packed_rows);
+        var result: [3]Value = undefined;
+        for (kinds, &result) |kind, *value| {
+            const spec = try self.bounds(kind, false);
+            const slice = try self.make(width);
+            value.* = if (spec.clipsOutput()) clipped: {
+                defer self.release(slice);
+                break :clipped try self.make(width);
+            } else slice;
+        }
+        return result;
+    }
+
+    pub fn attend(self: *F32AudioDeclaration, input: Value) !Value {
+        const width = self.plan.recipe.hidden;
+        const use_packed = self.plan.recipe.packed_layers & (@as(u16, 1) << @intCast(self.plan.layer)) != 0;
+        const attended = attention: {
+            if (use_packed) {
+                const values = try self.packedQkv(width);
+                defer self.release(values[0]);
+                defer self.release(values[1]);
+                defer self.release(values[2]);
+                break :attention try self.make(width);
+            }
+            const q = try self.linear(.query, false, input);
+            defer self.release(q);
+            const k = try self.linear(.key, false, input);
+            defer self.release(k);
+            const v = try self.linear(.value, false, input);
+            defer self.release(v);
+            break :attention try self.make(width);
+        };
+        defer self.release(attended);
+        return self.linear(.attention_out, false, attended);
+    }
+
+    pub fn attentionResidual(self: *F32AudioDeclaration, input: Value, _: Value) !Value {
+        const normed = try self.normalizeStage(.attention_post, false);
+        defer self.release(normed);
+        return self.make(input.width);
+    }
+
+    pub fn convolve(self: *F32AudioDeclaration, input: Value) !Value {
+        const pw2 = project: {
+            const activated = activate: {
+                const normed = normalize: {
+                    const stencil = convolve: {
+                        const gated = gate: {
+                            const pw1 = project_input: {
+                                const pre = try self.normalizeStage(.convolution_pre, false);
+                                defer self.release(pre);
+                                break :project_input try self.linear(.convolution_in, false, pre);
+                            };
+                            defer self.release(pw1);
+                            break :gate try self.make(input.width);
+                        };
+                        defer self.release(gated);
+                        break :convolve try self.make(input.width);
+                    };
+                    defer self.release(stencil);
+                    break :normalize try self.normalizeStage(.convolution_post, false);
+                };
+                defer self.release(normed);
+                break :activate try self.make(input.width);
+            };
+            defer self.release(activated);
+            break :project try self.linear(.convolution_out, false, activated);
+        };
+        defer self.release(pw2);
+        return self.make(input.width);
     }
 };
 
@@ -5241,7 +5407,7 @@ fn tryAudioExecutionRange(cb: *const ComputeBackend, a: std.mem.Allocator, store
             try cb.checkExecutionControl();
             relative_keys[relative_count] = (try audioRelativeKey(cb, a, store, cfg, inputs.rel_in, layer, true)) orelse return null;
             relative_count += 1;
-            if (recipe.source_bf16) {
+            if (recipe.source_bf16 or recipe.workspace != null) {
                 var name: [128]u8 = undefined;
                 _ = try depthwiseConvWeightCt(cb, a, store, try AudioCacheRecipe.depthwiseWeightName(&name, layer), cfg.conv_kernel_size, cfg.audio_hidden);
             }

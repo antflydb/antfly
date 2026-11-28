@@ -6663,6 +6663,7 @@ test "embeddinggemma2 CUDA original grouped Stage output escrow preserves instru
     }
     const clips = initial[0..width];
     const AudioWitness = struct {
+        source_bf16: bool = false,
         owners: usize = 0,
         graphs: usize = 0,
         executions: u64 = 0,
@@ -6711,7 +6712,11 @@ test "embeddinggemma2 CUDA original grouped Stage output escrow preserves instru
             const cuda = @import("../ops/cuda/cuda_compute.zig");
             try cuda.CudaCompute.checkRequestCacheRetirement(&cb);
             const compute: *const cuda.CudaCompute = @ptrCast(@alignCast(cb.ptr));
-            var result = @This(){ .executions = compute.audio_arena_executes, .replays = compute.audio_graph_replays };
+            var result = @This(){
+                .source_bf16 = (try cb.sourceScalarStorage(.audio)) == .bf16,
+                .executions = compute.audio_arena_executes,
+                .replays = compute.audio_graph_replays,
+            };
             for (compute.audio_plans.entries) |entry| if (entry.owner != null and entry.owner.?.managed and !entry.disabled) {
                 result.owners += 1;
                 if (entry.owner.?.plan.origin == .declared) result.declared_owners += 1;
@@ -6743,7 +6748,7 @@ test "embeddinggemma2 CUDA original grouped Stage output escrow preserves instru
     }
     try std.testing.expectEqual(width, first_audio.vectors.len);
     try std.testing.expectEqual(BatchExecution.Execution.native_batch, first_audio.execution);
-    if (audio_optin and !observed_workspace) {
+    if (audio_optin and !observed_workspace and audio_before.source_bf16) {
         stage = "verify cold declared audio ownership";
         const cold = try AudioWitness.read(session, control);
         try std.testing.expect(cold.declared_owners > audio_before.declared_owners);

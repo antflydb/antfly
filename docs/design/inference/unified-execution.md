@@ -3149,6 +3149,17 @@ addresses, no projection launch during preparation, and exact projection
 output. The twelve released-model audio cases also passed with the
 packing policy enabled and matched eager CUDA exactly.
 
+The released F32 route now declares the grouped workspace, including
+clamp lifetimes and optional RMS mirrors. An ordinary submission warms
+vendor staging before the plan binds its addresses. The width-two Spark
+receipt recorded one warm submission, zero learned plans, one capture,
+and three replays. Spark passed all 21 released-model cases across
+declared BF16 and declared or observed F32 at widths two through four,
+with exact eager parity after changing the samples. Declared F32 also
+passed with the packed projection policy enabled. Planned and captured
+arena sizes matched the previous observed capacities. Three local
+audio and Metal checks passed. HTTP latency for this change is pending.
+
 ### Isolated Metal E4B HTTP comparison at `58b3917a89`
 
 The local M4 Max used the same pinned binaries as the mixed serving

@@ -8322,6 +8322,8 @@ pub const CudaCompute = struct {
         if (!try audioWorkspaceLowerBoundFits(recipe, segments[0..recipe.count], rows, base)) return;
         if (recipe.workspace) |workspace| {
             if (workspace.events.len == 0) return;
+            // F32 vendor staging needs one real invocation to materialize.
+            if (!recipe.source_bf16 and (existing == null or !existing.?.warmed)) return;
             // Seal the exact same event program before reserving either charge.
             var preview: AudioPlan.Owner = .{ .allocator = std.heap.page_allocator };
             preview.declare(base, workspace.events, workspace.published_slot) catch return;
@@ -8376,6 +8378,7 @@ pub const CudaCompute = struct {
         hash.update(std.mem.asBytes(&bits));
         hash.update(std.mem.asBytes(&self.embedding_gemma2_execution.weight_generation));
         hash.update(std.mem.asBytes(&self.cublaslt_workspace_scratch.buffer.ptr));
+        hash.update(std.mem.asBytes(&self.bf16_activation_scratch.buffer.ptr));
         hash.update(std.mem.asBytes(&self.embedding_gemma2_constant_generation));
         return AudioCacheBase.resolve(&hash, inputs, spans);
     }
@@ -21822,6 +21825,29 @@ fn groupedAudioWorkspaceBytes(ctx: *anyopaque, physical: @import("../../executio
                 (sourceScalarStorageOp(ctx, .audio) == .bf16) != precision.source_bf16) return null;
             return 0;
         },
+        .f32_plan => |recipe| {
+            if (self.ctx.info.compute_major < 8) return null;
+            // A new pack changes the generation used by Stage admission.
+            // Let the existing prepared route publish it before declaring.
+            const widths = [3]usize{ recipe.hidden, recipe.hidden, recipe.hidden };
+            for (0..recipe.blocks) |layer| {
+                if (recipe.packed_layers & (@as(u16, 1) << @intCast(layer)) == 0) continue;
+                var storage: [3][128]u8 = undefined;
+                const names = try audioPackedQkvNames(&storage, layer);
+                const request = try CudaCompute.packedNamedCacheRequest(&names, &widths, recipe.hidden);
+                if (self.embedding_gemma2_execution.findPacked(request.packed_weight.name.slice()) == null) return null;
+            }
+            return 0;
+        },
+        .f32_norm => |value| {
+            const weight = self.resident_weights.getPtr(value.name) orelse return null;
+            if (weight.dtype != .f32 or weight.quant_type != null or weight.tc_quant != null or weight.buffer.ptr == 0 or
+                weight.elem_count != value.width or !std.mem.eql(i64, weight.shape, &.{@intCast(value.width)})) return null;
+            return if (rmsNormBf16MirrorSupported(self, value.rows))
+                try checkedMul(try checkedMul(value.rows, value.width), @sizeOf(u16))
+            else
+                0;
+        },
         .linear => |value| {
             const weight = self.resident_weights.getPtr(value.name) orelse return null;
             const geometry = try SourceLinearGeometry.resolve(value.rows, null, value.width, value.columns);
@@ -21910,6 +21936,19 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
     }
     const base_key = cache_base.key;
     const entry = try self.audio_plans.getWithCleanup(base_key, plan_cleanup);
+    if (dispatch.workspace != null and dispatch.geometry != null and !dispatch.geometry.?.recipe.source_bf16 and !entry.disabled and !entry.warmed and entry.owner == null) {
+        // Stage may grow vendor scratch on its first ordinary submission.
+        // Keep the declaration and warm its final pointer signature without
+        // learning allocations from the real run.
+        const result = try run(context, inputs);
+        if (std.mem.indexOfScalar(CT, inputs, result) != null) return error.AudioPlanChanged;
+        errdefer freeTensorWithCleanup(self, result, plan_cleanup);
+        const warmed_base = try self.audioCacheBase(plan_key, input_metadata[0..inputs.len], null);
+        const warmed_entry = try self.audio_plans.getWithCleanup(warmed_base.key, plan_cleanup);
+        warmed_entry.warmed = true;
+        observation.cudaAudioResult(.warmed);
+        return result;
+    }
     if (!entry.disabled and entry.owner == null) if (dispatch.workspace) |workspace| {
         if (workspace.events.len == 0) return null;
         if (self.ctx.prepared_cache_funding) |funding| {
