@@ -29943,7 +29943,9 @@ pub fn tryCapturedAttentionOutputProjection(cb: *const ops.ComputeBackend, input
     return try cb.observeBackendEntry(.linear_no_bias, &linearNoBiasWithDestination, .{ self, input, weight, rows, in_dim, out_dim, false, @as(?buffer_mod.DeviceBuffer, destination) });
 }
 
-pub fn tryCapturedAttentionResidual(cb: *const ops.ComputeBackend, a: CT, b: CT) !?CT {
+pub const CapturedResidual = enum { attention, layer_output };
+
+pub fn tryCapturedResidual(cb: *const ops.ComputeBackend, a: CT, b: CT, kind: CapturedResidual) !?CT {
     if (!acceptsPhysicalImplementation(cb.vtable)) return null;
     const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
     const owner = &self.bounded_decode_graph;
@@ -29954,7 +29956,14 @@ pub fn tryCapturedAttentionResidual(cb: *const ops.ComputeBackend, a: CT, b: CT)
     try ensureF32(lhs);
     try ensureF32(rhs);
     const bytes = try checkedMul(lhs.elem_count, @sizeOf(f32));
-    const destination = (try owner.bindAttentionResidual(bytes)) orelse return null;
+    const destination = switch (kind) {
+        .attention => (try owner.bindAttentionResidual(bytes)) orelse return null,
+        .layer_output => blk: {
+            const layout = owner.storage_layout orelse return error.InvalidExecutionPlan;
+            if (layout.ffn_outputs == null) return null;
+            break :blk try owner.bindLayerOutput(bytes, &.{ lhs.buffer, rhs.buffer });
+        },
+    };
     try buffer_mod.validateRegions(3, .{ lhs.buffer, rhs.buffer, destination }, @splat(bytes), @splat(@alignOf(f32)), 2);
     const shape = try dupeShape(self.allocator, lhs.shape);
     var output = try OwnedF32Output.fromOwnedShapeDestination(self, shape, lhs.elem_count, bytes, destination);

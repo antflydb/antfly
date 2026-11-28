@@ -412,6 +412,10 @@ pub const GraphPhase = struct {
         if (policy.recurrent_scratch) try self.declareRecurrentScratch();
         try self.declareRecurrentOutput();
         if (policy.compact_ffn) |compact| try self.declareFfnScratch(compact);
+        if (policy.layer_norm and self.storage_layout.ffn_outputs == null) {
+            const elements = try std.math.mul(usize, self.descriptor.rows, self.descriptor.hidden);
+            try self.declareLayerOutputs(try std.math.mul(usize, elements, @sizeOf(f32)));
+        }
         if (policy.layer_norm) {
             const elements = try std.math.mul(usize, self.descriptor.rows, self.descriptor.hidden);
             const norm_bytes = try std.math.mul(usize, elements, @sizeOf(f32));
@@ -507,10 +511,14 @@ pub const GraphPhase = struct {
         else
             try Ffn.init(descriptor.rows, descriptor.hidden, descriptor.ffn_intermediate, 0);
         self.storage_layout.ffn_workspace = try self.storage_layout.declareLayerWorkspace(layout.scratch_bytes);
+        try self.declareLayerOutputs(layout.output_bytes);
+    }
+
+    fn declareLayerOutputs(self: *GraphPhase, bytes: usize) !void {
         // Residuals can cross a layer boundary while layer scratch is reused.
         // Place both alternating publication slots after all serial scratch.
         const scratch_end = try StorageLayout.aligned(try self.storage_layout.layerLiveBytes());
-        self.storage_layout.ffn_outputs = try self.storage_layout.declareLayerRegion(scratch_end, try std.math.mul(usize, layout.output_bytes, 2));
+        self.storage_layout.ffn_outputs = try self.storage_layout.declareLayerRegion(scratch_end, try std.math.mul(usize, bytes, 2));
     }
 
     pub fn declareProjectionStaging(self: *GraphPhase) !void {
@@ -935,11 +943,16 @@ pub const Module = struct {
     }
 
     pub fn bindFfnOutput(self: *Module, ffn: @import("dense_ffn_workspace.zig").Layout, sources: []const buffer.DeviceBuffer) !buffer.DeviceBuffer {
+        if (ffn.rows != self.rows or ffn.hidden != self.hidden) return error.InvalidExecutionPlan;
+        return try self.bindLayerOutput(ffn.output_bytes, sources);
+    }
+
+    pub fn bindLayerOutput(self: *Module, bytes: usize, sources: []const buffer.DeviceBuffer) !buffer.DeviceBuffer {
         const layout = self.storage_layout orelse return error.InvalidExecutionPlan;
         const span = layout.ffn_outputs orelse return error.InvalidExecutionPlan;
-        if (ffn.rows != self.rows or ffn.hidden != self.hidden or ffn.output_bytes != span.bytes / 2) return error.InvalidExecutionPlan;
+        if (bytes != span.bytes / 2) return error.InvalidExecutionPlan;
         const output_bank = try self.bindLayerWorkspace(layout, span, span.bytes);
-        const slot = try output_bank.borrowRange(@as(usize, self.next_ffn_output) * ffn.output_bytes, ffn.output_bytes);
+        const slot = try output_bank.borrowRange(@as(usize, self.next_ffn_output) * bytes, bytes);
         const end = try std.math.add(u64, slot.ptr, slot.len);
         for (sources) |source| {
             const source_end = try std.math.add(u64, source.ptr, source.len);

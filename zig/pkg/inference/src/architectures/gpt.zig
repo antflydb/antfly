@@ -6896,7 +6896,7 @@ fn decoderBlockImpl(
         defer freeTensorWithCleanup(cb, ffn_out, raw_overrides.cleanup);
         debug_timing_stats.ffn_nanos += @intCast(monotonicNowNs() - ffn_started_at);
 
-        const result = try cb.residualAdd(ffn_out, attn_res);
+        const result = try layerFfnResidual(cb, ffn_out, attn_res);
         freeTensorWithCleanup(cb, attn_res, raw_overrides.cleanup);
         try dumpLayerLastRowStats(cb, allocator, layer, result, hidden_size);
         return result;
@@ -7953,7 +7953,7 @@ fn decoderBlockImpl(
     const result = if (ffn_out_includes_residual) blk: {
         free_ffn_out = false;
         break :blk ffn_out;
-    } else try cb.residualAdd(ffn_out, attn_res);
+    } else try layerFfnResidual(cb, ffn_out, attn_res);
     errdefer freeTensorWithCleanup(cb, result, raw_overrides.cleanup);
     freeTensorWithCleanup(cb, attn_res, raw_overrides.cleanup);
     attn_res_owned = false;
@@ -12539,7 +12539,16 @@ fn layerAttentionProjection(cb: *const ComputeBackend, input: CT, weight: CT, ro
 fn layerAttentionResidual(cb: *const ComputeBackend, projected: CT, hidden: CT) !CT {
     if (comptime build_options.enable_cuda) {
         if (cb.kind() == .cuda) {
-            if (try @import("../ops/cuda/cuda_compute.zig").tryCapturedAttentionResidual(cb, projected, hidden)) |assigned| return assigned;
+            if (try @import("../ops/cuda/cuda_compute.zig").tryCapturedResidual(cb, projected, hidden, .attention)) |assigned| return assigned;
+        }
+    }
+    return cb.residualAdd(projected, hidden);
+}
+
+fn layerFfnResidual(cb: *const ComputeBackend, projected: CT, hidden: CT) !CT {
+    if (comptime build_options.enable_cuda) {
+        if (cb.kind() == .cuda) {
+            if (try @import("../ops/cuda/cuda_compute.zig").tryCapturedResidual(cb, projected, hidden, .layer_output)) |assigned| return assigned;
         }
     }
     return cb.residualAdd(projected, hidden);
