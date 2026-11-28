@@ -757,6 +757,14 @@ def run(args, model, label, mode, concurrency, output):
                     sample["model_graph_max_declared_replay_rows"] = max_declared_rows
                     if retirements := graph_retirements(section):
                         sample["model_graph_retirements"] = retirements
+                        sample["recorded_graphs_retired_before_completed_replay"] = [
+                            retirement
+                            for retirement in retirements
+                            # A record-and-launch writes two tokens. The first
+                            # replay must start with that same progress value.
+                            if retirement["phase"] == "replay"
+                            and retirement["progress"] == 2
+                        ]
                     if denials := graph_funding_denials(section):
                         sample["model_graph_funding_denials"] = denials
                     if (
