@@ -21699,14 +21699,17 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
     out_owned = false;
     return out;
 }
-fn audioWorkspaceFitsOp(ctx: *anyopaque, recipe: CacheFunding.AudioRecipe, segments: []const usize, rows: usize) !bool {
+fn audioWorkspaceFitsOp(ctx: *anyopaque, recipe: CudaCompute.CacheFunding.AudioRecipe, segments: []const usize, rows: usize) !bool {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     if (self.capability_profile != .embedding_gemma2 or !self.embedding_gemma2_policy.audio_graph) return false;
+    if (!recipe.source_bf16) return true;
     const Inputs = @import("../../execution/audio_schedule.zig").ExecutionInputs;
     var shapes: [Inputs.count][2]i64 = undefined;
     const inputs = try Inputs.describe(&shapes, rows, recipe.hidden, recipe.context_left, recipe.heads);
     const base = try self.audioCacheBase(0, inputs[0..Inputs.activeCount(!recipe.source_bf16)], null);
-    return CudaCompute.audioWorkspaceLowerBoundFits(recipe, segments, rows, base);
+    const fits = try CudaCompute.audioWorkspaceLowerBoundFits(recipe, segments, rows, base);
+    if (!fits) @import("../../execution/runtime_observation.zig").cudaAudioResult(.workspace_preflight_declined);
+    return fits;
 }
 
 fn audioBatchLayoutsEnabledOp(ctx: *anyopaque) bool {
@@ -60388,7 +60391,7 @@ test "CUDA grouped audio admission rejects an impossible mandatory workspace bef
     const clips = [_]usize{ 12, 25 };
     var plans: [clips.len]Source.Plan = undefined;
     const layout = try Source.planGroup(&plans, &clips, 37, 8, 128, 12, 24, 13);
-    var recipe: CacheFunding.AudioRecipe = undefined;
+    var recipe: CudaCompute.CacheFunding.AudioRecipe = undefined;
     recipe.source_bf16 = true;
     recipe.hidden = 1024;
     recipe.heads = 8;

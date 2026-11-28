@@ -437,6 +437,7 @@ pub const CudaAudio = struct {
     learning_host_transfer: u64 = 0,
     learning_unsealed: u64 = 0,
     arena_unavailable: u64 = 0,
+    workspace_preflight_declined: u64 = 0,
     input_alias_declined: u64 = 0,
     capture_storage_declined: u64 = 0,
     capture_begin_declined: u64 = 0,
