@@ -36,6 +36,7 @@ class NativeStreams(unittest.TestCase):
         self.incarnation = "index-1"
         self.binary = False
         self.revision = 1
+        self.index_timestamp = {"indexed_at": 1793740000}
         self.wrong_field = False
         self.requests = []
         self.readers = ["user:self"]
@@ -97,7 +98,7 @@ class NativeStreams(unittest.TestCase):
                         "uri": "gs://originals/interview.wav",
                         "path": "interview.wav",
                         "revision": "recording-7",
-                        "indexed_at": 1793740000,
+                        **owner.index_timestamp,
                     },
                     "permissions": {"public": False, "readers": owner.readers},
                     "metadata": {},
@@ -288,6 +289,21 @@ class NativeStreams(unittest.TestCase):
                 if body.get("hierarchy")
             )
         )
+
+    def test_native_stream_accepts_unknown_index_timestamp(self):
+        self.index_timestamp = {}
+        result = self.run_grep("Tuesday")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        match = next(
+            row
+            for line in result.stdout.splitlines()
+            if (row := json.loads(line))["type"] == "match"
+        )
+        self.assertIsNone(match["source"].get("indexed_at"))
+
+        self.index_timestamp = {"indexed_at": "yesterday"}
+        result = self.run_grep("Tuesday")
+        self.assertEqual(result.returncode, 2, result.stdout)
 
     def test_binary_inline_eligibility_survives_projection_and_pruning(self):
         self.binary = True

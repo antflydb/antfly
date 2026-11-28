@@ -2938,7 +2938,7 @@ fn enrichmentErrorDisposition(err: anyerror) EnrichmentErrorDisposition {
     if (document_extraction_mod.remoteContentErrorIsPermanent(err)) return .terminal_request;
     // These stages describe deterministic failures of the fetched PDF bytes.
     // Retrying the same immutable input cannot repair its structure or streams.
-    if (document_extraction_mod.failureStage(err, "").len != 0) return .terminal_request;
+    if (document_extraction_mod.deterministicPdfFailureStage(@errorName(err), "").len != 0) return .terminal_request;
     return switch (err) {
         error.OutOfMemory,
         error.InvalidDenseArtifactTargetCounter,
@@ -5584,7 +5584,8 @@ fn isOperationCanceled(err: anyerror) bool {
 
 fn isOperationInterruption(err: anyerror) bool {
     return isOperationCanceled(err) or err == error.ProviderInvocationCanceled or
-        err == error.EnrichmentWaitCanceled or err == error.Timeout or err == error.PdfRenderTimeout;
+        err == error.EnrichmentWaitCanceled or err == error.Timeout or err == error.PdfRenderTimeout or
+        err == error.PdfPreparationTimeout or err == error.PdfInspectionTimeout;
 }
 
 fn providerInvocationFailure(runtime: *EnrichmentRuntime, err: anyerror) anyerror {
@@ -10802,7 +10803,7 @@ test "enrichment cancellation distinguishes PDF deadlines and asset invocation f
         .config = .{ .cancellation = CancellationToken.fromAtomic(&signal) },
         .ownership = undefined,
     };
-    const expired: document_extraction_mod.PdfRenderDeadline = .{ .deadline_ns = 0 };
+    const expired: document_extraction_mod.PdfOperationDeadline = .{ .deadline_ns = 0 };
     expired.probe().check() catch |err| {
         const classified = expired.classifyError(err);
         try std.testing.expectEqual(error.PdfRenderTimeout, classified);
@@ -15745,6 +15746,7 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
     }
 
     if (text_session) |session| {
+        try session.prepareForBatchRendering();
         {
             const coordinator = try RuntimePdfOcrCoordinator.createFromPrepared(alloc, @import("antfly_platform").allocator.concurrentFallback(), null, 30_000, config, session);
             defer coordinator.destroy();
@@ -15895,14 +15897,14 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
         var first_sink = Sink{ .alloc = alloc };
         var first_text = RuntimePdfPageTextSpool{ .scheduler = &scheduler, .digest = digest, .limits = .{}, .policy = .page };
         defer first_text.deinit();
-        try document_extraction_mod.extractPreparedPdfStreamingWithTextCache(alloc, session, "application/pdf", .{}, .auto, first_sink.sink(), first_text.cache());
+        try document_extraction_mod.extractPreparedPdfStreamingWithTextCache(alloc, session, "application/pdf", .{}, .auto, first_sink.sink(), first_text.cache(), null);
         try first_text.finish();
         try std.testing.expectEqual(@as(usize, 2), first_text.stores);
         try std.testing.expectEqual(@as(usize, 0), first_text.hits);
         var second_sink = Sink{ .alloc = alloc };
         var second_text = RuntimePdfPageTextSpool{ .scheduler = &scheduler, .digest = digest, .limits = .{}, .policy = .page };
         defer second_text.deinit();
-        try document_extraction_mod.extractPreparedPdfStreamingWithTextCache(alloc, session, "application/pdf", .{}, .always, second_sink.sink(), second_text.cache());
+        try document_extraction_mod.extractPreparedPdfStreamingWithTextCache(alloc, session, "application/pdf", .{}, .always, second_sink.sink(), second_text.cache(), null);
         try second_text.finish();
         try std.testing.expectEqual(@as(usize, 0), second_text.stores);
         try std.testing.expectEqual(@as(usize, 2), second_text.hits);
@@ -16566,7 +16568,7 @@ const PreparedDocumentSourceCache = struct {
         entry: *Entry = undefined,
         borrows: usize = 0,
         decode_limits: document_extraction_mod.PdfDecodeLimits,
-        deadline: document_extraction_mod.PdfRenderDeadline = undefined,
+        deadline: document_extraction_mod.PdfOperationDeadline = undefined,
         session: ?document_extraction_mod.PdfRenderSession = null,
 
         fn matches(self: *const @This(), limits: document_extraction_mod.PdfDecodeLimits) bool {
@@ -16594,7 +16596,7 @@ const PreparedDocumentSourceCache = struct {
         cache: *PreparedDocumentSourceCache,
         variant: ?*PreparedPdfVariant,
 
-        fn session(self: *const @This()) *document_extraction_mod.PdfRenderSession {
+        fn session(self: *const @This()) *const document_extraction_mod.PdfRenderSession {
             return &self.variant.?.session.?;
         }
 
@@ -16671,7 +16673,7 @@ const PreparedDocumentSourceCache = struct {
         Allocator,
         []const u8,
         document_extraction_mod.PdfDecodeLimits,
-        *const document_extraction_mod.PdfRenderDeadline,
+        *const document_extraction_mod.PdfOperationDeadline,
     ) anyerror!document_extraction_mod.PdfRenderSession = @This().preparePdfSession,
 
     fn clearMedia(self: *@This()) void {
@@ -17294,9 +17296,9 @@ const PreparedDocumentSourceCache = struct {
             return err;
         };
         variant.* = .{ .entry = entry, .decode_limits = decode_limits };
-        variant.deadline = document_extraction_mod.PdfRenderDeadline.init(timeout_ms);
-        if (owner.deadline_ns != null or owner.cancellation.ptr != null)
-            variant.deadline.owner = .{ .context = &owner, .is_cancelled_fn = preparedSourceOwnerCanceled };
+        variant.deadline = document_extraction_mod.PdfOperationDeadline.init(timeout_ms);
+        variant.deadline.timeout_error = error.PdfPreparationTimeout;
+        variant.deadline.owner = preparedSourceOwnerProbe(&owner);
         const prepare_timer = pipeline_metrics.start(.pdf_prepare);
         defer prepare_timer.finish();
         const prepared = self.prepare_pdf_session_fn(alloc, entry.content.data, decode_limits, &variant.deadline);
@@ -17439,7 +17441,7 @@ const PreparedDocumentSourceCache = struct {
         alloc: Allocator,
         source_bytes: []const u8,
         decode_limits: document_extraction_mod.PdfDecodeLimits,
-        deadline: *const document_extraction_mod.PdfRenderDeadline,
+        deadline: *const document_extraction_mod.PdfOperationDeadline,
     ) !document_extraction_mod.PdfRenderSession {
         var session = try document_extraction_mod.PdfRenderSession.initWithDecodeLimitsAndCancellation(
             alloc,
@@ -17511,6 +17513,21 @@ fn preparedSourceOwnerCanceled(ptr: ?*const anyopaque) bool {
     const owner: *const asset_producer_mod.InvocationContext = @ptrCast(@alignCast(ptr orelse return true));
     checkPreparedSourcePoll(owner.*) catch return true;
     return false;
+}
+
+fn preparedSourceOwnerCancellationError(ptr: ?*const anyopaque, err: anyerror) anyerror {
+    const owner: *const asset_producer_mod.InvocationContext = @ptrCast(@alignCast(ptr orelse return err));
+    checkPreparedSourceOwner(owner.*) catch |owner_err| return owner_err;
+    return err;
+}
+
+fn preparedSourceOwnerProbe(owner: *const asset_producer_mod.InvocationContext) document_extraction_mod.PdfCancellationProbe {
+    if (owner.deadline_ns == null and owner.cancellation.ptr == null) return .{};
+    return .{
+        .context = owner,
+        .is_cancelled_fn = preparedSourceOwnerCanceled,
+        .cancellation_error_fn = preparedSourceOwnerCancellationError,
+    };
 }
 
 fn pdfPreparationOwner(runtime: *EnrichmentRuntime, cancellation: *const EnrichmentSourceCancellation) asset_producer_mod.InvocationContext {
@@ -17598,7 +17615,7 @@ test "shared PDF coordinator state is admitted separately from render windows" {
     var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
     defer manager.deinit(alloc);
     const coordinator = try alloc.create(RuntimePdfOcrCoordinator);
-    coordinator.* = .{ .owner_alloc = alloc, .reservation = ReservedWorkingSetAllocator.init(alloc, 64 * 1024), .deadline = document_extraction_mod.PdfRenderDeadline.init(1_000) };
+    coordinator.* = .{ .owner_alloc = alloc, .reservation = ReservedWorkingSetAllocator.init(alloc, 64 * 1024), .deadline = document_extraction_mod.PdfOperationDeadline.init(1_000) };
     defer coordinator.destroy();
     coordinator.admitAllocator(alloc, &manager);
     const state = try coordinator.reservation.allocator().alloc(u8, 48 * 1024);
@@ -17776,7 +17793,7 @@ test "prepared document cache single-flights concurrent PDF variants and drains 
             _: Allocator,
             _: []const u8,
             _: document_extraction_mod.PdfDecodeLimits,
-            _: *const document_extraction_mod.PdfRenderDeadline,
+            _: *const document_extraction_mod.PdfOperationDeadline,
         ) !document_extraction_mod.PdfRenderSession {
             _ = calls.fetchAdd(1, .acq_rel);
             return .{ .parsed = .{} };
@@ -17788,7 +17805,7 @@ test "prepared document cache single-flights concurrent PDF variants and drains 
         start: std.atomic.Value(bool) = .init(false),
         lease_ready: std.atomic.Value(usize) = .init(0),
         release: std.atomic.Value(bool) = .init(false),
-        sessions: [2]?*document_extraction_mod.PdfRenderSession = .{ null, null },
+        sessions: [2]?*const document_extraction_mod.PdfRenderSession = .{ null, null },
         errors: [2]?anyerror = .{ null, null },
 
         fn run(self: *@This(), index: usize) void {
@@ -17873,7 +17890,7 @@ test "prepared document cache prepares unrelated PDF keys concurrently" {
             _: Allocator,
             _: []const u8,
             _: document_extraction_mod.PdfDecodeLimits,
-            _: *const document_extraction_mod.PdfRenderDeadline,
+            _: *const document_extraction_mod.PdfOperationDeadline,
         ) !document_extraction_mod.PdfRenderSession {
             _ = calls.fetchAdd(1, .acq_rel);
             const now_active = active.fetchAdd(1, .acq_rel) + 1;
@@ -21968,7 +21985,7 @@ fn processDocumentExtractionAsset(
                 if (config.content_type.len > 0) config.content_type else downloaded.content_type,
                 @errorName(err),
                 "PDF preparation failed",
-                document_extraction_mod.failureStage(err, "pdf_inspection"),
+                document_extraction_mod.failureStage(err, "pdf_preparation"),
                 manifest_key,
                 previous_child_ranges,
                 existing_state,
@@ -22000,16 +22017,9 @@ fn processDocumentExtractionAsset(
     }
     var pdf_inspection_reservation = ReservedWorkingSetAllocator.init(collection_alloc, pdf_inspection_bytes);
     const document_extraction_alloc = if (source_is_pdf) pdf_inspection_reservation.allocator() else runtime.alloc;
-    var pdf_inspection_deadline = document_extraction_mod.PdfRenderDeadline.init(runtime.syncWaitTimeoutMs());
-    var prepared_pdf_session: ?document_extraction_mod.PdfRenderSession = if (prepared_pdf_source) |source|
-        document_extraction_mod.PdfRenderSession.initFromPrepared(
-            document_extraction_alloc,
-            source,
-            pdf_inspection_deadline.probe(),
-        ) catch |err| return pdf_inspection_deadline.classifyError(err)
-    else
-        null;
-    if (prepared_pdf_session) |*session| try session.setDecodeLimits(extraction_config.pdf_decode_limits);
+    const inspection_owner = pdfPreparationOwner(runtime, &preparation_cancellation);
+    var pdf_inspection_deadline: document_extraction_mod.PdfOperationDeadline = undefined;
+    var prepared_pdf_session: ?document_extraction_mod.PdfRenderSession = null;
     defer if (prepared_pdf_session) |*session| session.deinit();
 
     var desired_unit_keys = std.ArrayListUnmanaged([]const u8).empty;
@@ -22080,12 +22090,26 @@ fn processDocumentExtractionAsset(
         .unit_spool = if (unit_spool) |*spool| spool else null,
         .page_text_spool = if (page_text_spool) |*spool| spool else null,
         .pdf_inspection_reserved = source_is_pdf,
-        .prepared_pdf_session = if (prepared_pdf_session) |*session| session else null,
+        .prepared_pdf_session = prepared_pdf_source,
     };
     defer collect_ctx.deinit();
     var prepared_marking = document_extraction_mod.UnconfiguredGeneratedTextSink{ .alloc = document_extraction_alloc, .config = &extraction_config, .inner = collect_ctx.sink() };
-    const extraction_result = if (prepared_pdf_session) |*session|
-        document_extraction_mod.extractPreparedPdfStreamingWithTextCache(
+    const inspection_budget_ms = runtime.syncWaitTimeoutMs();
+    const inspection_started_ns = if (source_is_pdf) platform_time.monotonicNs() else 0;
+    pdf_inspection_deadline = .{
+        .deadline_ns = inspection_started_ns +| (inspection_budget_ms *| std.time.ns_per_ms),
+        .timeout_error = error.PdfInspectionTimeout,
+        .owner = preparedSourceOwnerProbe(&inspection_owner),
+    };
+    const extraction_result = if (prepared_pdf_source) |source| pdf: {
+        prepared_pdf_session = document_extraction_mod.PdfRenderSession.initFromFrozen(
+            document_extraction_alloc,
+            source,
+            pdf_inspection_deadline.probe(),
+        ) catch |err| break :pdf pdf_inspection_deadline.classifyError(err);
+        const session = &prepared_pdf_session.?;
+        session.setDecodeLimits(extraction_config.pdf_decode_limits) catch |err| break :pdf err;
+        break :pdf document_extraction_mod.extractPreparedPdfStreamingWithTextCache(
             document_extraction_alloc,
             session,
             if (extraction_config.content_type.len > 0) extraction_config.content_type else downloaded.content_type,
@@ -22093,9 +22117,9 @@ fn processDocumentExtractionAsset(
             extraction_config.ocr_mode,
             prepared_marking.sink(),
             if (page_text_spool) |*spool| spool.cache() else null,
-        )
-    else
-        document_extraction_mod.extractDownloadedStreaming(document_extraction_alloc, downloaded.*, source_url, extraction_config, collect_ctx.sink());
+            &pdf_inspection_deadline,
+        );
+    } else document_extraction_mod.extractDownloadedStreaming(document_extraction_alloc, downloaded.*, source_url, extraction_config, collect_ctx.sink());
     // Publish the final short neutral-text segment before a later consumer
     // traverses this source. Errors abandon buffered rows via deinit instead.
     if (extraction_result) |_| {
@@ -22116,6 +22140,15 @@ fn processDocumentExtractionAsset(
         else
             raw_err;
         if (try scope.shouldYield(runtime, err)) return err;
+        var failure_message_buffer: [192]u8 = undefined;
+        const failure_message = if (err == error.PdfInspectionTimeout)
+            std.fmt.bufPrint(&failure_message_buffer, "PDF inspection timed out (page={?d}, budget_ms={d}, wall_elapsed_ms={d})", .{
+                pdf_inspection_deadline.inspection_page,
+                inspection_budget_ms,
+                (platform_time.monotonicNs() -| inspection_started_ns) / std.time.ns_per_ms,
+            }) catch unreachable
+        else
+            "document extraction failed";
         try writeDocumentExtractionFailureManifest(
             runtime,
             request.doc_key,
@@ -22125,7 +22158,7 @@ fn processDocumentExtractionAsset(
             source_fingerprint,
             if (config.content_type.len > 0) config.content_type else downloaded.content_type,
             @errorName(err),
-            "document extraction failed",
+            failure_message,
             document_extraction_mod.failureStage(err, "document_extraction"),
             manifest_key,
             previous_child_ranges,
@@ -23168,7 +23201,7 @@ const RuntimePdfOcrCoordinator = struct {
     owner_alloc: Allocator,
     budgeted: ?resource_manager_mod.BudgetedAllocator = null,
     reservation: ReservedWorkingSetAllocator,
-    deadline: document_extraction_mod.PdfRenderDeadline,
+    deadline: document_extraction_mod.PdfOperationDeadline,
     session: document_extraction_mod.PdfRenderSession = undefined,
     session_initialized: bool = false,
 
@@ -23185,8 +23218,9 @@ const RuntimePdfOcrCoordinator = struct {
         self.* = .{
             .owner_alloc = owner_alloc,
             .reservation = ReservedWorkingSetAllocator.init(backing_alloc, config.pdf_render_max_inflight_bytes),
-            .deadline = document_extraction_mod.PdfRenderDeadline.init(timeout_ms),
+            .deadline = document_extraction_mod.PdfOperationDeadline.init(timeout_ms),
         };
+        self.deadline.timeout_error = error.PdfPreparationTimeout;
         self.admitAllocator(backing_alloc, manager);
         errdefer if (self.budgeted) |*budgeted| budgeted.deinit();
         self.session = document_extraction_mod.PdfRenderSession.initWithDecodeLimitsAndCancellation(
@@ -23205,6 +23239,7 @@ const RuntimePdfOcrCoordinator = struct {
             return self.deadline.classifyError(err);
         };
         self.configureRenderBudget(config) catch |err| return self.deadline.classifyError(err);
+        self.deadline.timeout_error = error.PdfRenderTimeout;
         return self;
     }
 
@@ -23214,18 +23249,19 @@ const RuntimePdfOcrCoordinator = struct {
         manager: ?*resource_manager_mod.ResourceManager,
         timeout_ms: u64,
         config: document_extraction_mod.Config,
-        source: *document_extraction_mod.PdfRenderSession,
+        source: *const document_extraction_mod.PdfRenderSession,
     ) !*@This() {
         const self = try owner_alloc.create(@This());
         errdefer owner_alloc.destroy(self);
         self.* = .{
             .owner_alloc = owner_alloc,
             .reservation = ReservedWorkingSetAllocator.init(backing_alloc, config.pdf_render_max_inflight_bytes),
-            .deadline = document_extraction_mod.PdfRenderDeadline.init(timeout_ms),
+            .deadline = document_extraction_mod.PdfOperationDeadline.init(timeout_ms),
         };
+        self.deadline.timeout_error = error.PdfPreparationTimeout;
         self.admitAllocator(backing_alloc, manager);
         errdefer if (self.budgeted) |*budgeted| budgeted.deinit();
-        self.session = document_extraction_mod.PdfRenderSession.initFromPrepared(
+        self.session = document_extraction_mod.PdfRenderSession.initFromFrozen(
             self.reservation.allocator(),
             source,
             self.deadline.probe(),
@@ -23236,6 +23272,7 @@ const RuntimePdfOcrCoordinator = struct {
         self.session_initialized = true;
         errdefer self.session.deinit();
         self.configureRenderBudget(config) catch |err| return self.deadline.classifyError(err);
+        self.deadline.timeout_error = error.PdfRenderTimeout;
         return self;
     }
 
@@ -23292,7 +23329,7 @@ const RuntimePdfOcrCoordinator = struct {
     }
 
     fn beginOperation(self: *@This(), timeout_ms: u64) void {
-        self.deadline = document_extraction_mod.PdfRenderDeadline.init(timeout_ms);
+        self.deadline = document_extraction_mod.PdfOperationDeadline.init(timeout_ms);
         self.session.setCancellationProbe(self.deadline.probe());
         self.reservation.limit_exceeded = false;
     }
@@ -23336,7 +23373,7 @@ pub fn runNativePdfOcrCoordinatorIntegration(
     const CancelSink = struct {
         fn begin(_: *anyopaque, _: document_extraction_mod.StreamInfo) !void {}
         fn unit(raw: *anyopaque, _: *document_extraction_mod.Unit) !void {
-            const deadline: *document_extraction_mod.PdfRenderDeadline = @ptrCast(@alignCast(raw));
+            const deadline: *document_extraction_mod.PdfOperationDeadline = @ptrCast(@alignCast(raw));
             deadline.deadline_ns = 0;
             return error.Canceled;
         }
@@ -23356,6 +23393,7 @@ pub fn runNativePdfOcrCoordinatorIntegration(
         .always,
         cancel_sink,
         null,
+        null,
     ));
     try std.testing.expectError(error.PdfRenderTimeout, document_extraction_mod.extractPreparedPdfStreamingWithTextCache(
         alloc,
@@ -23365,8 +23403,56 @@ pub fn runNativePdfOcrCoordinatorIntegration(
         .always,
         cancel_sink,
         null,
+        null,
     ));
     coordinator.beginOperation(30_000);
+
+    const DelayedSink = struct {
+        pages: usize = 0,
+        cancel_on_end: std.atomic.Value(bool) = .init(false),
+
+        fn unit(raw: *anyopaque, _: *document_extraction_mod.Unit) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            platform_time.sleepNs(std.time.ns_per_ms);
+            self.pages += 1;
+        }
+
+        fn cancelOnEnd(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.cancel_on_end.store(true, .release);
+        }
+    };
+    var delayed_sink = DelayedSink{};
+    var inspection = document_extraction_mod.PdfOperationDeadline.init(30_000);
+    inspection.timeout_error = error.PdfInspectionTimeout;
+    const initial_deadline = inspection.deadline_ns;
+    try document_extraction_mod.extractPreparedPdfStreamingWithTextCache(
+        alloc,
+        &coordinator.session,
+        "application/pdf",
+        .{},
+        .always,
+        .{ .ptr = &delayed_sink, .on_begin = CancelSink.begin, .on_unit = DelayedSink.unit, .on_end = CancelSink.end },
+        null,
+        &inspection,
+    );
+    try std.testing.expectEqual(@as(usize, 2), delayed_sink.pages);
+    try std.testing.expect(inspection.deadline_ns > initial_deadline);
+
+    const inspection_owner: asset_producer_mod.InvocationContext = .{
+        .cancellation = CancellationToken.fromAtomic(&delayed_sink.cancel_on_end),
+    };
+    inspection.owner = preparedSourceOwnerProbe(&inspection_owner);
+    try std.testing.expectError(error.EnrichmentWaitCanceled, document_extraction_mod.extractPreparedPdfStreamingWithTextCache(
+        alloc,
+        &coordinator.session,
+        "application/pdf",
+        .{},
+        .always,
+        .{ .ptr = &delayed_sink, .on_begin = CancelSink.begin, .on_unit = DelayedSink.unit, .on_end = DelayedSink.cancelOnEnd },
+        null,
+        &inspection,
+    ));
 
     const persistent_bytes = coordinator.reservation.live_bytes;
     if (persistent_bytes == 0) return error.PdfCoordinatorDidNotRetainParsedState;
@@ -23447,7 +23533,7 @@ pub fn runNativePdfOcrCoordinatorIntegration(
             .config = .{},
             .ownership = undefined,
         };
-        const expired: document_extraction_mod.PdfRenderDeadline = .{ .deadline_ns = 0 };
+        const expired: document_extraction_mod.PdfOperationDeadline = .{ .deadline_ns = 0 };
         var expired_retry = try PdfDeferredRenderRetry.capture(alloc, &plans, rendered, deferred.?.options, available_bytes);
         defer if (expired_retry) |*retry| retry.deinit(alloc);
         try std.testing.expectError(error.PdfRenderTimeout, PdfDeferredRenderRetry.retryAfterRelease(&expired_retry, &runtime, &coordinator.session, window_lease, &rendered, expired.probe()));
@@ -24368,7 +24454,7 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatchWithBackingAllocator(
     units: []document_extraction_mod.Unit,
     kind: RuntimeGeneratedUnitTextKind,
     pdf_coordinator_slot: *?*RuntimePdfOcrCoordinator,
-    prepared_pdf_session: ?*document_extraction_mod.PdfRenderSession,
+    prepared_pdf_session: ?*const document_extraction_mod.PdfRenderSession,
 ) !void {
     const uses_pdf_decoder_reservation = kind == .ocr and std.mem.eql(u8, route_type, "pdf");
     if (uses_pdf_decoder_reservation) if (runtime.document_prefetch) |pipeline| {
@@ -24495,7 +24581,7 @@ const RuntimePdfRenderWindow = struct {
 };
 
 const RuntimePdfRenderCancellation = struct {
-    deadline: document_extraction_mod.PdfRenderDeadline,
+    deadline: document_extraction_mod.PdfOperationDeadline,
     external: document_extraction_mod.PdfCancellationProbe,
 
     fn isCancelled(context: ?*const anyopaque) bool {
@@ -26226,7 +26312,7 @@ fn renderRuntimePdfWindow(
     const retry_waves = std.math.mul(usize, waves, maximum_pdf_page_render_attempts) catch std.math.maxInt(usize);
     const timeout_ms = std.math.mul(u64, runtime.syncWaitTimeoutMs(), retry_waves) catch std.math.maxInt(u64);
     var render_cancellation = RuntimePdfRenderCancellation{
-        .deadline = document_extraction_mod.PdfRenderDeadline.init(timeout_ms),
+        .deadline = document_extraction_mod.PdfOperationDeadline.init(timeout_ms),
         .external = cancellation,
     };
     const lease = window_lease orelse return error.DocumentExtractionWorkingSetTooLarge;
@@ -28350,7 +28436,7 @@ const RuntimeDocumentExtractionCollectContext = struct {
     ocr_failed_page_numbers: std.ArrayListUnmanaged(u32) = .empty,
     ocr_failure_summaries: std.ArrayListUnmanaged(RuntimeOcrFailureSummary) = .empty,
     pdf_coordinator: ?*RuntimePdfOcrCoordinator = null,
-    prepared_pdf_session: ?*document_extraction_mod.PdfRenderSession = null,
+    prepared_pdf_session: ?*const document_extraction_mod.PdfRenderSession = null,
     resolved_char_cursor: usize = 0,
 
     fn sink(self: *@This()) document_extraction_mod.UnitSink {
@@ -28448,9 +28534,7 @@ const RuntimeDocumentExtractionCollectContext = struct {
     fn onEnd(ptr: *anyopaque) anyerror!void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         try self.flushPendingGeneratedText();
-        // A render coordinator created from the prepared inspection session
-        // borrows its immutable document metadata. Tear it down before the
-        // extraction call returns and releases that source session.
+        // The coordinator borrows the prepared document's immutable metadata.
         self.releasePdfCoordinator();
     }
 
@@ -45181,12 +45265,35 @@ test "synchronous document extraction OCR batches honor request execution item c
     try std.testing.expectEqualStrings("ocr text 0", units[2].text);
 }
 
+test "PDF operation timeouts retain their stage and request retry ownership" {
+    for ([_]struct { code: anyerror, stage: []const u8 }{
+        .{ .code = error.PdfPreparationTimeout, .stage = "pdf_preparation" },
+        .{ .code = error.PdfInspectionTimeout, .stage = "pdf_inspection" },
+        .{ .code = error.PdfRenderTimeout, .stage = "pdf_page_render" },
+    }) |operation| {
+        const deadline: document_extraction_mod.PdfOperationDeadline = .{ .deadline_ns = 0, .timeout_error = operation.code };
+        const result = deadline.probe().check();
+        try std.testing.expectError(error.Canceled, result);
+        try std.testing.expectEqual(operation.code, deadline.classifyError(error.Canceled));
+        try std.testing.expectEqualStrings(operation.stage, document_extraction_mod.failureStage(operation.code, "document_extraction"));
+        try std.testing.expectEqual(EnrichmentErrorDisposition.retryable_request, enrichmentErrorDisposition(operation.code));
+    }
+
+    const owner: asset_producer_mod.InvocationContext = .{ .deadline_ns = 0 };
+    const deadline: document_extraction_mod.PdfOperationDeadline = .{
+        .deadline_ns = 0,
+        .timeout_error = error.PdfInspectionTimeout,
+        .owner = preparedSourceOwnerProbe(&owner),
+    };
+    try std.testing.expectEqual(error.EnrichmentWaitTimeout, deadline.classifyError(error.Canceled));
+}
+
 test "PDF render deadline installs an active monotonic cancellation probe" {
-    var deadline = document_extraction_mod.PdfRenderDeadline{ .deadline_ns = 0 };
+    var deadline = document_extraction_mod.PdfOperationDeadline{ .deadline_ns = 0 };
     const parse_probe = deadline.probe();
     try std.testing.expect(parse_probe.is_cancelled_fn.?(parse_probe.context));
 
-    deadline = document_extraction_mod.PdfRenderDeadline.init(60_000);
+    deadline = document_extraction_mod.PdfOperationDeadline.init(60_000);
     const render_probe = deadline.probe();
     try std.testing.expect(!render_probe.is_cancelled_fn.?(render_probe.context));
 }
