@@ -8014,7 +8014,10 @@ pub const CudaCompute = struct {
         if (recipe.workspace) |workspace| {
             // Seal the exact same event program before reserving either charge.
             var preview: AudioPlan.Owner = .{ .allocator = std.heap.page_allocator };
-            try preview.declare(base, workspace.events, workspace.published_slot);
+            preview.declare(base, workspace.events, workspace.published_slot) catch |err| switch (err) {
+                error.InvalidExecutionPlan => return,
+                else => return err,
+            };
             try builder.add(.{ .audio_learning = .{ .key = base.key, .declared_cold = true } });
             try builder.add(audioArenaRequest(preview.executable.?));
         } else if (existing != null) try builder.add(.{ .audio_learning = .{ .key = base.key } });
@@ -21433,6 +21436,46 @@ fn runAudioWithWorkspace(
     self.execution_scope = scope;
     defer self.execution_scope = null;
     return run(context, inputs);
+}
+
+fn groupedAudioWorkspaceBytes(ctx: *anyopaque, physical: @import("../../execution/grouped_audio_block.zig").Physical) anyerror!?usize {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    switch (physical) {
+        .admit => {
+            if (self.capability_profile != .embedding_gemma2 or !self.embedding_gemma2_policy.audio_graph or
+                sourceScalarStorageOp(ctx, .audio) != .bf16) return null;
+            return 0;
+        },
+        .linear => |value| {
+            const weight = self.resident_weights.getPtr(value.name) orelse return null;
+            const geometry = try SourceLinearGeometry.resolve(value.rows, null, value.width, value.columns);
+            if (weight.quant_type != null or weight.tc_quant != null or
+                (weight.dtype != .f32 and weight.dtype != .bf16) or weight.buffer.ptr == 0 or
+                weight.elem_count != geometry.weight_count or
+                !std.mem.eql(i64, weight.shape, &.{ @intCast(value.columns), @intCast(value.width) })) return null;
+            return (try sourceLinearLayout(self.ctx.info.compute_major, geometry.rows, value.width, value.columns, weight.dtype != .bf16, false)).bytes;
+        },
+        .norm => |value| {
+            const weight = self.resident_weights.getPtr(value.name) orelse return null;
+            if (weight.quant_type != null or weight.tc_quant != null or
+                (weight.dtype != .f32 and weight.dtype != .bf16) or weight.buffer.ptr == 0 or
+                weight.elem_count != value.width or !std.mem.eql(i64, weight.shape, &.{@intCast(value.width)})) return null;
+            const geometry = try SourceRmsGeometry.resolve(.{
+                .rows = value.rows,
+                .width = value.width,
+                .reference_layout = if (value.segments.len == 0) .contiguous else .channel_major,
+                .reference_rows_per_batch = if (value.segments.len == 0) value.rows else 0,
+                .segments = value.segments,
+            }, self.ctx.info.multiprocessor_count, self.source_reduction_threads_per_sm);
+            return (try SourceF32Operands(2).Layout.resolve(.{ null, if (weight.dtype == .bf16) value.width else null }, geometry.partial_bytes)).bytes;
+        },
+        .attention => |value| {
+            const Source = @import("local_relative_source.zig");
+            var clips: [@import("../../execution/audio_schedule.zig").GroupedRows.max_clips]Source.Plan = undefined;
+            if (value.segments.len > clips.len) return null;
+            return (try Source.planGroup(clips[0..value.segments.len], value.segments, value.rows, value.heads, value.head_dim, value.chunk, value.context, value.left)).bytes;
+        },
+    }
 }
 
 /// One actual warm invocation initializes caches; the next learns lifetimes.
@@ -38760,6 +38803,7 @@ const vtable: ops.ComputeBackend.VTable = .{
             .imagePatches = &preprocessEmbeddingGemma2ImagePatchesOp,
         },
         .audio_execution = .{
+            .workspaceBytes = &groupedAudioWorkspaceBytes,
             .execute = &audioExecutionOp,
             .storage = &sourceAudioStorageOp,
         },

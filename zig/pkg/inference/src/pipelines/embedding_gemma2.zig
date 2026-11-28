@@ -6650,6 +6650,7 @@ test "embeddinggemma2 CUDA original grouped Stage output escrow preserves instru
         graphs: usize = 0,
         executions: u64 = 0,
         replays: u64 = 0,
+        declared_owners: usize = 0,
         max_planned_arena_bytes: usize = 0,
         max_declared_operation_scratch_intervals: usize = 0,
         max_captured_arena_bytes: usize = 0,
@@ -6670,6 +6671,7 @@ test "embeddinggemma2 CUDA original grouped Stage output escrow preserves instru
             var result = @This(){ .executions = compute.audio_arena_executes, .replays = compute.audio_graph_replays };
             for (compute.audio_plans.entries) |entry| if (entry.owner != null and entry.owner.?.managed and !entry.disabled) {
                 result.owners += 1;
+                if (entry.owner.?.plan.origin == .declared) result.declared_owners += 1;
                 if (entry.owner.?.executable) |executable| {
                     result.max_planned_arena_bytes = @max(result.max_planned_arena_bytes, executable.storage.bytes);
                     result.max_declared_operation_scratch_intervals = @max(result.max_declared_operation_scratch_intervals, entry.owner.?.plan.declared_operation_scratch_intervals);
@@ -6694,6 +6696,12 @@ test "embeddinggemma2 CUDA original grouped Stage output escrow preserves instru
         a.free(first_audio.input_tokens);
     }
     try std.testing.expectEqual(@as(usize, 2), first_audio.vectors.len);
+    if (audio_optin and !platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_AUDIO_OBSERVE_WORKSPACE")) {
+        stage = "verify cold declared audio ownership";
+        const cold = try AudioWitness.read(session, control);
+        try std.testing.expect(cold.declared_owners > audio_before.declared_owners);
+        try std.testing.expect(cold.executions > audio_before.executions);
+    }
     stage = "replay repeated audio cohorts";
     for (0..if (audio_optin) @as(usize, 6) else @as(usize, 2)) |_| {
         const repeated_audio = try embedAudios(a, session, hf.tokenizer(), &clips, options, session.execution_gate, control, null);

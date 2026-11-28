@@ -2833,6 +2833,8 @@ pub const ComputeBackend = struct {
     };
 
     pub const AudioExecutionRegion = struct {
+        /// Exact pre-submission scratch bytes, or null for an unsupported schedule.
+        workspaceBytes: ?*const fn (ctx: *anyopaque, physical: @import("../execution/grouped_audio_block.zig").Physical) anyerror!?usize = null,
         setControl: ?*const fn (ctx: *anyopaque, control: ?InferenceExecutionControl) ?InferenceExecutionControl = null,
         storage: ?*const fn (ctx: *anyopaque, begin: bool) anyerror!bool = null,
         /// run submits work synchronously. Input handles are borrowed for the
