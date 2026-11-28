@@ -855,6 +855,17 @@ pub const Module = struct {
         self.phase = .warm;
     }
 
+    /// The warmed path may prove that every temporary used a declared span.
+    /// Discard any partial trace so compatibility learning starts from scratch.
+    pub fn finishDeclaredWarmup(plan: *plan_mod.Plan, matches_dispatch: bool) !bool {
+        if (matches_dispatch and plan.valid and plan.count == 0 and plan.event_count == 0) {
+            try plan.declare(&.{}, null);
+            return true;
+        }
+        plan.* = .{};
+        return false;
+    }
+
     pub fn arenaLayout(self: *const Module) !plan_mod.Layout {
         const plan = self.plan orelse return error.InvalidState;
         const layout = try plan.layout(0);
@@ -1361,6 +1372,22 @@ test "bounded CUDA decoder shares declared attention and recurrent workspace" {
     owner.storage_layout = fused_layout;
     owner.metadata.len = fused_layout.metadata_bytes;
     try std.testing.expectEqual(owner.metadata.ptr + head.offset, (try owner.bindFusedHeadWorkspace()).ptr);
+}
+
+test "bounded CUDA decoder seals an empty declaration only after a complete warm burst" {
+    var plan: plan_mod.Plan = .{};
+    plan.allocate(256, 0x10000);
+    try std.testing.expect(!try Module.finishDeclaredWarmup(&plan, true));
+    try std.testing.expectEqual(@as(usize, 0), plan.count);
+    try std.testing.expectEqual(plan_mod.Origin.observed, plan.origin);
+    try std.testing.expect(!try Module.finishDeclaredWarmup(&plan, false));
+    try std.testing.expect(try Module.finishDeclaredWarmup(&plan, true));
+    const declared = try plan.layout(0);
+    try std.testing.expectEqual(plan_mod.Origin.declared, plan.origin);
+    try std.testing.expectEqual(@as(usize, 0), declared.bytes);
+    var scope = try plan_mod.Scope.bind(&plan, declared, 0, 0);
+    try std.testing.expect(scope.complete());
+    try std.testing.expectError(error.InvalidExecutionPlan, scope.allocate(4));
 }
 
 test "captured graph head packets fund the exact smaller bank and invalidate a full-width binding" {

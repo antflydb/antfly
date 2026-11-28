@@ -3913,9 +3913,13 @@ pub const CudaCompute = struct {
             const plan = owner.plan orelse return error.InvalidExecutionPlan;
             const WorkspaceScope = @import("../../execution/stream_workspace.zig").Scope;
             const capture = phase == .capture;
+            const layout = owner.storage_layout orelse return error.InvalidExecutionPlan;
+            const check_declared_warmup = phase == .warm and owner.rows == 2 and owner.hidden == 1024 and
+                layout.shared_head_workspace != null and layout.ffn_workspace != null and layout.recurrent_projection_joined != null and
+                layout.attention_inputs != null and platform.env.getenvBool("ANTFLY_CUDA_LIGHTON_GRAPH_DECLARED_WARMUP");
             var scope: ?WorkspaceScope = if (capture)
                 self.capture_scope orelse return error.InvalidExecutionPlan
-            else if (phase == .learn) WorkspaceScope.observe(plan) else null;
+            else if (phase == .learn or check_declared_warmup) WorkspaceScope.observe(plan) else null;
             var capture_active = false;
             errdefer {
                 std.log.warn("LightOn decoder graph aborted: phase={s} event={d}/{d}", .{ @tagName(phase), if (scope) |value| value.cursor else 0, plan.event_count });
@@ -3951,8 +3955,10 @@ pub const CudaCompute = struct {
                 return error.InvalidExecutionPlan;
             if (owner.expected_ragged_packets != 0 and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
                 std.debug.print("LIGHTONOCR3 cuda_model_graph_recorded_ragged_packets={d} rows={d}\n", .{ owner.expected_ragged_packets, owner.rows });
+            const matched_dispatch = compute.stats.h2d_bytes == h2d and compute.stats.d2h_bytes == d2h and
+                compute.lighton_attention.calls - attention_calls == owner.expected_attention_calls;
             if (phase == .learn) {
-                if (!plan.finishNoOutput() or compute.stats.h2d_bytes != h2d or compute.stats.d2h_bytes != d2h or compute.lighton_attention.calls - attention_calls != owner.expected_attention_calls) {
+                if (!plan.finishNoOutput() or !matched_dispatch) {
                     std.log.warn("LightOn decoder graph plan declined: allocations={d} events={d} peak={d} h2d={d} d2h={d}", .{ plan.count, plan.event_count, plan.peak, compute.stats.h2d_bytes - h2d, compute.stats.d2h_bytes - d2h });
                     owner.disabled_epoch = owner.epoch_id;
                     owner.phase = .disabled;
@@ -3962,7 +3968,7 @@ pub const CudaCompute = struct {
                     self.launch_route = .learned;
                 }
             } else if (capture) {
-                const matches = scope.?.complete() and compute.stats.h2d_bytes == h2d and compute.stats.d2h_bytes == d2h and compute.lighton_attention.calls - attention_calls == owner.expected_attention_calls;
+                const matches = scope.?.complete() and matched_dispatch;
                 capture_active = false;
                 owner.pending_graph = try graph_mod.endRecording(&compute.ctx);
                 if (!matches) return error.InvalidExecutionPlan;
@@ -3975,7 +3981,11 @@ pub const CudaCompute = struct {
                 owner.captures += 1;
                 owner.phase = .replay;
             } else {
-                owner.phase = .learn;
+                const declared = check_declared_warmup and try @import("bounded_decode_graph.zig").Module.finishDeclaredWarmup(
+                    plan,
+                    matched_dispatch and owner.bound_recurrent_joined_projection_bytes != 0 and owner.attention_gates_in_place == owner.expected_attention_calls,
+                );
+                owner.phase = if (declared) .capture else .learn;
                 self.launch_route = .warmed;
             }
         }
@@ -4393,7 +4403,7 @@ pub const CudaCompute = struct {
         const vendor = self.currentGraphVendorWorkspace() orelse return error.PreparedCachePlanChanged;
         if (!std.meta.eql(vendor, graph_phase.vendor_workspace)) return error.PreparedCachePlanChanged;
         const descriptor = graph_phase.descriptor;
-        if (graph_phase.expected_compute != @intFromPtr(self) or descriptor.epoch != epoch or descriptor.rows != rows or descriptor.hidden != hidden or descriptor.vocab != vocab or descriptor.future_tokens != future_tokens or !std.meta.eql(descriptor.attention_geometry, expected.attention_geometry) or !std.meta.eql(descriptor.recurrent_heads, expected.recurrent_heads) or descriptor.attention_layers != expected.attention_layers or descriptor.recurrent_layers != expected.recurrent_layers or descriptor.ffn_intermediate != expected.ffn_intermediate or descriptor.attention_q_gate != expected.attention_q_gate or !std.meta.eql(descriptor.head_storage, expected.head_storage) or !std.mem.eql(u64, descriptor.key, key) or !std.mem.eql(u32, descriptor.positions, positions) or !std.mem.eql(u64, descriptor.sequences, expected.sequences)) return error.PreparedCachePlanChanged;
+        if (graph_phase.expected_compute != @intFromPtr(self) or descriptor.epoch != epoch or descriptor.rows != rows or descriptor.hidden != hidden or descriptor.vocab != vocab or descriptor.future_tokens != future_tokens or !std.meta.eql(descriptor.attention_geometry, expected.attention_geometry) or !std.meta.eql(descriptor.recurrent_heads, expected.recurrent_heads) or !std.meta.eql(descriptor.recurrent_projection_widths, expected.recurrent_projection_widths) or descriptor.attention_layers != expected.attention_layers or descriptor.recurrent_layers != expected.recurrent_layers or descriptor.ffn_intermediate != expected.ffn_intermediate or descriptor.attention_q_gate != expected.attention_q_gate or !std.meta.eql(descriptor.head_storage, expected.head_storage) or !std.mem.eql(u64, descriptor.key, key) or !std.mem.eql(u32, descriptor.positions, positions) or !std.mem.eql(u64, descriptor.sequences, expected.sequences)) return error.PreparedCachePlanChanged;
         const owner = &self.bounded_decode_graph;
         while (!owner.mutex.tryLock()) std.atomic.spinLoopHint();
         var claimed = false;
