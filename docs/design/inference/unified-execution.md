@@ -3130,3 +3130,18 @@ then returned retryable resource unavailability before finishing all
 pages. The norm-weight migration removes the observed 10,240-byte
 peak. Sustained wide declared replay and progress under retirement
 pressure remain open.
+
+### Released Inkling Metal checkpoint at `7f0ff56ff8`
+
+Five focused checks passed on M4 Max with zero skips. The released
+Inkling-2-Mini decoder matched the known greedy sequence for four
+tokens. At 16 prefill rows, grouped execution matched serial logits
+exactly and took 310.25 ms compared with 855.51 ms. The separate
+273-row fixture matched the next token and took 3,398.91 ms with
+grouped execution compared with 5,087.47 ms. These are single-fixture
+timings. The 57-by-62 image produced four projected rows, and the
+33-token image-chat prompt returned the expected answer, “Red.”
+The released grouped vision projections matched the separate
+projections. The same run verified Whisper’s resident publication
+guard and both assigned Metal audio paths. Full-context runtime and
+external-engine comparisons were outside this cohort.
