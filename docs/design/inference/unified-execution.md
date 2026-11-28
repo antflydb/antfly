@@ -1515,7 +1515,7 @@ deletion and qualification gates.
 | Requirement | State | Evidence and remaining gate |
 | --- | --- | --- |
 | Shared liveness and authoritative storage | Partial | Assigned execution and admitted storage share dependency analysis. Metal image and video bind workspaces through the vision region. CUDA attention and recurrent scratch and outputs, dense FFN scratch, and alternating FFN output slots share an admitted layer bank. Released LightOnOCR replay at `211c80a1f9` verified the attention and recurrent output bounds and a 2,002,944-byte layer bank. Grouped audio declares operation scratch within a partially observed schedule. Composite audio and decoder lifetimes and the remaining Metal scopes are still open. The compatibility table identifies opaque vendor workspaces with separate accounting. |
-| Stable addresses and CUDA capture | Partial | Released T5-small replayed at prefixes 1, 8, 32 and 64. Released EmbeddingGemma 2 grouped audio captured and replayed using a 38,017,792-byte arena. The context-level projector guard declines unplanned cuBLASLt staging before allocation. LightOnOCR-3-4B shared logits backing replayed at up to 98 rows with exact parity across repeated 128-page, 24 GiB runs. The full-width default had no wide replay in the ABBA pair, while the shared arena was 1.55% slower on average. The later `211c80a1f9` LightOnOCR-3-0.8B comparison matched the serial output in every arm and reached 64-row replay in one of four arms. Sustained wide replay and ordinary/capture throughput parity remain open. |
+| Stable addresses and CUDA capture | Partial | Released T5-small replayed at prefixes 1, 8, 32 and 64. Released EmbeddingGemma 2 grouped audio captured and replayed using a 36,788,736-byte arena at `a7d8bcfa6a`. The fixture cancelled a replay before staging, then replayed the same graph successfully. The context-level projector guard declines unplanned cuBLASLt staging before allocation. LightOnOCR-3-4B shared logits backing replayed at up to 98 rows with exact parity across repeated 128-page, 24 GiB runs. The full-width default had no wide replay in the ABBA pair, while the shared arena was 1.55% slower on average. The later `211c80a1f9` LightOnOCR-3-0.8B comparison matched the serial output in every arm and reached 64-row replay in one of four arms. Sustained wide replay and ordinary/capture throughput parity remain open. |
 | Runtime-owned state and physical policy | Partial | `decoder_storage.zig` owns Gemma 4 replay capacity and `decoder_prefill.zig` owns chunk selection, eager binding and scheduled cancellation. The shared frame owner controls media view retirement. Metal HTTP acquires and pins the existing per-layer input table before decoder state advances. Residual task-bound state and cache policy need provider-specific verification and migration. |
 | Resident placement | Partial | The released fused T5-small step retired its encoder activations before decoding on CPU, Metal and CUDA. Spark recorded 393,216 device-to-device gather bytes and zero gather downloads. Imported ONNX handoff tests exercise exact output custody and host fallback on all three providers. Metal verifies a scalar token readback and a one-row fallback. At `bd0e05a4e3`, Spark passed the device gather and consumed a retained audio output view without a device copy. Other eligible stateful and opaque producer/consumer pairs still need qualification. |
 | Task orchestration | Partial | Media tasks call shared frame and projection retirement owners. Scheduled generation routes publish independent outputs through runtime callbacks. Some hardware-specific paths still choose or own physical transitions in model and task code. |
@@ -2800,6 +2800,16 @@ and candidate p50/p95 were 49.06/49.43 ms. Candidate-only p50 controls were
 Actual capture and replay counts come from the separate released-checkpoint
 fixture. The default-mode and graph-enabled runs were separate comparisons,
 so their latency difference does not isolate graph replay overhead.
+
+The subsequent Spark paired run at `24d2051504` used the same frozen
+baseline, request and 40 measured requests per side. Outputs matched
+exactly across AA, ABBA and BB under both policies. One other GPU context
+held 184 MiB throughout. Default grouped audio improved from 50.57/51.21
+to 49.01/49.95 ms p50/p95. With capture enabled on both builds, it improved
+from 50.34/51.25 to 48.51/49.20 ms. The separate released-model fixture at
+`a7d8bcfa6a` passed 26 focused checks with zero skips and replayed twice.
+Its 36,788,736-byte captured arena includes 132 operation scratch intervals.
+The encoder still observes the composite tensor lifetimes.
 
 ### Isolated Metal E4B HTTP comparison at `58b3917a89`
 
