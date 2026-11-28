@@ -206,7 +206,7 @@ pub const WorkspaceDeclaration = struct {
 
 test "audio workspace compiler retires each producer after its last consumer" {
     const a = std.testing.allocator;
-    const Plan = @import("stream_workspace.zig").Plan;
+    const StreamPlan = @import("stream_workspace.zig").Plan;
     const steps = [_]WorkspaceDeclaration.Step{
         .{ .output_bytes = 256, .scratch_bytes = 512 },
         .{ .output_bytes = 256, .reads = &.{0} },
@@ -215,7 +215,7 @@ test "audio workspace compiler retires each producer after its last consumer" {
     };
     const declaration = try WorkspaceDeclaration.compile(a, &steps, 3);
     defer a.free(declaration.events);
-    const expected = [_]Plan.Declaration{
+    const expected = [_]StreamPlan.Declaration{
         .{ .allocate = 256 },
         .{ .allocate_scratch = 512 },
         .{ .release = 1 },
