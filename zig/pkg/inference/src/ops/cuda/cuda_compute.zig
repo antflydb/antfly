@@ -60779,6 +60779,7 @@ test "CUDA audio depthwise cold inventory validates actual floating source layou
     recipe.mel_bins = 128;
     recipe.conv_kernel = 5;
     recipe.context_left = 13;
+    recipe.chunk = 12;
     recipe.depthwise_cached = true;
     var names: [12][256]u8 = undefined;
     var source_shape = [_]i64{ 1024, 1, 5 };
@@ -60831,7 +60832,6 @@ test "CUDA audio depthwise cold inventory validates actual floating source layou
     try compute.appendAudioCacheWorkload(recipe, &packed_builder);
     try std.testing.expectEqual(@as(usize, 53), packed_builder.len); // 38+3frontend+12QKV
 
-    recipe.chunk = 12;
     recipe.source_bf16 = true;
     recipe.graph_allowed = true;
     recipe.host_ops_empty = true;
