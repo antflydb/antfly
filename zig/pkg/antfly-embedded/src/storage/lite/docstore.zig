@@ -3245,6 +3245,9 @@ pub const Store = struct {
     commit_head: ?*MutationRequest = null,
     commit_tail: ?*MutationRequest = null,
     commit_draining: bool = false,
+    /// The draining leader is applying (appending) a group; false while it
+    /// seals one. See `prepareLeaseHandoff`.
+    commit_applying: bool = false,
     /// Group-commit bounds (WS2): at most this many staged requests, or this
     /// many estimated bytes, join one native transaction/fsync. A single
     /// request larger than `group_max_bytes` still forms its own group of
@@ -3471,6 +3474,9 @@ pub const Store = struct {
     test_groups_total: if (@import("builtin").is_test) std.atomic.Value(u64) else void = if (@import("builtin").is_test) .init(0) else {},
     test_group_members_total: if (@import("builtin").is_test) std.atomic.Value(u64) else void = if (@import("builtin").is_test) .init(0) else {},
     writer_admission: ?WriterAdmission = null,
+    /// Cleared when the file cannot pipeline seals (no shared region, no
+    /// protected redo): its groups then sync under the lease.
+    pipelined_seal_allowed: bool = true,
     /// C API mutations admitted on this store and not yet finished, and when
     /// the last one finished (awake clock): an idle fold waits for them.
     foreground_requests: std.atomic.Value(u32) = .init(0),
@@ -6114,6 +6120,28 @@ pub const Store = struct {
     /// WS1 hook: call before relying on `durableSequence()` to bound which
     /// pages are safe to reuse, so a ride-along write still sitting in the
     /// queue cannot silently delay reuse past when it should be eligible.
+    /// Before a lane lets the writer lease go: every drained member's
+    /// records are appended and their tail published. A pipelined file
+    /// needs nothing more, since any process seals them
+    /// (lite-cross-process-commit-sealing.md §5.4), so a group's seal no
+    /// longer holds the lease. Otherwise the group must be durable first.
+    pub fn prepareLeaseHandoff(self: *Store) void {
+        if (!self.file.pipelined_seal) {
+            self.ensureDurableForReuse();
+            self.sync() catch {};
+            return;
+        }
+        const io = self.file.runtime();
+        self.commit_mutex.lockUncancelable(io);
+        const become_leader = self.commit_head != null and !self.commit_draining;
+        if (become_leader) self.commit_draining = true;
+        self.commit_mutex.unlock(io);
+        if (become_leader) self.driveMutationCoordinator(true, null);
+        self.commit_mutex.lockUncancelable(io);
+        while (self.commit_applying or (self.commit_head != null and self.commit_draining)) self.commit_ready.waitUncancelable(io, &self.commit_mutex);
+        self.commit_mutex.unlock(io);
+    }
+
     pub fn ensureDurableForReuse(self: *Store) void {
         self.forceDrainDurable();
         // `forceDrainDurable` is a no-op when another thread is already
@@ -6628,13 +6656,23 @@ pub const Store = struct {
                 break;
             };
             pending_admission_waited_ns = 0;
+            self.commit_applying = true;
             self.commit_mutex.unlock(io);
 
             if (@import("builtin").is_test) {
                 _ = self.test_groups_total.fetchAdd(1, .monotonic);
                 _ = self.test_group_members_total.fetchAdd(batch.size, .monotonic);
             }
-            const result = self.applyMutationGroup(head, force_durable);
+            const applied = self.applyMutationGroup(head, force_durable);
+            // Appended: a lease handoff need not wait for the seal.
+            self.commit_mutex.lockUncancelable(io);
+            self.commit_applying = false;
+            self.commit_ready.broadcast(io);
+            self.commit_mutex.unlock(io);
+            const result: anyerror!void = if (applied) |seal|
+                (if (seal) |pending| self.sealGroup(pending) else {})
+            else |err|
+                err;
             var completed: ?*MutationRequest = head;
             while (completed) |item| : (completed = item.next) {
                 // A group failure supersedes every per-member result.
@@ -6976,7 +7014,7 @@ pub const Store = struct {
     /// specific error instead (this function then returns successfully).
     /// `force_durable` makes this group durable regardless of any member's
     /// own `durable` flag; see `driveMutationCoordinator`.
-    fn applyMutationGroup(self: *Store, head: *MutationRequest, force_durable: bool) !void {
+    fn applyMutationGroup(self: *Store, head: *MutationRequest, force_durable: bool) !?native.NativeFile.SealContext {
         const profile_span = write_stage_profile.begin(.group_apply);
         defer profile_span.end();
         // §9.4 (revised, step 4): start the background idle/threshold
@@ -7024,7 +7062,7 @@ pub const Store = struct {
                     // is empty. Honor the durable request even without edits.
                     if (force_durable or head.durable or head.complete != null or self.writer_admission != null) try self.file.sync();
                     head.committed_sequence = self.file.committedSequence();
-                    return;
+                    return null;
                 },
                 .inline_delete => {},
                 // Older overlay entries could shadow physical deletes in
@@ -7061,7 +7099,7 @@ pub const Store = struct {
             // Nothing survived staging; there is no durability to buy for a
             // transaction that would otherwise flush and publish no change.
             self.file.abortTransaction();
-            return;
+            return null;
         }
         // WS2: self.mutex is a spin lock (PublicationMutex); holding it
         // across the actual durability-barrier syscall would starve a new
@@ -7097,8 +7135,12 @@ pub const Store = struct {
         // confused with each other, since each owns its own stack frame.
         var sync_gate: SyncExclusiveGate = .{ .store = self };
         const commit_started = std.Io.Clock.awake.now(self.file.runtime()).nanoseconds;
-        try self.file.commitTransactionWithDurability(durable, .{ .context = &sync_gate, .release = releaseStoreMutexForSync, .reacquire = reacquireStoreMutexAfterSync });
-        if (durable) self.last_group_sync_ns = std.Io.Clock.awake.now(self.file.runtime()).nanoseconds - commit_started;
+        // A lease holder on a protected file appends and publishes, and the
+        // group completes once a seal covers it, whichever process seals
+        // (lite-cross-process-commit-sealing.md).
+        const pipelined = durable and self.pipelineSeal();
+        try self.file.commitTransactionWithDurability(durable and !pipelined, .{ .context = &sync_gate, .release = releaseStoreMutexForSync, .reacquire = reacquireStoreMutexAfterSync });
+        if (durable and !pipelined) self.last_group_sync_ns = std.Io.Clock.awake.now(self.file.runtime()).nanoseconds - commit_started;
         // Regression-B test hook: stamp every member with the sequence this
         // group's commit just landed at, while `self.mutex` is still held
         // (acquired at this function's top) so no other group can have
@@ -7108,6 +7150,33 @@ pub const Store = struct {
         const committed_sequence = self.file.activeCheckpoint().commit_sequence;
         var stamped: ?*MutationRequest = head;
         while (stamped) |item| : (stamped = item.next) item.committed_sequence = committed_sequence;
+        return if (pipelined) try self.file.sealContext() else null;
+    }
+
+    /// Whether this group pipelines its seal; enables it on first use.
+    fn pipelineSeal(self: *Store) bool {
+        if (!self.pipelined_seal_allowed or self.writer_admission == null) return false;
+        if (std.c.getenv("ANTFLY_LITE_PIPELINED_SEAL")) |value| if (std.mem.eql(u8, std.mem.span(value), "0")) {
+            self.pipelined_seal_allowed = false;
+            return false;
+        };
+        if (self.file.pipelined_seal) return true;
+        self.file.enablePipelinedSeal() catch {
+            self.pipelined_seal_allowed = false;
+            return false;
+        };
+        return true;
+    }
+
+    /// Seals a pipelined group without the store lock, then adopts the
+    /// seal as the handle's durability under it.
+    fn sealGroup(self: *Store, seal: native.NativeFile.SealContext) !void {
+        const started = std.Io.Clock.awake.now(self.file.runtime()).nanoseconds;
+        try seal.sealThrough();
+        self.last_group_sync_ns = std.Io.Clock.awake.now(self.file.runtime()).nanoseconds - started;
+        lockStoreExclusive(self);
+        defer self.mutex.unlock();
+        self.file.settleSealed();
     }
 
     /// Per-commit state threaded through one `commitTransactionWithDurability`
@@ -11980,7 +12049,7 @@ test "lite a member failing its own apply rolls back alone inside a shared group
     var first = MutationRequest{ .context = &good, .apply = Context.apply, .next = &second };
     // The group as a whole still commits: the bad member's own apply failed
     // and was rolled back alone, but the good member's writes are durable.
-    try store.applyMutationGroup(&first, false);
+    _ = try store.applyMutationGroup(&first, false);
     try first.result;
     try std.testing.expectError(error.InjectedGroupFailure, second.result);
     const doc = (try store.file.getDocumentAlloc(alloc, "doc")).?;

@@ -1,6 +1,6 @@
 # Lite cross-process commit sealing
 
-Status: design, follow-up to #1865.
+Status: implemented (follow-up to #1865). `ANTFLY_LITE_PIPELINED_SEAL=0` turns pipelining off for diagnosis; groups then sync under the lease as before.
 
 ## 1. Why
 
@@ -228,10 +228,30 @@ Every test checks invariant 1 the same way. After recovery, every
 acknowledged row is present. Unacknowledged rows may or may not be present,
 but no half-applied group appears.
 
-## 7. Delivery
+## 7. Where it lives
 
-1. Region fields, the seal lock as a sealer, `NativeFile.sealAppendedTail`,
-   and takeover adopt-or-cut, in native tests.
-2. Docstore: a group completes on seal, not on its own barrier, and drain
-   ends at append.
-3. The capi lane releases without sync, plus the cross-process crash tests.
+- Region: `SealBlock` in `shared_lock_region.zig` (format v7), with
+  `publishAppendedTail`, `sealState`, `noteSealed`, `noteCut`, `poisonSeal`,
+  `waitSealEpoch` and `tryLockFrontierBarrier`. A cold open with no live
+  peer clears poison and the appended tail.
+- Native file (`native.zig`):
+  - `enablePipelinedSeal`;
+  - pipelined appends through the ride-along branch, plus
+    `publishAppendedTail`;
+  - `sealAppendedTail` and `sealThrough`, the seal and the wait;
+  - `settleSealed`;
+  - adopt-or-cut in `resyncRedoTailUnderAuthority`, with `cutAppendedTail`;
+  - `sealOrCutDeadWriterTail` in dead-writer recovery;
+  - the fold fence in `checkpointRedoLogWithDurabilityImpl`;
+  - the seal lock in `writeAndSyncRedoFrontier`;
+  - `publishSealedLogState`, which advances the watermark readers use.
+- Docstore (`docstore.zig`):
+  - `applyMutationGroup` pipelines a lease holder's group and returns its
+    `SealContext`.
+  - `driveMutationCoordinator` seals it outside the store lock and
+    completes the members only afterwards.
+  - `prepareLeaseHandoff` waits for appends, not seals.
+- Lane (`capi/lite_connection.zig`): every release site calls
+  `prepareLeaseHandoff` instead of draining and syncing.
+- Tests: the `lite commit sealing:` tests in `native.zig`, and the
+  region seal-block test.
