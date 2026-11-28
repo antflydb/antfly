@@ -67,6 +67,7 @@ test {
     _ = @import("api/sql/testing/catalog_campaign_test.zig");
     _ = @import("api/sql/testing/conflict_scope_test.zig");
     _ = @import("api/table_catalog.zig");
+    _ = @import("api/public_table_http.zig");
     _ = @import("api/table_reads.zig");
     _ = @import("api/table_reads.zig").document_hydration_tests;
     _ = @import("api/tables.zig");
@@ -94,6 +95,20 @@ test {
     _ = runtime_http_bridge;
     _ = table_contract;
     _ = table_read_source;
+}
+
+test "storage artifact inspection carries the reprocess intent across the owner boundary" {
+    const std = @import("std");
+    const a = std.testing.allocator;
+    var manifest = try @import("api/table_reads.zig").parseStorageKernelDocumentArtifactManifestResponse(a,
+        \\{"document_id":"doc","artifact_name":"ocr","artifact_id":"asset","manifest_json":"{}","generation":1,"reprocess":{"requested_generation":2,"status":"pending","worker":{"scanned_sequence":9,"applied_sequence":8,"target_sequence":10,"retry_queue_full":false,"retrying":false,"failed":false,"background_running":true}}}
+    );
+    defer manifest.deinit(a);
+    try std.testing.expectEqual(@as(u64, 1), manifest.generation);
+    try std.testing.expectEqual(@as(u64, 2), manifest.reprocess.?.requested_generation);
+    try std.testing.expectEqual(.pending, manifest.reprocess.?.status);
+    try std.testing.expectEqual(@as(u64, 10), manifest.reprocess.?.worker.?.target_sequence);
+    try std.testing.expect(manifest.reprocess.?.worker.?.next_retry_at_ms == null);
 }
 
 /// Implementation source choices for this compilation root.

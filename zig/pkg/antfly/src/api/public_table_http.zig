@@ -6698,7 +6698,7 @@ test "public document artifact manifest handler returns summary and raw state" {
         unit_count: usize,
         manifest_json: []const u8,
         state_json: ?[]const u8,
-        reprocess: db_mod.types.DocumentArtifactReprocessStatus,
+        reprocess: ?db_mod.types.DocumentArtifactReprocessStatus = null,
     };
     var parsed = try std.json.parseFromSlice(Parsed, std.testing.allocator, resp.body, .{
         .ignore_unknown_fields = true,
@@ -6708,8 +6708,8 @@ test "public document artifact manifest handler returns summary and raw state" {
     try std.testing.expectEqual(@as(u16, 200), resp.status);
     try std.testing.expectEqualStrings("doc:a", parsed.value.document_id);
     try std.testing.expectEqual(@as(u64, 7), parsed.value.generation);
-    try std.testing.expectEqual(@as(u64, 8), parsed.value.reprocess.requested_generation);
-    try std.testing.expectEqual(.pending, parsed.value.reprocess.status);
+    try std.testing.expectEqual(@as(u64, 8), parsed.value.reprocess.?.requested_generation);
+    try std.testing.expectEqual(.pending, parsed.value.reprocess.?.status);
     try std.testing.expectEqualStrings("text", parsed.value.route_type);
     try std.testing.expectEqual(@as(usize, 2), parsed.value.unit_count);
     try std.testing.expectEqualStrings("{\"manifest_version\":2}", parsed.value.manifest_json);
@@ -6735,6 +6735,7 @@ test "public document artifact manifest handler returns summary and raw state" {
     try std.testing.expectEqual(@as(u16, 200), list_resp.status);
     try std.testing.expectEqualStrings("doc:a", parsed_list.value.document_id);
     try std.testing.expectEqual(@as(usize, 1), parsed_list.value.artifacts.len);
+    try std.testing.expect(parsed_list.value.artifacts[0].reprocess == null);
     try std.testing.expectEqualStrings("doc:a", parsed_list.value.artifacts[0].document_id);
     try std.testing.expectEqual(@as(u64, 7), parsed_list.value.artifacts[0].generation);
 
