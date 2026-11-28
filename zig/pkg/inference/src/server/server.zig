@@ -48795,7 +48795,10 @@ test "LightOnOCR3 real checkpoint transcribes the invoice fixture" {
             // At two rows the position plane starts on the first 16-byte boundary.
             try std.testing.expectEqual(@as(usize, 44), report.readback_bytes);
             try std.testing.expectEqual(report.planned_scratch_bytes, report.bound_scratch_bytes);
-            try std.testing.expect(report.planned_events != 0 and report.metadata_bytes != 0 and report.attention_scratch_bytes != 0);
+            try std.testing.expect(report.plan_origin != null and report.metadata_bytes != 0 and report.attention_scratch_bytes != 0);
+            try std.testing.expectEqual(report.planned_events == 0, report.planned_scratch_bytes == 0);
+            try std.testing.expect(report.replayed_bursts > 0);
+            try std.testing.expectEqual(report.completed_bursts, report.eager_bursts + report.recorded_bursts + report.replayed_bursts);
             if (platform.env.getenvBool("ANTFLY_TEST_LIGHTONOCR3_CUDA_UNFUSED_RECURRENT"))
                 try std.testing.expect(report.recurrent_scratch_bytes != 0);
             const alignment = @import("../execution/stream_workspace.zig").alignment;

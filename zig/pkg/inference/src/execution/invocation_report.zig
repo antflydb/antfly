@@ -469,7 +469,9 @@ test "uniform report retains bounded CUDA decoder workspace after completed publ
         observation.cudaDecoderDeclined(.workspace_admission);
         observation.cudaDecoderWorkspace(workspace);
         _ = nested.finish();
-        try std.testing.expectEqual(workspace, nested.cuda_decoder_workspace.?);
+        var replayed = workspace;
+        replayed.replayed_bursts = 1;
+        try std.testing.expectEqual(replayed, nested.cuda_decoder_workspace.?);
         try std.testing.expectEqualDeep(observation.CudaDecoderDeclines{ .admission_or_revalidation = 1, .unbacked_kv_pages = 1, .workspace_admission = 1 }, nested.cuda_decoder_declines.?);
     }
     _ = scope.finish();
@@ -479,6 +481,8 @@ test "uniform report retains bounded CUDA decoder workspace after completed publ
     var expected = workspace;
     expected.completed_bursts = 3;
     expected.eager_bursts = 1;
+    expected.recorded_bursts = 1;
+    expected.replayed_bursts = 1;
     try std.testing.expectEqual(expected, source.snapshot().?.report.?.cuda_decoder_workspace.?);
     try std.testing.expectEqualDeep(observation.CudaDecoderDeclines{ .missing_kv_binding = 1, .admission_or_revalidation = 1, .unbacked_kv_pages = 1, .workspace_admission = 1 }, source.snapshot().?.report.?.cuda_decoder_declines.?);
 }

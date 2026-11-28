@@ -532,6 +532,8 @@ pub const CudaVendorConvolution = struct {
 pub const CudaDecoderWorkspace = struct {
     completed_bursts: u64 = 1,
     eager_bursts: u64 = 0,
+    recorded_bursts: u64 = 0,
+    replayed_bursts: u64 = 0,
     /// Host wall time through kernel submission or graph launch. Capture
     /// instantiation is a subset, and readback includes device completion.
     submit_host_ns: u64 = 0,
@@ -591,6 +593,8 @@ pub inline fn cudaDecoderWorkspace(workspace: CudaDecoderWorkspace) void {
             .recorded_and_launched, .replayed => 0,
         };
         scope.cuda_decoder_workspace.?.eager_bursts = (if (prior) |previous| previous.eager_bursts else 0) +| eager;
+        scope.cuda_decoder_workspace.?.recorded_bursts = (if (prior) |previous| previous.recorded_bursts else 0) +| @as(u64, @intFromBool(workspace.route == .recorded_and_launched));
+        scope.cuda_decoder_workspace.?.replayed_bursts = (if (prior) |previous| previous.replayed_bursts else 0) +| @as(u64, @intFromBool(workspace.route == .replayed));
         if (prior) |previous| {
             scope.cuda_decoder_workspace.?.submit_host_ns +|= previous.submit_host_ns;
             scope.cuda_decoder_workspace.?.capture_instantiate_host_ns +|= previous.capture_instantiate_host_ns;
@@ -1487,11 +1491,14 @@ test "CUDA decoder burst timings accumulate across nested observations" {
         replayed.capture_instantiate_host_ns = 0;
         replayed.readback_host_ns = 250;
         cudaDecoderWorkspace(replayed);
+        replayed.replayed_bursts = 1;
         try testing.expectEqualDeep(replayed, inner.cuda_decoder_workspace.?);
     }
     const total = outer.cuda_decoder_workspace.?;
     try testing.expectEqual(CudaDecoderWorkspace.Route.replayed, total.route);
     try testing.expectEqual(@as(u64, 2), total.completed_bursts);
+    try testing.expectEqual(@as(u64, 1), total.recorded_bursts);
+    try testing.expectEqual(@as(u64, 1), total.replayed_bursts);
     try testing.expectEqual(@as(u64, 820), total.submit_host_ns);
     try testing.expectEqual(@as(u64, 600), total.capture_instantiate_host_ns);
     try testing.expectEqual(@as(u64, 450), total.readback_host_ns);
