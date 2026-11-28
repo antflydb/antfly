@@ -67,6 +67,7 @@ pub const StorageLayout = struct {
     ffn_workspace: ?Span = null,
     ffn_outputs: ?Span = null,
     projection_staging: ?Span = null,
+    final_norm_mirror: ?Span = null,
     fused_head_workspace: ?Span = null,
     recurrent_scratch: ?@import("gated_delta.zig").PacketScratch = null,
     metadata_bytes: usize,
@@ -363,6 +364,7 @@ pub const GraphPhase = struct {
         recurrent_scratch: bool,
         compact_ffn: ?bool,
         projection_staging: bool,
+        final_norm_mirror: bool = false,
     };
 
     /// Resolve layer lifetimes in submission order from the descriptor. A
@@ -376,6 +378,13 @@ pub const GraphPhase = struct {
         try self.declareRecurrentOutput();
         if (policy.compact_ffn) |compact| try self.declareFfnScratch(compact);
         if (policy.projection_staging) try self.declareProjectionStaging();
+        if (policy.final_norm_mirror) {
+            const rows = self.descriptor.rows;
+            const width = self.descriptor.hidden;
+            const bytes = try std.math.mul(usize, try std.math.mul(usize, rows, width), @sizeOf(u16));
+            const offset = try StorageLayout.aligned(self.storage_layout.layerWorkspaceBytes());
+            self.storage_layout.final_norm_mirror = try self.storage_layout.declareLayerRegion(offset, bytes);
+        }
     }
 
     pub fn declareAttentionScratch(self: *GraphPhase, chunk128_override: ?bool) !void {
@@ -879,6 +888,13 @@ pub const Module = struct {
         return self.bindLayerWorkspace(layout, span, span.bytes);
     }
 
+    pub fn bindFinalNormMirror(self: *const Module, bytes: usize) !?buffer.DeviceBuffer {
+        const layout = self.storage_layout orelse return error.InvalidExecutionPlan;
+        const span = layout.final_norm_mirror orelse return null;
+        if (span.bytes != bytes) return error.InvalidExecutionPlan;
+        return try self.bindLayerWorkspace(layout, span, bytes);
+    }
+
     fn bindLayerWorkspace(self: *const Module, layout: StorageLayout, span: StorageLayout.Span, bytes: usize) !buffer.DeviceBuffer {
         const prefix_end = layout.counter.offset + layout.counter.bytes;
         if (bytes == 0 or bytes > span.bytes or span.offset < prefix_end or
@@ -1047,6 +1063,19 @@ test "bounded CUDA decoder shares declared attention and recurrent workspace" {
     try std.testing.expectEqual(composed.projection_staging.?.bytes, shared_staging.bytes);
     try std.testing.expect(shared_staging.offset >= shared_head.offset + shared_head.bytes);
     try std.testing.expectEqual(shared_staging.offset + shared_staging.bytes, shared_layout.metadata_bytes);
+
+    var mirror_policy = policy;
+    mirror_policy.final_norm_mirror = true;
+    try phase.prepareWorkspace(mirror_policy);
+    const mirror_layout = phase.storage_layout;
+    const mirror = mirror_layout.final_norm_mirror.?;
+    try std.testing.expectEqual(rows * descriptor.hidden * @sizeOf(u16), mirror.bytes);
+    try std.testing.expect(mirror.offset >= shared_staging.offset + shared_staging.bytes);
+    var mirror_owner = output_owner;
+    mirror_owner.storage_layout = mirror_layout;
+    mirror_owner.metadata.len = mirror_layout.metadata_bytes;
+    try std.testing.expectEqual(mirror_owner.metadata.ptr + mirror.offset, (try mirror_owner.bindFinalNormMirror(mirror.bytes)).?.ptr);
+    try std.testing.expectError(error.InvalidExecutionPlan, mirror_owner.bindFinalNormMirror(mirror.bytes - 2));
 
     var fused = descriptor;
     fused.hidden = 1024;

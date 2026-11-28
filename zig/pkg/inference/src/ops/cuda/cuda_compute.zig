@@ -4239,6 +4239,7 @@ pub const CudaCompute = struct {
             .recurrent_scratch = !self.lighton_fused_gdn_decode_enabled or self.ctx.info.compute_major < 8,
             .compact_ffn = if (lightOnFfnBlockEnabled(cb) and lightOnDevice(self).portableKernels() and !self.lighton_bf16_decode_outputs) self.lighton_bf16_projection_outputs else null,
             .projection_staging = cudaCublasLtEnabled() and self.cublaslt != null and self.ctx.info.compute_major >= 8,
+            .final_norm_mirror = cudaRmsNormBf16MirrorEnabled() and cudaCublasLtEnabled() and self.cublaslt != null and self.ctx.info.compute_major >= 8,
         }) catch |err| switch (err) {
             error.InvalidShape, error.Overflow => return .unsupported,
         };
@@ -29882,7 +29883,7 @@ fn addLayerNorm(ctx: *anyopaque, a: CT, b: CT, gamma: CT, beta: CT, dim: usize, 
 }
 
 fn rmsNorm(ctx: *anyopaque, input: CT, weight: CT, dim: usize, eps: f32) anyerror!CT {
-    return rmsNormWithDestination(ctx, input, weight, dim, eps, null);
+    return rmsNormWithDestination(ctx, input, weight, dim, eps, null, null);
 }
 
 /// The graph's original input has been consumed when the decoder reaches its
@@ -29899,10 +29900,15 @@ pub fn tryCapturedFinalNorm(cb: *const ops.ComputeBackend, input: CT, weight: CT
     if (destination.len != bytes or kernel_geometry.byteRangesOverlap(destination.ptr, bytes, source.buffer.ptr, source.buffer.len) or
         kernel_geometry.byteRangesOverlap(destination.ptr, bytes, gamma.buffer.ptr, gamma.buffer.len)) return null;
     _ = try buffer_mod.validateRegion(destination, bytes, @alignOf(f32));
-    return try rmsNormWithDestination(cb.ptr, input, weight, dim, eps, destination);
+    const mirror = try owner.bindFinalNormMirror(try checkedMul(source.elem_count, @sizeOf(u16)));
+    if (mirror) |span| {
+        const regions = [_]buffer_mod.DeviceBuffer{ source.buffer, gamma.buffer, destination, span };
+        try buffer_mod.validateRegions(4, regions, .{ source.buffer.len, gamma.buffer.len, bytes, span.len }, .{ @alignOf(f32), 1, @alignOf(f32), @alignOf(u16) }, 2);
+    }
+    return try rmsNormWithDestination(cb.ptr, input, weight, dim, eps, destination, mirror);
 }
 
-fn rmsNormWithDestination(ctx: *anyopaque, input: CT, weight: CT, dim: usize, eps: f32, destination: ?buffer_mod.DeviceBuffer) anyerror!CT {
+fn rmsNormWithDestination(ctx: *anyopaque, input: CT, weight: CT, dim: usize, eps: f32, destination: ?buffer_mod.DeviceBuffer, mirror_destination: ?buffer_mod.DeviceBuffer) anyerror!CT {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     const input_tensor = tensorFromCt(input);
     const weight_tensor = tensorFromCt(weight);
@@ -29928,11 +29934,11 @@ fn rmsNormWithDestination(ctx: *anyopaque, input: CT, weight: CT, dim: usize, ep
         return result;
     }
     if (geometry.rows > 1 and cudaRmsNormBf16MirrorEnabled() and cudaCublasLtEnabled() and self.ctx.info.compute_major >= 8 and self.cublaslt != null) {
-        var bf16_mirror = allocDeviceBuffer(self, input_tensor.elem_count * @sizeOf(u16)) catch buffer_mod.DeviceBuffer{};
+        var bf16_mirror = mirror_destination orelse allocDeviceBuffer(self, input_tensor.elem_count * @sizeOf(u16)) catch buffer_mod.DeviceBuffer{};
         if (bf16_mirror.ptr != 0) {
             const launched_mirror = blk: {
                 self.kernels.launchRmsNormF32Bf16(&self.ctx, device, bf16_mirror, input_tensor.buffer, weight_tensor.buffer, geometry.rows, geometry.width, eps) catch |err| {
-                    bf16_mirror.free(&self.ctx);
+                    if (mirror_destination == null) releaseDeviceBuffer(self, &bf16_mirror);
                     switch (err) {
                         error.CudaKernelUnavailable => break :blk false,
                         else => return err,
@@ -29944,9 +29950,10 @@ fn rmsNormWithDestination(ctx: *anyopaque, input: CT, weight: CT, dim: usize, ep
                 self.stats.launch_norm += 1;
                 self.stats.launch_norm_rms += 1;
                 self.stats.rms_norm_bf16_mirror_hits += 1;
-                errdefer bf16_mirror.free(&self.ctx);
+                errdefer if (mirror_destination == null) releaseDeviceBuffer(self, &bf16_mirror);
                 const result = try createTensorWithDTypeAndBf16Mirror(self, device, bf16_mirror, shape, input_tensor.elem_count, .f32);
                 tensorFromCt(result).owns_buffer = destination == null;
+                tensorFromCt(result).owns_bf16_mirror = mirror_destination == null;
                 return result;
             }
         }
