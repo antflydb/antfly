@@ -3131,6 +3131,18 @@ pages. The norm-weight migration removes the observed 10,240-byte
 peak. Sustained wide declared replay and progress under retirement
 pressure remain open.
 
+At `a8180efde0`, all 45 focused Spark checks passed again, as did
+the separate cache-disabled and unfused HTTP fixtures. Both wide
+variants completed all 256 pages with exact serial parity and zero
+retirement-capacity retries. The unprofiled run passed the timed
+wide replay gate at 6.32 pages/second. It replayed an observed
+zero-byte plan at 98 rows and declared zero-byte plans at 60 and
+2 rows. The profiled variant reached 6.27 pages/second and replayed
+a declared zero-byte plan at 3 rows, missing its wide replay
+requirement. The enlarged retirement pool preserved progress in
+this pair. Sustained wide replay and declared replay above 64 rows
+remain open.
+
 ### Released Inkling Metal checkpoint at `7f0ff56ff8`
 
 Five focused checks passed on M4 Max with zero skips. The released
