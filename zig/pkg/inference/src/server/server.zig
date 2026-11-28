@@ -48805,10 +48805,16 @@ test "LightOnOCR3 real checkpoint transcribes the invoice fixture" {
             try std.testing.expectEqual(report.planned_scratch_bytes, report.bound_scratch_bytes);
             try std.testing.expect(report.plan_origin != null and report.metadata_bytes != 0 and report.attention_scratch_bytes != 0);
             try std.testing.expectEqual(report.planned_events == 0, report.planned_scratch_bytes == 0);
-            if (platform.env.getenvBool("ANTFLY_CUDA_LIGHTON_GRAPH_DECLARED_WARMUP")) {
-                try std.testing.expectEqual(@as(?@import("../execution/stream_workspace.zig").Origin, .declared), report.plan_origin);
-                try std.testing.expectEqual(@as(usize, 0), report.planned_events);
-                try std.testing.expect(report.eager_bursts <= 1);
+            if (platform.env.getenvBool("ANTFLY_CUDA_LIGHTON_GRAPH_DECLARED_WARMUP") and
+                platform.env.getenv("ANTFLY_CUDA_ENABLE_LIGHTON_FUSED_PROJECTIONS") != null)
+            {
+                const fused_projections = platform.env.getenvBool("ANTFLY_CUDA_ENABLE_LIGHTON_FUSED_PROJECTIONS");
+                const expected_origin: @import("../execution/stream_workspace.zig").Origin = if (fused_projections) .declared else .observed;
+                try std.testing.expectEqual(expected_origin, report.plan_origin.?);
+                if (fused_projections) {
+                    try std.testing.expectEqual(@as(usize, 0), report.planned_events);
+                    try std.testing.expect(report.eager_bursts <= 1);
+                }
             }
             try std.testing.expect(report.replayed_bursts > 0);
             try std.testing.expectEqual(report.completed_bursts, report.eager_bursts + report.recorded_bursts + report.replayed_bursts);

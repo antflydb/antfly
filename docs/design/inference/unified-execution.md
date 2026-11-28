@@ -2991,6 +2991,32 @@ The new epoch logs measured the two scheduled prefill intervals at
 are host durations and can include waits. The paired latency gate
 remains independent of this correctness fixture.
 
+The Spark comparison paired `4a5809a18b` against `8d4b13c954`
+with 40 measured requests per side in AA, ABBA and BB. All 240
+measured outputs matched exactly. Every paired candidate request
+replaced the learning burst with a seventh replay.
+
+| Control or comparison | First side median / p95 (ms) | Second side median / p95 (ms) |
+| --- | ---: | ---: |
+| AA | 466.36 / 473.84 | 469.83 / 498.12 |
+| ABBA | 469.55 / 482.72 | 468.68 / 498.23 |
+| BB | 465.68 / 475.88 | 464.96 / 475.80 |
+
+Paired decoder host submission fell from 6.47/6.61 to 4.15/4.32 ms.
+The 15.51 ms paired HTTP p95 increase was smaller than the 24.28 ms
+AA spread. The comparison therefore leaves the HTTP tail gate open.
+Candidate-only stage logging attributed 83.39/116.87 ms to scheduled
+prefill and 46.46/92.65 ms to the sum of prepared vision spans in
+ABBA. The vision spans can overlap; they cannot be added to a request's
+critical path or compared against unavailable baseline phase timings.
+
+The same binary passed exact two-page output and observed graph replay
+with declared warmup disabled. With the opt-in enabled and recurrent
+fusion disabled, serial output parity passed and the graph correctly
+used its observed workspace. The old fixture expected a declared plan
+solely from the opt-in and failed that assertion. The fixture now
+expects observed learning when the fusion prerequisite is turned off.
+
 ### Metal validation of the grouped audio follow-up
 
 The M4 Max production HTTP server built from `78a42df545` served the
