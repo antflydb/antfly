@@ -1172,6 +1172,8 @@ pub const Executor = struct {
             total = try std.math.add(usize, total, item.query_sequence_len);
             switch (item.phase) {
                 .prefill => {
+                    if (self.prepared_qwen_prefill_chunk_rows != 0 and item.query_sequence_len > self.prepared_qwen_prefill_chunk_rows)
+                        return error.InvalidPreparedPrompt;
                     prefill_count += 1;
                     const work: *PendingPrefillBatchWork = @ptrCast(@alignCast(item.work_ptr));
                     const prompt = work.prepared_prefix orelse return error.InvalidPreparedPrompt;

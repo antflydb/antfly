@@ -8150,7 +8150,6 @@ pub const NativeGenerationPipeline = struct {
             .io = self.io orelse return error.MissingIo,
             .control = self.execution_control,
             .continuation = self.continuationControl(),
-            .chunk_rows = self.prepared_qwen_prefill_chunk_rows,
             .wants_greedy = wants_greedy,
             .executor = self.stepExecutor(),
             .publication = publication,
