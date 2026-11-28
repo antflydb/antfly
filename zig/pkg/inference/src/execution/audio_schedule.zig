@@ -140,98 +140,10 @@ pub const WorkspaceDeclaration = struct {
         return .{ .events = events, .published_slot = published_slot, .fingerprint = hash.final() };
     }
 
-    pub const Step = struct {
-        /// Null for an assigned write, in-place operation, or barrier.
-        output_bytes: ?usize = null,
-        scratch_bytes: usize = 0,
-        /// Indices of outputs from preceding steps, in retirement order.
-        reads: []const u15 = &.{},
-    };
-
-    /// Compile an output-producing audio program with operation-local scratch.
-    /// The caller owns the result's events and frees them after the Stage ends.
-    pub fn compile(a: std.mem.Allocator, steps: []const Step, publication: u15) !WorkspaceDeclaration {
-        if (publication >= steps.len or steps.len > Workspace.Plan.slot_capacity) return error.InvalidExecutionPlan;
-        if (steps[publication].output_bytes == null) return error.InvalidExecutionPlan;
-        var slot_count: usize = 0;
-        for (steps) |step| {
-            if (step.output_bytes) |bytes| {
-                if (bytes == 0 or bytes > Workspace.limit) return error.InvalidExecutionPlan;
-                slot_count += 1;
-            }
-            if (step.scratch_bytes > Workspace.limit) return error.InvalidExecutionPlan;
-            slot_count += @intFromBool(step.scratch_bytes != 0);
-        }
-        if (slot_count > Workspace.Plan.slot_capacity) return error.InvalidExecutionPlan;
-        const temporaries = try a.alloc(struct { last_use: usize, slot: u15 }, steps.len);
-        defer a.free(temporaries);
-        for (steps, temporaries, 0..) |step, *temporary, index| {
-            temporary.* = .{ .last_use = index, .slot = undefined };
-            for (step.reads) |input| {
-                if (input >= index or steps[input].output_bytes == null) return error.InvalidExecutionPlan;
-                temporaries[input].last_use = index;
-            }
-        }
-        var events: std.ArrayList(Event) = .empty;
-        defer events.deinit(a);
-        try events.ensureTotalCapacityPrecise(a, slot_count * 2 - 1);
-        var next_slot: usize = 0;
-        for (steps, temporaries, 0..) |step, *temporary, index| {
-            if (step.output_bytes) |bytes| {
-                temporary.slot = @intCast(next_slot);
-                next_slot += 1;
-                events.appendAssumeCapacity(.{ .allocate = bytes });
-            }
-            if (step.scratch_bytes != 0) {
-                const scratch: u15 = @intCast(next_slot);
-                next_slot += 1;
-                events.appendAssumeCapacity(.{ .allocate_scratch = step.scratch_bytes });
-                events.appendAssumeCapacity(.{ .release = scratch });
-            }
-            for (step.reads) |input| if (input != publication and temporaries[input].last_use == index) {
-                events.appendAssumeCapacity(.{ .release = temporaries[input].slot });
-                // Repeated reads are legal, but retire the producing slot once.
-                temporaries[input].last_use = steps.len;
-            };
-            if (step.output_bytes != null and index != publication and temporary.last_use == index)
-                events.appendAssumeCapacity(.{ .release = temporary.slot });
-        }
-        return init(try events.toOwnedSlice(a), temporaries[publication].slot);
-    }
-
     pub fn cacheKey(self: WorkspaceDeclaration, seed: u64) u64 {
         return std.hash.Wyhash.hash(seed, std.mem.asBytes(&self.fingerprint));
     }
 };
-
-test "audio workspace compiler retires each producer after its last consumer" {
-    const a = std.testing.allocator;
-    const StreamPlan = @import("stream_workspace.zig").Plan;
-    const steps = [_]WorkspaceDeclaration.Step{
-        .{ .output_bytes = 256, .scratch_bytes = 512 },
-        .{ .output_bytes = 256, .reads = &.{0} },
-        .{ .reads = &.{0} },
-        .{ .output_bytes = 256, .reads = &.{ 0, 0, 1 } },
-    };
-    const declaration = try WorkspaceDeclaration.compile(a, &steps, 3);
-    defer a.free(declaration.events);
-    const expected = [_]StreamPlan.Declaration{
-        .{ .allocate = 256 },
-        .{ .allocate_scratch = 512 },
-        .{ .release = 1 },
-        .{ .allocate = 256 },
-        .{ .allocate = 256 },
-        .{ .release = 0 },
-        .{ .release = 2 },
-    };
-    try std.testing.expectEqualDeep(&expected, declaration.events);
-    try std.testing.expectEqual(@as(u15, 3), declaration.published_slot);
-
-    try std.testing.expectError(error.InvalidExecutionPlan, WorkspaceDeclaration.compile(a, &steps, 2));
-    var invalid = steps;
-    invalid[0].reads = &.{1};
-    try std.testing.expectError(error.InvalidExecutionPlan, WorkspaceDeclaration.compile(a, &invalid, 3));
-}
 
 /// Copied operation geometry only. The actual Stage certifies the model and
 /// rebuilds mutable backend policy/learned-layout requests after every yield.

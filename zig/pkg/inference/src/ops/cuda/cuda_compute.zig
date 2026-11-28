@@ -63546,13 +63546,13 @@ test "CUDA cold audio declaration dispatches before any learning invocation" {
     const publication_bytes = try checkedMul(projection.output_count, @sizeOf(f32));
     const layout = try sourceLinearLayout(compute.ctx.info.compute_major, projection.rows, 2, 2, true, false);
     const Workspace = ops.ComputeBackend.AudioWorkspaceDeclaration;
-    const steps = [_]Workspace.Step{
-        .{ .output_bytes = publication_bytes, .scratch_bytes = layout.bytes },
-        .{ .output_bytes = publication_bytes, .reads = &.{0} },
-        .{ .reads = &.{ 1, 0 } },
-    };
-    const workspace = try Workspace.compile(std.testing.allocator, &steps, 1);
-    defer std.testing.allocator.free(workspace.events);
+    const workspace = Workspace.init(&.{
+        .{ .allocate = publication_bytes },
+        .{ .allocate_scratch = layout.bytes },
+        .{ .release = 1 },
+        .{ .allocate = publication_bytes },
+        .{ .release = 0 },
+    }, 2);
     const bindings = try compute.audioCacheBase(workspace.cacheKey(cold_key), &geometry, null);
     const executes_before = compute.audio_arena_executes;
     const first = (try audioExecutionOp(&compute, cold_key, &inputs, @constCast(&cb), Run.call, .{
