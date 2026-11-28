@@ -4965,6 +4965,15 @@ fn tryAudioExecutionRange(cb: *const ComputeBackend, a: std.mem.Allocator, store
         if (rows != inputs.valid_mask.len or !std.mem.eql(usize, spans, inputs.segments)) break :recipe &local_recipe;
         break :recipe candidate;
     } else &local_recipe;
+    if (recipe.workspace != null) {
+        // A declared block may bind its relative keys but cannot lazily
+        // project them inside its tensor lifetime schedule.
+        for (start..end) |layer| {
+            try cb.checkExecutionControl();
+            const key_tensor = (try audioRelativeKey(cb, a, store, cfg, inputs.rel_in, layer, true)) orelse return null;
+            cb.free(key_tensor);
+        }
+    }
     const Run = struct {
         cb: *const ComputeBackend,
         a: std.mem.Allocator,
@@ -5287,6 +5296,20 @@ fn splitAudioQkv(cb: *const ComputeBackend, a: std.mem.Allocator, packed_rows: C
     return .{ .first = results[0], .second = results[1], .third = results[2] };
 }
 
+fn audioRelativeKey(cb: *const ComputeBackend, a: std.mem.Allocator, store: *ProjectorWeights, cfg: AudioConfig, relative: CT, layer: usize, require_cache: bool) !?CT {
+    var key_buf: [192]u8 = undefined;
+    const key = try audioCacheConfig(cfg).towerKey(&key_buf, .relative_key, layer);
+    const cache = store.gguf == null;
+    if (cache) {
+        if (try cb.modelConstant(key, null)) |hit| return hit;
+    } else if (require_cache) return null;
+    var name: [128]u8 = undefined;
+    const source = try audioSourceLinear(cb, a, store, cfg, relative, try fmt(&name, "a.blk.{d}.attn_k_rel", .{layer}), cfg.attention_context_left, cfg.audio_hidden, cfg.audio_hidden, .row_major, false, false);
+    if (!require_cache) return try publishAudioConstant(cb, key, source, cache);
+    defer cb.free(source);
+    return try cb.modelConstant(key, source);
+}
+
 fn audioSelfAttention(
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
@@ -5299,13 +5322,7 @@ fn audioSelfAttention(
     const valid_mask = inputs.valid_mask;
     const rows = valid_mask.len;
     var buf: [128]u8 = undefined;
-    var key_buf: [192]u8 = undefined;
-    const rel_key = try audioCacheConfig(cfg).towerKey(&key_buf, .relative_key, layer);
-    const cache_relative = store.gguf == null;
-    const rel = if (cache_relative) (try cb.modelConstant(rel_key, null)) orelse blk: {
-        const source = try audioSourceLinear(cb, allocator, store, cfg, inputs.rel_in, try fmt(&buf, "a.blk.{d}.attn_k_rel", .{layer}), cfg.attention_context_left, cfg.audio_hidden, cfg.audio_hidden, .row_major, false, false);
-        break :blk try publishAudioConstant(cb, rel_key, source, true);
-    } else try audioSourceLinear(cb, allocator, store, cfg, inputs.rel_in, try fmt(&buf, "a.blk.{d}.attn_k_rel", .{layer}), cfg.attention_context_left, cfg.audio_hidden, cfg.audio_hidden, .row_major, false, false);
+    const rel = (try audioRelativeKey(cb, allocator, store, cfg, inputs.rel_in, layer, false)).?;
     defer cb.free(rel);
     const choice = if (cfg.source_scalar_storage == .bf16) null else try packedAudioQkv(cb, allocator, store, input, rows, cfg.audio_hidden, layer);
     const packed_rows: ?ops.LinearTripleResult = if (choice) |value| switch (value) {
