@@ -3543,7 +3543,8 @@ fn audioSubsampleBatch(cb: *const ComputeBackend, a: std.mem.Allocator, store: *
             const host = try a.alloc(f32, batch * height);
             defer a.free(host);
             for (features, 0..) |f, b| for (0..height) |t| {
-                host[b * height + t] = if (f.mask[t * 2]) 1 else 0;
+                const source_frame = t * 2;
+                host[b * height + t] = if (source_frame < f.mask.len and f.mask[source_frame]) 1 else 0;
             };
             const mask = try deviceResidentFromFloat32(cb, host, &.{ @intCast(batch), 1, @intCast(height), 1 });
             defer cb.free(mask);
