@@ -3298,6 +3298,22 @@ page-state cleanup before replay. Its shortest remaining budget was
 108 tokens. The 113-row recordings emitted no EOS. These results
 leave both the throughput and consistent wide-replay gates open.
 
+The reversed-order unprofiled repeat used the same two frozen binaries
+and 24 GiB scratch limit. All eight arms again completed 256 pages with
+exact serial parity, 512 packed chunks and zero retirement-capacity
+retries. Pooled paired throughput was 6.37 pages/s for A and 6.20 for B,
+a 2.6% drop. The baseline controls ranged from 6.31 to 6.43 pages/s and
+the candidate controls from 6.33 to 6.40. Two baseline arms replayed at
+113 rows. One candidate arm reached 113 rows and the other three reached
+29 or 30 rows.
+
+The profiled run recorded 75 mixed prefill/decode steps in the paired
+baseline arms and 85 in the candidate arms. Their summed host forward
+and drain spans were 44.80 and 46.62 seconds, respectively. These spans
+include waits. The comparison changes both independent prompt cleanup
+and the replay-horizon check. It leaves attribution between those two
+changes open.
+
 The M4 Max focused cohort at `061f213135` passed all seven checks
 with zero skips. It exercised the shared installed Whisper Small
 checkpoint with the Metal backend required, verified assigned packed
