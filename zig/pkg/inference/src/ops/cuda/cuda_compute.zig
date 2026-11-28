@@ -8290,7 +8290,7 @@ pub const CudaCompute = struct {
         const inputs = try Inputs.describe(&shapes, rows, recipe.hidden, recipe.context_left, recipe.heads);
         const execution_key = recipe.key(segments[0..recipe.count], 0, recipe.blocks);
         const plan_key = if (recipe.workspace) |workspace| workspace.cacheKey(execution_key) else execution_key;
-        const base = try self.audioCacheBase(plan_key, inputs[0..Inputs.activeCount(!recipe.source_bf16)], null);
+        const base = try self.audioCacheBase(plan_key, inputs[0..recipe.cudaExecutionInputCount()], null);
         const existing = self.audioPlanFor(base);
         if (existing) |entry| if (entry.executableFor(base)) |plan| {
             if (!entry.owner.?.managed) try builder.add(.{ .audio_learning = .{ .key = base.key } });
@@ -21730,7 +21730,7 @@ fn cachedGroupedAudioWorkspace(ctx: *anyopaque, recipe: CudaCompute.CacheFunding
     const Inputs = schedule.ExecutionInputs;
     var shapes: [Inputs.count][2]i64 = undefined;
     const metadata = try Inputs.describe(&shapes, rows, recipe.hidden, recipe.context_left, recipe.heads);
-    const inputs = metadata[0..Inputs.activeCount(!recipe.source_bf16)];
+    const inputs = metadata[0..recipe.cudaExecutionInputCount()];
     const key = recipe.key(partition, 0, recipe.blocks);
     for (&self.audio_plans.entries) |*entry| {
         if (entry.disabled) continue;

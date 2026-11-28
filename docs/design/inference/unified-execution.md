@@ -2975,6 +2975,55 @@ shared the GPU with the same 184 MiB CUDA context throughout.
 The largest paired median increase was 0.27 ms at width two. At that
 width, the candidate-only median control varied by 0.77 ms.
 
+### CUDA grouped audio replay inputs
+
+The EmbeddingGemma 2 source BF16 encoder already prepares the relative
+key for each layer outside the audio workspace. Its grouped CUDA plan
+now stages 15 inputs. The raw relative-position tensor is consumed
+during key preparation, outside the workspace. At the released
+checkpoint geometry this removes 53,248 bytes from the logical replay
+inputs. Cold funding, sealed-plan lookup and dispatch use the same
+input count. Full-F32 CUDA and Metal use all 17 inputs for their
+existing callbacks.
+
+Spark GB10 passed all ten focused checks. The released checkpoint
+also passed all nine combinations of two, three and four clips with
+declared, observed and eager CUDA execution. The test used unequal
+clip lengths and verified exact vector equality between replay and
+eager CUDA after changing the samples. Both workspace policies bound
+exactly the planned arena at each width, with 132 operation scratch
+intervals.
+The arena sizes were 36,672,000, 38,132,736 and 39,529,472 bytes,
+respectively. Three local M4 Max audio and layout checks also passed.
+
+A separate Spark probe ran the F32 fallback by making the optional
+cuDNN provider unavailable. Eager CUDA passed at width four. The
+observed graph opt-in produced zero arena executions and zero replays
+at width two on both the previous and current binaries, and at width
+four on the current binary. F32 capture remains unqualified for this
+configuration.
+
+The Spark serving comparison used the prior grouped-audio server
+from `54b7bbb92d` and the compact-input server with declared graphs on
+both. All 576 measured requests completed and matched output hashes
+across AA, ABBA and BB. Both servers reported source BF16 audio in
+every arm. An unrelated CUDA context held 184 MiB throughout.
+
+| Clips | Prior p50 / p95 (ms) | Compact inputs p50 / p95 (ms) |
+| --- | ---: | ---: |
+| 2 | 26.78 / 28.59 | 26.88 / 27.93 |
+| 3 | 32.01 / 33.20 | 32.22 / 33.02 |
+| 4 | 36.11 / 36.92 | 35.91 / 37.06 |
+
+The paired medians moved by at most 0.21 ms. Baseline-only median
+controls differed by 0.19–0.71 ms, depending on width.
+
+A same-binary ABBA comparison then toggled the CUDA audio graph policy.
+All 96 measured requests across the three widths returned identical
+embedding vectors. Each policy reported a distinct, stable model
+identity. The first full-response comparison identified that metadata
+difference on all three widths.
+
 ### Isolated Metal E4B HTTP comparison at `58b3917a89`
 
 The local M4 Max used the same pinned binaries as the mixed serving

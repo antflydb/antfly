@@ -6641,10 +6641,27 @@ test "embeddinggemma2 CUDA original grouped Stage output escrow preserves instru
     try std.testing.expectEqual(raw.vector.len, owned.vectors.values(0).len);
     for (raw.vector, owned.vectors.values(0)) |x, y| try std.testing.expectApproxEqAbs(x, y, 1e-3);
     try std.testing.expect(!probe.violation.load(.acquire) and scheduler.head == null);
-    // This is the actual prepared-audio public caller, separate from Content's
-    // singleton frontend above. Equal real clips naturally form a B2 cohort;
-    // repeated B2 runs cover any enabled warm/learned arena policy unchanged.
-    const clips = [_]@import("audio_preparation.zig").Clip{ .{ .bytes = audio }, .{ .bytes = audio } };
+    // Keep the real clip's format and vary both the lengths and samples.
+    // Length sorting must scatter embeddings back into the caller's order.
+    var decoded = try @import("audio.zig").decodeWav(a, audio);
+    defer decoded.deinit();
+    const reversed = try a.dupe(f32, decoded.samples);
+    defer a.free(reversed);
+    std.mem.reverse(f32, reversed);
+    const width = if (platform.env.getenv("ANTFLY_TEST_GROUPED_AUDIO_WIDTH")) |value|
+        try std.fmt.parseUnsigned(usize, value, 10)
+    else
+        2;
+    if (width < 2 or width > 4) return error.InvalidTestAudioWidth;
+    const Clip = @import("audio_preparation.zig").Clip;
+    var initial: [4]Clip = undefined;
+    var changed: [4]Clip = undefined;
+    for (0..width) |index| {
+        const length = decoded.samples.len - decoded.samples.len / 24 * index;
+        initial[index] = .{ .pcm = .{ .samples = decoded.samples[0..length], .sample_rate = decoded.sample_rate } };
+        changed[index] = .{ .pcm = .{ .samples = reversed[0..length], .sample_rate = decoded.sample_rate } };
+    }
+    const clips = initial[0..width];
     const AudioWitness = struct {
         owners: usize = 0,
         graphs: usize = 0,
@@ -6666,6 +6683,20 @@ test "embeddinggemma2 CUDA original grouped Stage output escrow preserves instru
             const previous = compute.embedding_gemma2_policy.audio_graph;
             compute.embedding_gemma2_policy.audio_graph = enabled;
             return previous;
+        }
+        fn requireReplaySample(actual: Session, supplied: Control) !void {
+            var waiter = Scheduler.Waiter{};
+            try actual.enterExecutionCohort(actual.execution_gate, supplied, &waiter);
+            defer actual.leaveExecutionCohort(actual.execution_gate, &waiter);
+            const target = (try actual.coldComputeTarget(supplied)) orelse return error.MissingActualCudaTarget;
+            if (target != .cuda) return error.MissingActualCudaTarget;
+            const cuda = @import("../ops/cuda/cuda_compute.zig");
+            const compute: *cuda.CudaCompute = @ptrCast(@alignCast(target.cuda.implementation_context));
+            // Request the existing replay sampling route even when timing
+            // selected ordinary execution on this particular device.
+            for (&compute.embedding_gemma2_execution.arenas) |*arena| {
+                if (arena.kind == .audio and arena.graph != null) arena.replay_samples = 0;
+            }
         }
         fn read(actual: Session, supplied: Control) !@This() {
             // Metadata only, under the SAME actual model cohort. Attest the
@@ -6702,13 +6733,14 @@ test "embeddinggemma2 CUDA original grouped Stage output escrow preserves instru
     const observed_workspace = platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_AUDIO_OBSERVE_WORKSPACE");
     const audio_before = try AudioWitness.read(session, control);
     stage = "prepare first audio cohort";
-    const first_audio = try embedAudios(a, session, hf.tokenizer(), &clips, options, session.execution_gate, control, null);
+    const first_audio = try embedAudios(a, session, hf.tokenizer(), clips, options, session.execution_gate, control, null);
     defer {
         for (first_audio.vectors) |vector| a.free(vector);
         a.free(first_audio.vectors);
         a.free(first_audio.input_tokens);
     }
-    try std.testing.expectEqual(@as(usize, 2), first_audio.vectors.len);
+    try std.testing.expectEqual(width, first_audio.vectors.len);
+    try std.testing.expectEqual(BatchExecution.Execution.native_batch, first_audio.execution);
     if (audio_optin and !observed_workspace) {
         stage = "verify cold declared audio ownership";
         const cold = try AudioWitness.read(session, control);
@@ -6717,7 +6749,7 @@ test "embeddinggemma2 CUDA original grouped Stage output escrow preserves instru
     }
     stage = "replay repeated audio cohorts";
     for (0..if (audio_optin) @as(usize, 6) else @as(usize, 2)) |_| {
-        const repeated_audio = try embedAudios(a, session, hf.tokenizer(), &clips, options, session.execution_gate, control, null);
+        const repeated_audio = try embedAudios(a, session, hf.tokenizer(), clips, options, session.execution_gate, control, null);
         defer {
             for (repeated_audio.vectors) |vector| a.free(vector);
             a.free(repeated_audio.vectors);
@@ -6755,8 +6787,21 @@ test "embeddinggemma2 CUDA original grouped Stage output escrow preserves instru
     }
     if (audio_optin) {
         stage = "compare eager grouped audio with captured execution";
+        try AudioWitness.requireReplaySample(session, control);
+        const changed_audio = try embedAudios(a, session, hf.tokenizer(), changed[0..width], options, session.execution_gate, control, null);
+        defer {
+            for (changed_audio.vectors) |vector| a.free(vector);
+            a.free(changed_audio.vectors);
+            a.free(changed_audio.input_tokens);
+        }
+        const changed_witness = try AudioWitness.read(session, control);
+        try std.testing.expect(changed_witness.replays > audio_after.replays);
+        try std.testing.expectEqualSlices(usize, first_audio.input_tokens, changed_audio.input_tokens);
+        for (first_audio.vectors, changed_audio.vectors) |before, after|
+            try std.testing.expect(!std.mem.eql(f32, before, after));
+
         const previous = try AudioWitness.setGraphPolicy(session, control, false);
-        const eager_audio = try embedAudios(a, session, hf.tokenizer(), &clips, options, session.execution_gate, control, null);
+        const eager_audio = try embedAudios(a, session, hf.tokenizer(), changed[0..width], options, session.execution_gate, control, null);
         defer {
             for (eager_audio.vectors) |vector| a.free(vector);
             a.free(eager_audio.vectors);
@@ -6764,11 +6809,11 @@ test "embeddinggemma2 CUDA original grouped Stage output escrow preserves instru
         }
         const eager_witness = try AudioWitness.read(session, control);
         _ = try AudioWitness.setGraphPolicy(session, control, previous);
-        try std.testing.expectEqual(audio_after.executions, eager_witness.executions);
-        try std.testing.expectEqual(audio_after.replays, eager_witness.replays);
-        try std.testing.expectEqualSlices(usize, first_audio.input_tokens, eager_audio.input_tokens);
-        try std.testing.expectEqual(first_audio.vectors.len, eager_audio.vectors.len);
-        for (first_audio.vectors, eager_audio.vectors) |expected, actual| {
+        try std.testing.expectEqual(changed_witness.executions, eager_witness.executions);
+        try std.testing.expectEqual(changed_witness.replays, eager_witness.replays);
+        try std.testing.expectEqualSlices(usize, changed_audio.input_tokens, eager_audio.input_tokens);
+        try std.testing.expectEqual(changed_audio.vectors.len, eager_audio.vectors.len);
+        for (changed_audio.vectors, eager_audio.vectors) |expected, actual| {
             try std.testing.expectEqualSlices(f32, expected, actual);
         }
     }

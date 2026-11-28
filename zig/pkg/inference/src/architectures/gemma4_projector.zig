@@ -1485,13 +1485,13 @@ test "audio cache recipe shares exact execution key and original HF packed names
         try std.testing.expectEqualSlices(i64, &.{33}, mask.shape);
         try std.testing.expectEqual(rows, mask.elements);
     }
-    for (metadata[Inputs.scales..Inputs.segment_valid]) |scale| {
+    for (metadata[Inputs.scales..Inputs.relative]) |scale| {
         try std.testing.expectEqualSlices(i64, &.{@intCast(batch.hidden / batch.heads)}, scale.shape);
         try std.testing.expectEqual(batch.hidden / batch.heads, scale.elements);
     }
     try std.testing.expectEqualSlices(i64, &.{33}, metadata[Inputs.segment_valid].shape);
     try std.testing.expectEqual(rows, metadata[Inputs.segment_valid].elements);
-    try std.testing.expectEqual(Inputs.scales + Inputs.scale_count, Inputs.activeCount(false));
+    try std.testing.expectEqual(Inputs.scales + Inputs.scale_count, Inputs.prepared_relative_count);
     for (0..12) |layer| for ([_][]const u8{ "q", "k", "v" }, 0..) |component, index| {
         var original: [128]u8 = undefined;
         const logical = try std.fmt.bufPrint(&original, "a.blk.{d}.attn_{s}.weight", .{ layer, component });
@@ -5246,19 +5246,25 @@ fn tryAudioExecutionRange(cb: *const ComputeBackend, a: std.mem.Allocator, store
             var layer_inputs = self.inputs.*;
             layer_inputs.relative_keys = self.relative_keys;
             layer_inputs.relative_key_start = self.start;
-            layer_inputs.rel_in = values[audio_schedule.ExecutionInputs.relative];
+            const Input = audio_schedule.ExecutionInputs;
+            if (self.relative_keys.len == 0) {
+                layer_inputs.rel_in = values[Input.relative];
+                if (self.inputs.segment_valid != null) layer_inputs.segment_valid = values[Input.segment_valid];
+            } else {
+                layer_inputs.segment_valid = null;
+            }
             layer_inputs.valid_ct = values[audio_schedule.ExecutionInputs.valid];
             layer_inputs.segment_starts = if (self.inputs.segment_starts != null) values[audio_schedule.ExecutionInputs.segment_start] else null;
-            layer_inputs.segment_valid = if (self.inputs.segment_valid != null) values[audio_schedule.ExecutionInputs.segment_valid] else null;
             var scales: [audio_schedule.ExecutionInputs.scale_count]CT = undefined;
-            @memcpy(&scales, values[audio_schedule.ExecutionInputs.scales..audio_schedule.ExecutionInputs.segment_valid]);
+            @memcpy(&scales, values[Input.scales..Input.relative]);
             layer_inputs.scales = &scales;
             return runAudioLayers(self.cb, self.a, self.store, self.cfg, values[audio_schedule.ExecutionInputs.hidden], &layer_inputs, self.start, self.end);
         }
     };
     var run = Run{ .cb = cb, .a = a, .store = store, .cfg = cfg, .inputs = inputs, .relative_keys = relative_keys[0..relative_count], .start = start, .end = end };
     const values = audioExecutionInputs(hidden, inputs);
-    return cb.audioExecutionWithArenaFunding(key, values[0..audio_schedule.ExecutionInputs.activeCount(cb.kind() != .cuda or inputs.segment_valid != null)], &run, Run.call, defer_arena, .{ .recipe = recipe, .segments = inputs.segments, .rows = inputs.valid_mask.len });
+    const input_count = if (cb.kind() == .cuda) recipe.cudaExecutionInputCount() else values.len;
+    return cb.audioExecutionWithArenaFunding(key, values[0..input_count], &run, Run.call, defer_arena, .{ .recipe = recipe, .segments = inputs.segments, .rows = inputs.valid_mask.len });
 }
 
 fn audioExecutionEligible(cb: *const ComputeBackend, store: *const ProjectorWeights, cfg: AudioConfig, inputs: *const AudioLayerInputs) bool {
@@ -5279,7 +5285,7 @@ fn audioExecutionInputs(hidden: CT, inputs: *const AudioLayerInputs) [audio_sche
     values[audio_schedule.ExecutionInputs.valid] = inputs.valid_ct;
     values[audio_schedule.ExecutionInputs.segment_start] = inputs.segment_starts orelse inputs.valid_ct;
     values[audio_schedule.ExecutionInputs.segment_valid] = inputs.segment_valid orelse inputs.valid_ct;
-    @memcpy(values[audio_schedule.ExecutionInputs.scales..audio_schedule.ExecutionInputs.segment_valid], inputs.scales);
+    @memcpy(values[audio_schedule.ExecutionInputs.scales..audio_schedule.ExecutionInputs.relative], inputs.scales);
     return values;
 }
 fn audioLayer(

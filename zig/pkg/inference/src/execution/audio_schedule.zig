@@ -70,17 +70,17 @@ pub fn supportsCudaGroupedGraph(clips: usize, right_context: usize) bool {
 /// Ordered inputs shared by audio projection and workspace admission.
 pub const ExecutionInputs = struct {
     pub const hidden = 0;
-    pub const relative = 1;
-    pub const valid = 2;
-    pub const segment_start = 3;
-    pub const scales = 4;
+    pub const valid = 1;
+    pub const segment_start = 2;
+    pub const scales = 3;
     pub const scale_count = 12;
-    pub const segment_valid = scales + scale_count;
+    pub const relative = scales + scale_count;
+    pub const segment_valid = relative + 1;
     pub const count = segment_valid + 1;
 
-    pub fn activeCount(tagged: bool) usize {
-        return if (tagged) count else segment_valid;
-    }
+    /// CUDA source-precision blocks receive prepared relative keys and use
+    /// the ordinary validity plane with explicit clip spans.
+    pub const prepared_relative_count = relative;
 
     pub const Metadata = struct {
         shape: []const i64,
@@ -108,11 +108,13 @@ pub const ExecutionInputs = struct {
         var inputs: [count]Metadata = undefined;
         inputs[hidden] = .{ .shape = &shapes[hidden], .elements = try std.math.mul(usize, rows, width) };
         inputs[relative] = .{ .shape = &shapes[relative], .elements = try std.math.mul(usize, context_left, width) };
-        for (valid..count) |slot| {
-            const elements = if (slot < scales or slot == segment_valid) rows else head_dim;
+        for (valid..relative) |slot| {
+            const elements = if (slot < scales) rows else head_dim;
             shapes[slot][0] = @intCast(elements);
             inputs[slot] = .{ .shape = shapes[slot][0..1], .elements = elements };
         }
+        shapes[segment_valid][0] = row_dim;
+        inputs[segment_valid] = .{ .shape = shapes[segment_valid][0..1], .elements = rows };
         return inputs;
     }
 };
@@ -187,6 +189,10 @@ pub const AudioRecipe = struct {
         for ([_]usize{ self.hidden, self.output_hidden, self.intermediate, self.conv_kernel, context, try self.rows() }) |extent|
             if (std.math.cast(i64, extent) == null) return error.InvalidPreparedAudioRecipe;
     }
+    pub fn cudaExecutionInputCount(self: AudioRecipe) usize {
+        return if (self.source_bf16) ExecutionInputs.prepared_relative_count else ExecutionInputs.count;
+    }
+
     pub fn rows(self: AudioRecipe) !usize {
         return self.rowsAndSegments(null);
     }
