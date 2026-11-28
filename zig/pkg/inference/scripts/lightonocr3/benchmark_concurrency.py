@@ -937,10 +937,13 @@ def run(args, model, label, mode, concurrency, output):
                         result["status"] = (
                             "inconsistent_prepared_prefill_chunk_progress"
                         )
+                    expected_prefill_pages = (
+                        sample["requests"] * sample["pages_per_request"]
+                    )
                     if args.require_prepared_prefill_chunks and (
                         not chunk_progress
-                        or sample["packed_prefill_pages"] != args.requests
-                        or sample["packed_prefill_starts"] != args.requests
+                        or sample["packed_prefill_pages"] != expected_prefill_pages
+                        or sample["packed_prefill_starts"] != expected_prefill_pages
                         or sample["packed_prefill_chunks"]
                         <= sample["packed_prefill_pages"]
                     ):
