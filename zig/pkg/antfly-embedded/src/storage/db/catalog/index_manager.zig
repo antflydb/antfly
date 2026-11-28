@@ -22578,7 +22578,22 @@ pub const IndexManager = struct {
         return stats;
     }
 
+    /// A deadline a caller's synchronous merge work runs within: checked
+    /// before each refresh and each merge attempt, a refused one included.
+    pub const WorkBudget = struct {
+        context: *const anyopaque,
+        check: *const fn (context: *const anyopaque) anyerror!void,
+
+        fn checkWithin(budget: ?WorkBudget) !void {
+            if (budget) |b| try b.check(b.context);
+        }
+    };
+
     pub fn runTextMergeScheduler(self: *IndexManager, max_steps: usize) !usize {
+        return self.runTextMergeSchedulerWithin(max_steps, null);
+    }
+
+    pub fn runTextMergeSchedulerWithin(self: *IndexManager, max_steps: usize, budget: ?WorkBudget) !usize {
         var completed: usize = 0;
         // Indexes whose publication was refused this pass. A refusal
         // (`EnrichmentWaitCanceled`) can be scoped to one index whose inputs
@@ -22592,6 +22607,7 @@ pub const IndexManager = struct {
             refused.deinit(self.alloc);
         }
         while (completed < max_steps) {
+            try WorkBudget.checkWithin(budget);
             var task = (try self.beginTextMergeTask()) orelse break;
             defer task.deinit(self.alloc);
             errdefer self.cancelTextMergeTask(&task);
@@ -28070,11 +28086,16 @@ pub const IndexManager = struct {
     /// and planned, so the reload stalls neither other indexes nor this
     /// one's appliers. Callers run it before they plan merges.
     pub fn refreshTextIndexesBehindTip(self: *IndexManager) void {
+        self.refreshTextIndexesBehindTipWithin(null) catch {};
+    }
+
+    pub fn refreshTextIndexesBehindTipWithin(self: *IndexManager, budget: ?WorkBudget) !void {
         const now_ns = platform_time.monotonicNs();
         self.catalog_mutex.lockShared();
         defer self.catalog_mutex.unlockShared();
         for (self.text_indexes.items) |*entry| {
             if (!entry.tipRefreshRequired()) continue;
+            try WorkBudget.checkWithin(budget);
             if (entry.merge_retry_after_ns.load(.acquire) > now_ns) continue;
             switch (refreshTextIndexForReplan(entry, entry.config.name)) {
                 .current, .unsupported => TextMergeScheduler.schedule(entry),
@@ -51209,6 +51230,39 @@ test "text merge refused at a peer-advanced tip replans from the peer's segments
 // With the catalog's change history complete, the refresh reads only the
 // records the peer's merge changed: no full load of the catalog scope, and
 // the same active set as a refresh from the tip.
+// A synchronous drain's budget is checked before every attempt: once it is
+// spent, neither a refresh nor a merge starts, a refused merge (which
+// completes nothing) included.
+test "text merge work starts no attempt once its budget is spent" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    setBenchmarkTextMergePolicyOverride(.{ .max_segments_per_tier = 2, .max_segment_size = 5 * 1024 * 1024 * 1024, .floor_segment_size = 0 });
+    defer setBenchmarkTextMergePolicyOverride(null);
+    var fixture: StaleTextMergeFixture = undefined;
+    try fixture.init(alloc, &tmp);
+    defer fixture.deinit();
+    const Spent = struct {
+        fn check(_: *const anyopaque) anyerror!void {
+            return error.EnrichmentWaitTimeout;
+        }
+    };
+    const spent: IndexManager.WorkBudget = .{ .context = &fixture, .check = Spent.check };
+    const entry = fixture.textEntry();
+    const segments = entry.persistent.snapshot().segments.len;
+
+    try std.testing.expectError(error.EnrichmentWaitTimeout, fixture.manager.runTextMergeSchedulerWithin(1, spent));
+    try std.testing.expectEqual(segments, entry.persistent.snapshot().segments.len);
+    try std.testing.expect(entry.compaction_pending.load(.acquire));
+
+    entry.requestTipRefresh();
+    try std.testing.expectError(error.EnrichmentWaitTimeout, fixture.manager.refreshTextIndexesBehindTipWithin(spent));
+    try std.testing.expect(entry.tipRefreshRequired());
+    // Within budget the same work runs.
+    try fixture.manager.refreshTextIndexesBehindTipWithin(null);
+    try std.testing.expect(!entry.tipRefreshRequired());
+}
+
 test "text merge refused at a peer-advanced tip refreshes from the changed records" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

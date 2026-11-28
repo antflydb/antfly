@@ -9596,6 +9596,83 @@ test "capi native two genuinely separate writer processes do not lose each other
 // processes overwrite their own keys at `full_index`. Every acknowledged
 // overwrite must have removed its old token, and every live token must be
 // found, from a fresh handle, before anything drains.
+// A detached writer adopts a peer's unfolded tail when its transaction
+// opens. A batch large enough to cross the large-transaction fallback then
+// writes its delete and overwrite of the peer's keys straight into the tree;
+// the peer's older overlay versions must not shadow them or be folded back
+// over them, before or after a reopen.
+test "capi native separate writer processes supersede a peer's unfolded tail with a large batch" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .windows) return error.SkipZigTest;
+    const peer_path_env = "ANTFLY_TEST_LARGE_BATCH_PEER_PATH";
+    if (std.c.getenv(peer_path_env)) |child_path| {
+        const child = try open(std.mem.span(child_path), .{ .profile = .native, .busy_timeout_ms = 10_000 }, false);
+        const child_owner = child.lite_connection.?.owner;
+        xprocStopMaintenance(child_owner);
+        const child_id = try api.publishHandle(child);
+        var out: h.capi.Buffer = .{};
+        defer api.antfly_buffer_free_zero(&out);
+        try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_batch_json(child_id, .fromSlice(
+            "{\"inserts\":{\"victim\":{\"text\":\"peer\"},\"overwritten\":{\"text\":\"peer\"}},\"sync_level\":\"write\"}",
+        ), &out));
+        xprocReleaseWithoutFold(child_owner);
+        // Closing could fold the very tail the parent must adopt.
+        std.c._exit(0);
+    }
+    const a = std.testing.allocator;
+    var tmp = try api.TestDirectory.init("xproc-large-batch-supersede");
+    defer tmp.cleanup();
+    try std.Io.Dir.cwd().createDirPath(h.handleLockIo(), tmp.path());
+    const path = try std.fmt.allocPrint(a, "{s}/database.aflite", .{tmp.path()});
+    defer a.free(path);
+    const Check = struct {
+        fn found(handle: anytype, key: []const u8) !?[]u8 {
+            var out: h.capi.Buffer = .{};
+            defer api.antfly_buffer_free_zero(&out);
+            if (api.antfly_db_lookup_json(handle, .fromSlice(key), &out) != .ok) return null;
+            return try std.testing.allocator.dupe(u8, out.ptr.?[0..out.len]);
+        }
+        fn expectSuperseded(handle: anytype) !void {
+            try std.testing.expect((try found(handle, "victim")) == null);
+            const overwritten = (try found(handle, "overwritten")).?;
+            defer std.testing.allocator.free(overwritten);
+            try std.testing.expect(std.mem.indexOf(u8, overwritten, "parent") != null);
+            const bulk = (try found(handle, "bulk-0599")).?;
+            std.testing.allocator.free(bulk);
+        }
+    };
+    {
+        const wrapper = try open(path, .{ .profile = .native, .busy_timeout_ms = 10_000 }, true);
+        const owner = wrapper.lite_connection.?.owner;
+        xprocStopMaintenance(owner);
+        const id = try api.publishHandle(wrapper);
+        defer api.antfly_db_close(id);
+        {
+            var out: h.capi.Buffer = .{};
+            defer api.antfly_buffer_free_zero(&out);
+            try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_batch_json(id, .fromSlice("{\"inserts\":{\"seed\":{\"text\":\"seed\"}},\"sync_level\":\"write\"}"), &out));
+        }
+        xprocReleaseWithoutFold(owner);
+        var environment = std.process.Environ.Map.init(a);
+        defer environment.deinit();
+        try environment.put(peer_path_env, path);
+        try xprocRunTest("capi native separate writer processes supersede a peer's unfolded tail with a large batch", &environment);
+
+        var request: std.ArrayList(u8) = .empty;
+        defer request.deinit(a);
+        try request.appendSlice(a, "{\"inserts\":{\"overwritten\":{\"text\":\"parent\"}");
+        for (0..600) |i| try request.print(a, ",\"bulk-{d:0>4}\":{{\"text\":\"bulk document {d} padded to cross the large transaction fallback\"}}", .{ i, i });
+        try request.appendSlice(a, "},\"deletes\":[\"victim\"],\"sync_level\":\"write\"}");
+        var out: h.capi.Buffer = .{};
+        defer api.antfly_buffer_free_zero(&out);
+        try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_batch_json(id, .fromSlice(request.items), &out));
+        try Check.expectSuperseded(id);
+    }
+    const reopened = try open(path, .{ .profile = .native, .busy_timeout_ms = 10_000 }, false);
+    const reopened_id = try api.publishHandle(reopened);
+    defer api.antfly_db_close(reopened_id);
+    try Check.expectSuperseded(reopened_id);
+}
+
 test "capi native separate writer processes keep full-text deletes at full_index" {
     if (h.builtin.single_threaded or h.builtin.os.tag == .windows) return error.SkipZigTest;
     const a = std.testing.allocator;

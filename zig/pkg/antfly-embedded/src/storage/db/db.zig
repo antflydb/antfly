@@ -41014,20 +41014,30 @@ pub const DB = struct {
             {
                 var snapshot_replay = try self.acquireSnapshotReplayMutationWithin(io, wait);
                 defer snapshot_replay.release();
-                self.core.index_manager.refreshTextIndexesBehindTip();
+                // Every refresh and merge attempt starts within the budget, a
+                // refused merge (which completes nothing) included.
+                const budget = IndexManagerWorkBudget.of(&wait);
+                try self.core.index_manager.refreshTextIndexesBehindTipWithin(budget);
                 try wait.check();
                 try self.lockApplyForPortableRuntimeWithin(io, wait);
                 defer self.core.unlockApply();
-                // Each merge starts within the budget, the first included.
-                while (true) {
-                    try wait.check();
-                    if (try self.core.index_manager.runTextMergeScheduler(1) == 0) break;
-                }
+                while (try self.core.index_manager.runTextMergeSchedulerWithin(1, budget) != 0) {}
             }
             if (!self.core.index_manager.textTipRefreshPending()) return;
             if (io) |runtime_io| try runtime_io.sleep(.fromMilliseconds(1), .awake) else std.Thread.yield() catch {};
         }
     }
+
+    const IndexManagerWorkBudget = struct {
+        fn of(wait: *const derived_executor_mod.VisibilityWait) index_manager_mod.IndexManager.WorkBudget {
+            return .{ .context = wait, .check = check };
+        }
+
+        fn check(context: *const anyopaque) anyerror!void {
+            const wait: *const derived_executor_mod.VisibilityWait = @ptrCast(@alignCast(context));
+            try wait.check();
+        }
+    };
 
     /// `lockApplyForPortableRuntime`, retrying the lock in short slices
     /// that each recheck `wait` (timed waits with an Io, yields without),

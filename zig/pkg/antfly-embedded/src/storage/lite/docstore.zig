@@ -2925,7 +2925,6 @@ const MutationRequest = struct {
     scope_delete_exact_key: ?[]const u8 = null,
     scope_delete_only: bool = false,
     scope_delete_redo_bytes: ?*const fn (*anyopaque, *const native.NativeFile) usize = null,
-    document_batch: ?*const fn (*anyopaque) []const native.DocumentMutation = null,
     /// Never closes a group by becoming its leader, and never durable on
     /// its own: it joins whichever group a foreground (non-ride-along)
     /// member next forms, or `forceDrainDurable`'s forced group if none
@@ -5736,10 +5735,6 @@ pub const Store = struct {
         scope_delete_exact_key: ?[]const u8 = null,
         scope_delete_only: bool = false,
         scope_delete_redo_bytes: ?*const fn (*anyopaque, *const native.NativeFile) usize = null,
-        /// The document mutations this member writes, when known before it
-        /// applies: lets the leader settle the redo overlay first when the
-        /// group's transaction will cross the large-transaction fallback.
-        document_batch: ?*const fn (*anyopaque) []const native.DocumentMutation = null,
         /// Estimated size of this member's writes. Used only to bound group
         /// formation (`group_max_bytes`); never required to be exact. Also
         /// what `stageRideAlong` tracks against `ride_along_byte_threshold`.
@@ -5943,7 +5938,6 @@ pub const Store = struct {
             .scope_delete_exact_key = plan.scope_delete_exact_key,
             .scope_delete_only = plan.scope_delete_only,
             .scope_delete_redo_bytes = plan.scope_delete_redo_bytes,
-            .document_batch = plan.document_batch,
             .ride_along = ride_along,
             .estimated_bytes = plan.estimated_bytes,
         };
@@ -6514,29 +6508,6 @@ pub const Store = struct {
         self.last_redo_fold_ns = now;
     }
 
-    /// Whether the group's transaction will cross the large-transaction
-    /// fallback while the redo overlay holds an unfolded version of a key it
-    /// writes. Past the fallback its later private batches are written into
-    /// the tree, where such a version would stay the newest and the commit's
-    /// fold would write it back over them. Settled by folding first, as a
-    /// large scope deletion is (`planIndexScopeDeletion`). Members that do
-    /// not expose their documents count by their estimated size.
-    fn groupNeedsFoldFirst(self: *Store, head: *MutationRequest) bool {
-        const redo = if (self.file.redo) |*redo| redo else return false;
-        var bytes: usize = 0;
-        var member: ?*MutationRequest = head;
-        while (member) |item| : (member = item.next) {
-            bytes +|= if (item.document_batch) |batch| native.NativeFile.documentBatchWireBytes(batch(item.context)) else item.estimated_bytes;
-        }
-        if (bytes < redo.large_txn_fallback_bytes) return false;
-        member = head;
-        while (member) |item| : (member = item.next) {
-            const batch = item.document_batch orelse continue;
-            if (self.file.documentBatchHoldsUnfoldedKey(batch(item.context))) return true;
-        }
-        return false;
-    }
-
     /// Enqueue `plan` and return a ticket resolved once its group is durable.
     /// `plan.context` must stay valid until `Ticket.wait` returns: the group
     /// leader (this caller, or another thread already draining the queue)
@@ -7061,7 +7032,6 @@ pub const Store = struct {
                 .fold_first => try self.file.checkpointRedoLog(),
             }
         }
-        if (!artifact_lease_only and self.groupNeedsFoldFirst(head)) try self.file.checkpointRedoLog();
         if (artifact_lease_only) {
             try self.file.beginArtifactLeaseTransaction();
         } else {
@@ -8013,11 +7983,6 @@ pub const Txn = struct {
             return file.indexScopeCompanionRedoBytes(context.mutations, context.index_catalog_mutations);
         }
 
-        fn documentBatch(ptr: *anyopaque) []const native.DocumentMutation {
-            const context: *@This() = @ptrCast(@alignCast(ptr));
-            return context.mutations;
-        }
-
         fn apply(ptr: *anyopaque, file: *native.NativeFile) !void {
             const context: *@This() = @ptrCast(@alignCast(ptr));
             errdefer if (context.queued) |queued| queued.reject(queued.ptr);
@@ -8216,7 +8181,6 @@ pub const Txn = struct {
             .complete = if (context.queued != null) PrimaryCommitContext.complete else null,
             .estimated_bytes = estimated_bytes,
             .scope_delete_redo_bytes = if (self.index_catalog_delete_prefix != null) PrimaryCommitContext.scopeDeleteRedoBytes else null,
-            .document_batch = PrimaryCommitContext.documentBatch,
             .scope_delete_prefix = self.index_catalog_delete_prefix,
         };
         var ride_along_ticket: ?Store.Ticket = null;

@@ -2258,16 +2258,18 @@ pub const PersistentIndex = struct {
         replacement: ?index_mod.IndexWriter.PreparedSegmentReplacement = null,
         /// Kept segments' full deletion bitmaps, at their positions in the
         /// published snapshot, with the deletion count each was built from.
-        deletions: std.ArrayListUnmanaged(index_mod.RetainedDeletion) = .empty,
+        kept: std.ArrayListUnmanaged(index_mod.KeptDeletion) = .empty,
         deletion_counts: std.ArrayListUnmanaged(u32) = .empty,
         mirror: ?native_catalog_backend.Backend.PreparedMirror = null,
         /// Version columns decoded here, private until installed into the
         /// shared lookup (`version_locations`) with the snapshot they
         /// belong to.
         columns: std.ArrayListUnmanaged(DecodedColumn) = .empty,
-        dead_versions: []u64 = &.{},
+        /// Indexes the install detached from the lookup, freed with this
+        /// delta, after its locks are released.
+        detached: std.ArrayListUnmanaged(*VersionLocations.SegmentVersions) = .empty,
 
-        pub const DecodedColumn = struct { seg_id: u64, versions: []u64 };
+        pub const DecodedColumn = struct { seg_id: u64, index: ?*VersionLocations.SegmentVersions };
 
         pub fn deinit(self: *PreparedPeerDelta, alloc: Allocator) void {
             if (self.replacement) |*prepared| prepared.abort();
@@ -2277,12 +2279,14 @@ pub const PersistentIndex = struct {
                 entry.data.deinit(alloc);
             }
             self.additions.deinit(alloc);
-            for (self.deletions.items) |*item| item.deinit(alloc);
-            self.deletions.deinit(alloc);
+            for (self.kept.items) |*item| item.deinit();
+            self.kept.deinit(alloc);
             self.deletion_counts.deinit(alloc);
             if (self.mirror) |*mirror| mirror.deinit();
-            for (self.columns.items) |column| alloc.free(column.versions);
+            for (self.columns.items) |column| if (column.index) |index| index.destroy(alloc);
             self.columns.deinit(alloc);
+            for (self.detached.items) |index| index.destroy(alloc);
+            self.detached.deinit(alloc);
             self.base.release();
             self.arena.deinit();
             self.* = undefined;
@@ -2394,11 +2398,10 @@ pub const PersistentIndex = struct {
         }
         prepared.removed = removed.items;
         if (newly_dead.items.len != 0) {
-            prepared.dead_versions = newly_dead.items;
             try self.prepareKeptDeletions(&prepared, newly_dead.items);
         }
-        if (removed.items.len != 0 or prepared.additions.items.len != 0)
-            prepared.replacement = try self.writer.prepareSegmentsAgainst(base, self.alloc, prepared.removed, prepared.additions.items);
+        if (removed.items.len != 0 or prepared.additions.items.len != 0 or prepared.kept.items.len != 0)
+            prepared.replacement = try self.writer.prepareSegmentsAgainst(base, self.alloc, prepared.removed, prepared.additions.items, prepared.kept.items);
         prepared.mirror = try backend.prepareExternalMirror(prepared.keys);
         return prepared;
     }
@@ -2420,50 +2423,54 @@ pub const PersistentIndex = struct {
             @import("antfly_platform").sync.lockYielding(&locations.mutex);
             defer locations.mutex.unlock();
             for (versions) |version| {
-                if (locations.map.get(version)) |location| if ((try base.segmentIndex(location.seg_id)) != null and
-                    std.mem.indexOfScalar(u64, removed, location.seg_id) == null)
-                {
+                const found = found: {
+                    var it = locations.segments.iterator();
+                    while (it.next()) |entry| {
+                        const seg_id = entry.key_ptr.*;
+                        const local = entry.value_ptr.*.by_version.get(version) orelse continue;
+                        if ((try base.segmentIndex(seg_id)) == null or std.mem.indexOfScalar(u64, removed, seg_id) != null) continue;
+                        break :found VersionLocations.Location{ .seg_id = seg_id, .local_id = local };
+                    }
+                    break :found null;
+                };
+                if (found) |location| {
                     const slot = try by_segment.getOrPut(alloc, location.seg_id);
                     if (!slot.found_existing) slot.value_ptr.* = .empty;
                     try slot.value_ptr.append(alloc, location.local_id);
                     continue;
-                };
+                }
                 try missing.put(alloc, version, {});
             }
             if (missing.count() != 0) for (base.segments) |*segment| {
-                if (locations.indexed.contains(segment.id) or std.mem.indexOfScalar(u64, removed, segment.id) != null) continue;
+                if (locations.segments.contains(segment.id) or std.mem.indexOfScalar(u64, removed, segment.id) != null) continue;
                 try unindexed.append(alloc, segment.id);
             };
         }
+        // Built here, outside every lock; attached only once the delta
+        // publishes (`installVersionColumns`).
         for (unindexed.items) |seg_id| {
-            const index = (try base.segmentIndex(seg_id)).?;
+            const position = (try base.segmentIndex(seg_id)).?;
             try prepared.columns.ensureUnusedCapacity(self.alloc, 1);
-            const column = (try base.segments[index].reader.docVersionsAlloc(self.alloc)) orelse try self.alloc.alloc(u64, 0);
-            prepared.columns.appendAssumeCapacity(.{ .seg_id = seg_id, .versions = column });
-            for (column, 0..) |version, local| {
-                if (version == 0 or !missing.contains(version)) continue;
+            const index = try VersionLocations.SegmentVersions.build(self.alloc, &base.segments[position]);
+            prepared.columns.appendAssumeCapacity(.{ .seg_id = seg_id, .index = index });
+            var missing_it = missing.keyIterator();
+            while (missing_it.next()) |version| {
+                const local = index.by_version.get(version.*) orelse continue;
                 const slot = try by_segment.getOrPut(alloc, seg_id);
                 if (!slot.found_existing) slot.value_ptr.* = .empty;
-                try slot.value_ptr.append(alloc, @intCast(local));
+                try slot.value_ptr.append(alloc, local);
             }
         }
-        // Positions in the published snapshot: kept segments in order,
-        // replacements after them.
-        var position: usize = 0;
         for (base.segments) |*segment| {
             if (std.mem.indexOfScalar(u64, removed, segment.id) != null) continue;
-            defer position += 1;
             const locals = by_segment.get(segment.id) orelse continue;
-            try prepared.deletions.ensureUnusedCapacity(self.alloc, 1);
+            try prepared.kept.ensureUnusedCapacity(self.alloc, 1);
             try prepared.deletion_counts.ensureUnusedCapacity(self.alloc, 1);
             const state = try segment.cloneDeletedState(self.writer.alloc);
             var bitmap = state.bitmap orelse roaring.RoaringBitmap.init(self.writer.alloc);
-            const item = blk: {
-                errdefer bitmap.deinit();
-                for (locals.items) |local| try bitmap.add(local);
-                break :blk try index_mod.prepareRetainedDeletion(self.alloc, segment, position, bitmap);
-            };
-            prepared.deletions.appendAssumeCapacity(item);
+            errdefer bitmap.deinit();
+            for (locals.items) |local| try bitmap.add(local);
+            prepared.kept.appendAssumeCapacity(.{ .id = segment.id, .bitmap = bitmap });
             prepared.deletion_counts.appendAssumeCapacity(state.count);
         }
     }
@@ -2471,7 +2478,8 @@ pub const PersistentIndex = struct {
     /// Publishes a prepared delta if nothing reached the index since it was
     /// prepared; false when stale. The caller holds this index's apply
     /// guard, which its writers and inline stagings take. Only validation,
-    /// swaps and one pass over the kept segments' deletions run here.
+    /// and swaps run here: kept segments' new tombstones are part of the
+    /// published snapshot, so no reader sees the new copies without them.
     pub fn installPeerDelta(self: *PersistentIndex, prepared: *PreparedPeerDelta) !bool {
         const backend = switch (self.main_store_owner) {
             .native_catalog => |backend| backend,
@@ -2484,7 +2492,7 @@ pub const PersistentIndex = struct {
         if (self.inline_in_flight.load(.acquire) != 0 or self.inline_segments_pending.load(.acquire) != 0) return error.UnsupportedRefresh;
         if (backend.state_epoch.load(.acquire) != prepared.mirror_epoch) return false;
         if (@atomicLoad(*index_mod.IndexSnapshot, &self.writer.current, .acquire) != prepared.base) return false;
-        for (prepared.deletions.items, prepared.deletion_counts.items) |item, count| {
+        for (prepared.kept.items, prepared.deletion_counts.items) |item, count| {
             const index = (try prepared.base.segmentIndex(item.id)) orelse return false;
             if (prepared.base.segments[index].shared.deleted_count.load(.acquire) != count) return false;
         }
@@ -2495,7 +2503,6 @@ pub const PersistentIndex = struct {
             // Published: the writer owns the data, readers and deletions.
             prepared.additions.clearRetainingCapacity();
         }
-        self.writer.installRetainedDeletions(prepared.deletions.items);
         if (prepared.mirror) |*mirror| {
             // The epoch was checked above under the same guard.
             if (!mirror.publishIfEpoch(prepared.mirror_epoch)) backend.invalidateMirror();
@@ -2509,46 +2516,31 @@ pub const PersistentIndex = struct {
         return true;
     }
 
-    /// After a delta published: the lookup drops segments no longer served
-    /// (so repeated peer merges release their columns), takes the columns
-    /// the delta decoded for segments still served, and forgets the
-    /// versions it just marked dead.
+    /// After a delta published: the lookup detaches the segments the delta
+    /// retired, by id from its own list, and attaches the indexes it built
+    /// for segments still served. Neither touches a version; the detached
+    /// indexes are freed with the delta, after its locks are released.
     fn installVersionColumns(self: *PersistentIndex, prepared: *PreparedPeerDelta) void {
         const locations = &self.version_locations;
         @import("antfly_platform").sync.lockYielding(&locations.mutex);
         defer locations.mutex.unlock();
-        const snap = @atomicLoad(*index_mod.IndexSnapshot, &self.writer.current, .acquire);
-        self.pruneRetiredVersionLocationsLocked(snap) catch {
-            // Allocation failure: drop the whole lookup; it rebuilds.
-            locations.clear(self.alloc);
+        prepared.detached.ensureUnusedCapacity(self.alloc, prepared.removed.len) catch {
+            // Cannot keep what it detaches: leave the lookup to rebuild.
+            locations.destroySegments(self.alloc);
+            locations.segments.clearRetainingCapacity();
+            return;
         };
-        for (prepared.columns.items) |*column| {
-            const served = (snap.segmentIndex(column.seg_id) catch null) != null;
-            if (!served or locations.indexed.contains(column.seg_id)) continue;
-            locations.map.ensureUnusedCapacity(self.alloc, @intCast(column.versions.len)) catch continue;
-            locations.indexed.put(self.alloc, column.seg_id, column.versions) catch continue;
-            for (column.versions, 0..) |version, local| {
-                if (version != 0) locations.map.putAssumeCapacity(version, .{ .seg_id = column.seg_id, .local_id = @intCast(local) });
-            }
-            column.versions = &.{};
+        for (prepared.removed) |seg_id| {
+            const entry = locations.segments.fetchRemove(seg_id) orelse continue;
+            prepared.detached.appendAssumeCapacity(entry.value);
         }
-        for (prepared.dead_versions) |version| _ = locations.map.remove(version);
-    }
-
-    /// Drops the lookup's entries for segments `snap` no longer serves.
-    fn pruneRetiredVersionLocationsLocked(self: *PersistentIndex, snap: *const index_mod.IndexSnapshot) !void {
-        const locations = &self.version_locations;
-        var retired = std.ArrayListUnmanaged(u64).empty;
-        defer retired.deinit(self.alloc);
-        var indexed_it = locations.indexed.keyIterator();
-        while (indexed_it.next()) |seg_id| if ((try snap.segmentIndex(seg_id.*)) == null) try retired.append(self.alloc, seg_id.*);
-        for (retired.items) |seg_id| {
-            const column = locations.indexed.fetchRemove(seg_id).?.value;
-            defer self.alloc.free(column);
-            for (column) |version| {
-                const location = locations.map.get(version) orelse continue;
-                if (location.seg_id == seg_id) _ = locations.map.remove(version);
-            }
+        const snap = @atomicLoad(*index_mod.IndexSnapshot, &self.writer.current, .acquire);
+        for (prepared.columns.items) |*column| {
+            const index = column.index orelse continue;
+            const served = (snap.segmentIndex(column.seg_id) catch null) != null;
+            if (!served or locations.segments.contains(column.seg_id)) continue;
+            locations.segments.put(self.alloc, column.seg_id, index) catch continue;
+            column.index = null;
         }
     }
 
@@ -2711,8 +2703,8 @@ pub const PersistentIndex = struct {
         defer txn.abort();
         var plan = try self.planTipRefresh(&txn);
         errdefer plan.deinit(self.alloc);
-        if (plan.removed.items.len != 0 or plan.added.items.len != 0)
-            plan.replacement = try self.writer.prepareSegmentsAgainst(plan.snapshot, self.alloc, plan.removed.items, plan.added.items);
+        if (plan.removed.items.len != 0 or plan.added.items.len != 0 or plan.retained.items.len != 0)
+            plan.replacement = try self.writer.prepareSegmentsAgainst(plan.snapshot, self.alloc, plan.removed.items, plan.added.items, plan.retained.items);
         return .{ .view = view, .view_store = view_store, .mirror_epoch = mirror_epoch, .plan = plan };
     }
 
@@ -2742,16 +2734,15 @@ pub const PersistentIndex = struct {
     /// What a refresh from the tip changes in the writer, planned against
     /// one writer snapshot from one read of the tip. Everything index-sized
     /// is done here, outside the writer lock: new segments' readers and
-    /// deletions, and the retained segments' deletions with their coverage
-    /// counts, so publication is one pass.
+    /// deletions, and the retained segments' changed tombstones, so one
+    /// snapshot publishes membership and liveness together.
     pub const TipRefreshPlan = struct {
         snapshot: *index_mod.IndexSnapshot,
         removed: std.ArrayListUnmanaged(u64) = .empty,
         added: std.ArrayListUnmanaged(index_mod.ReplacementSegmentData) = .empty,
-        /// Deletions of segments already loaded, set after publication as
-        /// an inline install marks its deletes after adding its copies; each
-        /// at its position in the published snapshot.
-        retained: std.ArrayListUnmanaged(index_mod.RetainedDeletion) = .empty,
+        /// New tombstones of segments already loaded, only where they
+        /// changed; published in the same snapshot as `added`.
+        retained: std.ArrayListUnmanaged(index_mod.KeptDeletion) = .empty,
         next_segment_id: ?u64 = null,
         /// The replacement snapshot, with its segment metadata and field
         /// statistics, built against `snapshot` without the writer lock
@@ -2766,7 +2757,7 @@ pub const PersistentIndex = struct {
                 replacement.data.deinit(alloc);
             }
             self.added.deinit(alloc);
-            for (self.retained.items) |*item| item.deinit(alloc);
+            for (self.retained.items) |*item| item.deinit();
             self.retained.deinit(alloc);
             self.removed.deinit(alloc);
             self.snapshot.release();
@@ -2800,28 +2791,25 @@ pub const PersistentIndex = struct {
         defer present.deinit(self.alloc);
         var dead = try DeadVersions.load(self.alloc, txn);
         defer dead.deinit();
-        // Publication keeps the retained segments in order ahead of the
-        // added ones, so a retained segment's position there is its position
-        // here less the removed segments before it.
-        var removed_before: usize = 0;
-        for (plan.snapshot.segments, 0..) |*segment, i| {
+        for (plan.snapshot.segments) |*segment| {
             try present.put(self.alloc, segment.id, {});
             if (!tip.contains(segment.id)) {
                 try plan.removed.append(self.alloc, segment.id);
-                removed_before += 1;
                 continue;
             }
             // Reserved first: the bitmap is owned by nothing until it is in
             // the plan.
             try plan.retained.ensureUnusedCapacity(self.alloc, 1);
-            const derived = try derivedDeletionBitmap(self.writer.alloc, segment.reader.encoded(), &dead);
-            if (derived == null and segment.shared.deleted_count.load(.acquire) == 0) continue;
-            var bitmap = derived orelse roaring.RoaringBitmap.init(self.writer.alloc);
-            const item = index_mod.prepareRetainedDeletion(self.alloc, segment, i - removed_before, bitmap) catch |err| {
-                bitmap.deinit();
-                return err;
-            };
-            plan.retained.appendAssumeCapacity(item);
+            var derived = try derivedDeletionBitmap(self.writer.alloc, segment.reader.encoded(), &dead);
+            var current = try segment.cloneDeletedState(self.writer.alloc);
+            defer if (current.bitmap) |*bitmap| bitmap.deinit();
+            // Unchanged tombstones keep the segment's own cell and caches.
+            const unchanged = if (derived) |*next| (if (current.bitmap) |*now| next.eql(now) else next.isEmpty()) else current.count == 0;
+            if (unchanged) {
+                if (derived) |*next| next.deinit();
+                continue;
+            }
+            plan.retained.appendAssumeCapacity(.{ .id = segment.id, .bitmap = derived orelse roaring.RoaringBitmap.init(self.writer.alloc) });
         }
         // Segments new here are published with their deletions and readers.
         var tip_it = tip.keyIterator();
@@ -2860,14 +2848,13 @@ pub const PersistentIndex = struct {
             plan.replacement = null;
             // Published: the writer owns the data, readers and deletions.
             plan.added.clearRetainingCapacity();
-        } else if (plan.removed.items.len != 0 or plan.added.items.len != 0) {
-            var prepared = try self.writer.prepareSegmentsManyData(plan.removed.items, plan.added.items);
+        } else if (plan.removed.items.len != 0 or plan.added.items.len != 0 or plan.retained.items.len != 0) {
+            var prepared = try self.writer.prepareSegmentsManyDataWithKept(plan.removed.items, plan.added.items, plan.retained.items);
             defer prepared.abort();
             prepared.publish();
             // Published: the writer owns the data, readers and deletions.
             plan.added.clearRetainingCapacity();
         }
-        self.writer.installRetainedDeletions(plan.retained.items);
         if (plan.next_segment_id) |next| self.writer.next_segment_id = @max(self.writer.next_segment_id, next);
         self.version_locations.clear(self.alloc);
         return true;
@@ -5449,10 +5436,11 @@ pub const PersistentIndex = struct {
     /// is stale (a merge moved or dropped the copy) and is looked up again.
     pub const VersionLocations = struct {
         mutex: std.atomic.Mutex = .unlocked,
-        map: std.AutoHashMapUnmanaged(u64, Location) = .empty,
-        /// Each indexed segment's versions, so a retired segment's entries
-        /// leave in time proportional to that segment.
-        indexed: std.AutoHashMapUnmanaged(u64, []u64) = .empty,
+        /// Each indexed segment's version index, built from its version
+        /// column. A segment's index comes and goes whole, so attaching or
+        /// retiring one costs the same whatever the segment's size, and an
+        /// index can be built before it is attached.
+        segments: std.AutoHashMapUnmanaged(u64, *SegmentVersions) = .empty,
         /// Versions a committed death named before their level-0 segment was
         /// installed (a later commit's install ran first). The segment's
         /// install takes them.
@@ -5460,25 +5448,56 @@ pub const PersistentIndex = struct {
 
         const Location = struct { seg_id: u64, local_id: u32 };
 
+        pub const SegmentVersions = struct {
+            by_version: std.AutoHashMapUnmanaged(u64, u32) = .empty,
+
+            fn build(alloc: Allocator, segment: *const index_mod.SegmentEntry) !*SegmentVersions {
+                const column = (try segment.reader.docVersionsAlloc(alloc)) orelse try alloc.alloc(u64, 0);
+                defer alloc.free(column);
+                const index = try alloc.create(SegmentVersions);
+                index.* = .{};
+                errdefer index.destroy(alloc);
+                try index.by_version.ensureTotalCapacity(alloc, @intCast(column.len));
+                for (column, 0..) |version, local| {
+                    if (version != 0) index.by_version.putAssumeCapacity(version, @intCast(local));
+                }
+                return index;
+            }
+
+            fn destroy(self: *SegmentVersions, alloc: Allocator) void {
+                self.by_version.deinit(alloc);
+                alloc.destroy(self);
+            }
+        };
+
+        /// Where `version` sits among `snap`'s segments. A merge carries
+        /// versions into its output, so a retired input may still list it.
+        fn findServed(self: *const VersionLocations, snap: *const index_mod.IndexSnapshot, version: u64) !?Location {
+            var it = self.segments.iterator();
+            while (it.next()) |entry| {
+                const local = entry.value_ptr.*.by_version.get(version) orelse continue;
+                if ((try snap.segmentIndex(entry.key_ptr.*)) != null) return .{ .seg_id = entry.key_ptr.*, .local_id = local };
+            }
+            return null;
+        }
+
         fn clear(self: *VersionLocations, alloc: Allocator) void {
             @import("antfly_platform").sync.lockYielding(&self.mutex);
             defer self.mutex.unlock();
-            self.freeIndexed(alloc);
-            self.map.clearAndFree(alloc);
-            self.indexed.clearAndFree(alloc);
+            self.destroySegments(alloc);
+            self.segments.clearAndFree(alloc);
             self.parked.clearAndFree(alloc);
         }
 
         fn deinit(self: *VersionLocations, alloc: Allocator) void {
-            self.freeIndexed(alloc);
-            self.map.deinit(alloc);
-            self.indexed.deinit(alloc);
+            self.destroySegments(alloc);
+            self.segments.deinit(alloc);
             self.parked.deinit(alloc);
         }
 
-        fn freeIndexed(self: *VersionLocations, alloc: Allocator) void {
-            var it = self.indexed.valueIterator();
-            while (it.next()) |versions| alloc.free(versions.*);
+        fn destroySegments(self: *VersionLocations, alloc: Allocator) void {
+            var it = self.segments.valueIterator();
+            while (it.next()) |index| index.*.destroy(alloc);
         }
     };
 
@@ -5504,21 +5523,19 @@ pub const PersistentIndex = struct {
         if (!pending and locations.parked.count() != 0) locations.parked.clearRetainingCapacity();
         var refreshed = false;
         for (versions) |version| {
-            var location = locations.map.get(version);
-            if (location == null or (try snap.segmentIndex(location.?.seg_id)) == null) {
-                if (!refreshed) {
-                    try self.indexVersionLocationsLocked(snap);
-                    refreshed = true;
-                }
-                location = locations.map.get(version);
+            var location = try locations.findServed(snap, version);
+            if (location == null and !refreshed) {
+                try self.indexVersionLocationsLocked(snap);
+                refreshed = true;
+                location = try locations.findServed(snap, version);
             }
             const found = location orelse {
                 if (pending) try locations.parked.put(self.alloc, version, {});
                 continue;
             };
-            if ((try snap.segmentIndex(found.seg_id)) == null) continue;
+            // A dead version stays in its segment's index: marking it again
+            // changes nothing.
             try self.writer.applyCommittedDeletes(found.seg_id, &.{found.local_id});
-            _ = locations.map.remove(version);
         }
     }
 
@@ -5526,25 +5543,14 @@ pub const PersistentIndex = struct {
         const locations = &self.version_locations;
         var retired = std.ArrayListUnmanaged(u64).empty;
         defer retired.deinit(self.alloc);
-        var indexed_it = locations.indexed.keyIterator();
+        var indexed_it = locations.segments.keyIterator();
         while (indexed_it.next()) |seg_id| if ((try snap.segmentIndex(seg_id.*)) == null) try retired.append(self.alloc, seg_id.*);
-        for (retired.items) |seg_id| {
-            const versions = locations.indexed.fetchRemove(seg_id).?.value;
-            defer self.alloc.free(versions);
-            for (versions) |version| {
-                const location = locations.map.get(version) orelse continue;
-                if (location.seg_id == seg_id) _ = locations.map.remove(version);
-            }
-        }
+        for (retired.items) |seg_id| locations.segments.fetchRemove(seg_id).?.value.destroy(self.alloc);
         for (snap.segments) |*segment| {
-            if (locations.indexed.contains(segment.id)) continue;
-            const versions = (try segment.reader.docVersionsAlloc(self.alloc)) orelse try self.alloc.alloc(u64, 0);
-            errdefer self.alloc.free(versions);
-            for (versions, 0..) |version, local| {
-                if (version == 0) continue;
-                try locations.map.put(self.alloc, version, .{ .seg_id = segment.id, .local_id = @intCast(local) });
-            }
-            try locations.indexed.put(self.alloc, segment.id, versions);
+            if (locations.segments.contains(segment.id)) continue;
+            const index = try VersionLocations.SegmentVersions.build(self.alloc, segment);
+            errdefer index.destroy(self.alloc);
+            try locations.segments.put(self.alloc, segment.id, index);
         }
     }
 
@@ -10450,7 +10456,7 @@ test "persistent index prepares a change refresh without its locks" {
     const second = try buildSimpleSegment(alloc, "doc:a", "beta");
     defer alloc.free(second);
     try peer.indexSegment(second);
-    try std.testing.expectEqual(@as(usize, 0), index.version_locations.indexed.count());
+    try std.testing.expectEqual(@as(usize, 0), index.version_locations.segments.count());
 
     const Prepare = struct {
         index: *PersistentIndex,
@@ -10486,11 +10492,17 @@ test "persistent index prepares a change refresh without its locks" {
     try std.testing.expect(delta.replacement != null);
     // The kept segment's deletions and the mirror are built too, and the
     // column decoded to find the dead version is still private.
-    try std.testing.expectEqual(@as(usize, 1), delta.deletions.items.len);
+    try std.testing.expectEqual(@as(usize, 1), delta.kept.items.len);
     try std.testing.expect(delta.mirror != null);
     try std.testing.expectEqual(@as(usize, 1), delta.columns.items.len);
-    try std.testing.expectEqual(@as(usize, 0), index.version_locations.indexed.count());
+    try std.testing.expectEqual(@as(usize, 0), index.version_locations.segments.count());
+    // A reader of the snapshot before the delta keeps its own tombstones:
+    // the delta publishes the kept segment's new ones with the new segment.
+    const before = index.writer.acquireSnapshot();
+    defer before.release();
     try std.testing.expectEqual(PersistentIndex.ChangeRefreshOutcome.installed, try index.installRefreshFromChanges(&changes));
+    try std.testing.expectEqual(@as(u32, 1), before.liveDocCount());
+    try std.testing.expectEqual(@as(usize, 1), before.segments.len);
     const snap = index.writer.acquireSnapshot();
     defer snap.release();
     try std.testing.expectEqual(@as(usize, 2), snap.segments.len);
@@ -10589,10 +10601,10 @@ test "persistent index change refresh keeps decoded version columns private unti
         try index.indexSegment(own);
         try std.testing.expectEqual(PersistentIndex.ChangeRefreshOutcome.stale, try index.installRefreshFromChanges(&stale));
     }
-    try std.testing.expect(!locations.indexed.contains(kept_id));
+    try std.testing.expect(!locations.segments.contains(kept_id));
 
     try std.testing.expectEqual(PersistentIndex.ChangeRefreshOutcome.installed, try refreshFromChangesForTest(&index));
-    try std.testing.expect(locations.indexed.contains(kept_id));
+    try std.testing.expect(locations.segments.contains(kept_id));
     try std.testing.expectEqual(@as(u32, 2), index.writer.snapshot().liveDocCount());
 
     // The peer merges everything into one segment: the kept segment
@@ -10605,7 +10617,7 @@ test "persistent index change refresh keeps decoded version columns private unti
     merged[0] = try buildVersionedSegment(alloc, &.{.{ .doc_id = "doc:a", .term = "beta", .version = current }});
     try std.testing.expect(try peer.replaceSegmentsIfActiveManyOwnedWithDeletes(ids.items, merged, null));
     try std.testing.expectEqual(PersistentIndex.ChangeRefreshOutcome.installed, try refreshFromChangesForTest(&index));
-    try std.testing.expect(!locations.indexed.contains(kept_id));
+    try std.testing.expect(!locations.segments.contains(kept_id));
 }
 
 test "persistent index refreshed after a peer merge plans from the peer's output" {

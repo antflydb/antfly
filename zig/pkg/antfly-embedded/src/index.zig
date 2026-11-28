@@ -953,35 +953,26 @@ pub const ReplacementSegmentData = struct {
     /// replacement still owns it.
     deleted_owned: ?roaring.RoaringBitmap = null,
 };
-
-/// Deletions to install on a segment a publication keeps, prepared outside
-/// the writer lock (`prepareRetainedDeletion`): the bitmap, and each sparse
-/// typed-field coverage's missing live count under it.
-pub const RetainedDeletion = struct {
+/// A kept segment's replacement tombstones, published with a segment
+/// replacement (`IndexWriter.prepareSegmentsAgainst`). The bitmap is moved
+/// into the replacement snapshot's private cell for the segment.
+pub const KeptDeletion = struct {
     id: u64,
-    /// The segment's position in the snapshot `installRetainedDeletions`
-    /// installs into; checked, and searched for only when it moved.
-    position: usize,
     bitmap: ?roaring.RoaringBitmap,
-    missing_live: []?u32 = &.{},
 
-    pub fn deinit(self: *RetainedDeletion, alloc: Allocator) void {
+    pub fn deinit(self: *KeptDeletion) void {
         if (self.bitmap) |*bitmap| bitmap.deinit();
-        alloc.free(self.missing_live);
-        self.* = undefined;
+        self.bitmap = null;
     }
 };
 
-pub fn prepareRetainedDeletion(alloc: Allocator, segment: *const SegmentEntry, position: usize, bitmap: roaring.RoaringBitmap) !RetainedDeletion {
-    const coverages = segment.shared.typed_doc_values_coverage;
-    const missing_live = try alloc.alloc(?u32, coverages.len);
-    for (coverages, missing_live) |*coverage, *slot| {
-        slot.* = if (coverage.initialized.load(.acquire) and coverage.physical_status == .sparse_live_doc_values)
-            missingLiveCount(coverage, segment.reader.doc_count, &bitmap)
-        else
-            null;
-    }
-    return .{ .id = segment.id, .position = position, .bitmap = bitmap, .missing_live = missing_live };
+/// Undoes an unpublished fork (`buildSegmentReplacement`): its private cell
+/// and the parent entry, which took no reference yet.
+fn destroyFork(alloc: Allocator, seg: *SegmentEntry) void {
+    const parent = seg.shared.physical_parent.?;
+    SegmentEntry.destroyShared(alloc, seg.shared);
+    seg.* = parent.*;
+    alloc.destroy(parent);
 }
 
 pub const RetiredSegmentCleanup = struct {
@@ -4115,6 +4106,12 @@ pub const IndexWriter = struct {
         retired: []SegmentEntry,
         staging_alloc: Allocator,
         carried_count: usize,
+        /// Positions among the carried segments whose tombstones this
+        /// replacement replaces: each holds a private shared cell over the
+        /// same physical segment (`KeptDeletion`), so the snapshot publishes
+        /// membership and liveness together while older snapshots keep
+        /// theirs.
+        forks: []const u32 = &.{},
         next_segment_id: u64,
         active: bool = true,
         /// Prepared under the writer lock, which it still holds. A
@@ -4146,7 +4143,12 @@ pub const IndexWriter = struct {
             const writer = self.writer;
             const old = @atomicLoad(*IndexSnapshot, &writer.current, .acquire);
 
-            for (self.snapshot.segments[0..self.carried_count]) |*seg| seg.retain();
+            for (self.snapshot.segments[0..self.carried_count], 0..) |*seg, i| {
+                // A fork's physical parent takes the reference a carried
+                // segment would; the fork's own cell is the snapshot's.
+                if (std.mem.indexOfScalar(u32, self.forks, @intCast(i)) != null) seg.shared.physical_parent.?.retain() else seg.retain();
+            }
+            if (self.forks.len > 0) self.staging_alloc.free(self.forks);
             for (self.retired) |*seg| {
                 seg.data.madviseDiscardCleanPages();
                 std.debug.assert(seg.shared.retired_cleanup == null);
@@ -4165,6 +4167,8 @@ pub const IndexWriter = struct {
         pub fn abort(self: *PreparedSegmentReplacement) void {
             if (!self.active) return;
             const writer = self.writer;
+            for (self.forks) |i| destroyFork(writer.alloc, &self.snapshot.segments[i]);
+            if (self.forks.len > 0) self.staging_alloc.free(self.forks);
             for (self.snapshot.segments[self.carried_count..]) |*seg| {
                 SegmentEntry.destroyShared(writer.alloc, seg.shared);
                 seg.reader.deinit();
@@ -4937,7 +4941,16 @@ pub const IndexWriter = struct {
 
         self.lockMutex();
         errdefer self.mu.unlock();
-        return try self.buildSegmentReplacement(@atomicLoad(*IndexSnapshot, &self.current, .acquire), scratch_alloc, old_ids, replacements, true);
+        return try self.buildSegmentReplacement(@atomicLoad(*IndexSnapshot, &self.current, .acquire), scratch_alloc, old_ids, replacements, &.{}, true);
+    }
+
+    /// `prepareSegmentsManyData`, also replacing kept segments' tombstones
+    /// in the same snapshot (`KeptDeletion`).
+    pub fn prepareSegmentsManyDataWithKept(self: *IndexWriter, old_ids: []const u64, replacements: []ReplacementSegmentData, kept: []KeptDeletion) !PreparedSegmentReplacement {
+        if (old_ids.len == 0 and replacements.len == 0 and kept.len == 0) return error.EmptySegmentReplacement;
+        self.lockMutex();
+        errdefer self.mu.unlock();
+        return try self.buildSegmentReplacement(@atomicLoad(*IndexSnapshot, &self.current, .acquire), self.alloc, old_ids, replacements, kept, true);
     }
 
     /// `prepareSegmentsManyDataWithScratch` against `base`, a snapshot the
@@ -4950,9 +4963,10 @@ pub const IndexWriter = struct {
         scratch_alloc: Allocator,
         old_ids: []const u64,
         replacements: []ReplacementSegmentData,
+        kept: []KeptDeletion,
     ) !PreparedSegmentReplacement {
-        if (old_ids.len == 0 and replacements.len == 0) return error.EmptySegmentReplacement;
-        return try self.buildSegmentReplacement(base, scratch_alloc, old_ids, replacements, false);
+        if (old_ids.len == 0 and replacements.len == 0 and kept.len == 0) return error.EmptySegmentReplacement;
+        return try self.buildSegmentReplacement(base, scratch_alloc, old_ids, replacements, kept, false);
     }
 
     fn buildSegmentReplacement(
@@ -4961,6 +4975,7 @@ pub const IndexWriter = struct {
         scratch_alloc: Allocator,
         old_ids: []const u64,
         replacements: []ReplacementSegmentData,
+        kept: []KeptDeletion,
         locked: bool,
     ) !PreparedSegmentReplacement {
         const replacement_readers = try scratch_alloc.alloc(segment_mod.SegmentReader, replacements.len);
@@ -5008,6 +5023,37 @@ pub const IndexWriter = struct {
                 new_segments[idx] = seg;
                 idx += 1;
             }
+        }
+
+        // Kept segments whose tombstones change get a private cell over the
+        // same physical segment (as `shareMaskedImmutableSegments` does), so
+        // the new tombstones are visible exactly in this snapshot.
+        const forks = try scratch_alloc.alloc(u32, kept.len);
+        var forks_created: usize = 0;
+        errdefer {
+            for (forks[0..forks_created]) |i| destroyFork(self.alloc, &new_segments[i]);
+            scratch_alloc.free(forks);
+        }
+        for (kept) |*deletion| {
+            const position = for (new_segments[0..keep_count], 0..) |seg, i| {
+                if (seg.id == deletion.id) break i;
+            } else return error.InvalidSegment;
+            const seg = &new_segments[position];
+            const parent = try self.alloc.create(SegmentEntry);
+            errdefer self.alloc.destroy(parent);
+            parent.* = seg.*;
+            const shared = try SegmentEntry.createShared(self.alloc, seg.data, seg.reader.encoded());
+            if (deletion.bitmap) |bitmap| {
+                if (bitmap.isEmpty()) deletion.deinit() else {
+                    shared.deleted = bitmap;
+                    shared.deleted_count.store(@intCast(bitmap.cardinality()), .release);
+                    deletion.bitmap = null;
+                }
+            }
+            shared.physical_parent = parent;
+            seg.shared = shared;
+            forks[forks_created] = @intCast(position);
+            forks_created += 1;
         }
 
         var cells_created: usize = 0;
@@ -5103,6 +5149,7 @@ pub const IndexWriter = struct {
             .retired = retired,
             .staging_alloc = scratch_alloc,
             .carried_count = keep_count,
+            .forks = forks,
             .next_segment_id = next_segment_id,
             .locked = locked,
             .base = if (locked) null else old,
@@ -5129,30 +5176,6 @@ pub const IndexWriter = struct {
         // Ownership is transferred to this API even when recovery references
         // a segment that is no longer active.
         owned_bitmap.deinit();
-    }
-
-    /// Installs prepared deletions on the segments a publication kept, in
-    /// one pass under the writer lock: each found at its prepared position.
-    /// Takes every bitmap; a segment no longer active drops its own.
-    pub fn installRetainedDeletions(self: *IndexWriter, items: []RetainedDeletion) void {
-        self.lockMutex();
-        defer self.mu.unlock();
-        const snap = @atomicLoad(*IndexSnapshot, &self.current, .acquire);
-        for (items) |*item| {
-            const bitmap = item.bitmap orelse continue;
-            item.bitmap = null;
-            const seg: ?*SegmentEntry = if (item.position < snap.segments.len and snap.segments[item.position].id == item.id)
-                &snap.segments[item.position]
-            else for (snap.segments) |*candidate| {
-                if (candidate.id == item.id) break candidate;
-            } else null;
-            if (seg) |found| {
-                replaceDeletionLocked(found, bitmap, item.missing_live);
-            } else {
-                var dropped = bitmap;
-                dropped.deinit();
-            }
-        }
     }
 
     /// Under the writer lock. Takes `bitmap`.
@@ -5458,39 +5481,6 @@ test "typed doc values coverage is lazy and retains compact sparse membership" {
 // A refresh prepares the deletions of the segments it keeps, with their
 // coverage counts, outside the writer lock, and installs them in one pass:
 // each found at its prepared position, or searched for when it moved.
-test "retained deletions install prepared coverage counts in one pass" {
-    const alloc = std.testing.allocator;
-    const segment_bytes = try buildSparseTypedDocValuesTestSegment(alloc, 64);
-    defer alloc.free(segment_bytes);
-    var writer = try IndexWriter.init(alloc);
-    defer writer.deinit();
-    try writer.addSegmentWithIdData(1, SegmentData.fromOwnedHeap(try alloc.dupe(u8, segment_bytes)));
-    try writer.addSegmentWithIdData(2, SegmentData.fromOwnedHeap(try alloc.dupe(u8, segment_bytes)));
-
-    const snap = writer.snapshot();
-    for (snap.segments) |*segment| _ = (try segment.typedDocValuesCoverage("rank")).?;
-    var first_deleted = roaring.RoaringBitmap.init(alloc);
-    try first_deleted.add(1);
-    try first_deleted.add(2);
-    var second_deleted = roaring.RoaringBitmap.init(alloc);
-    try second_deleted.add(0);
-    var items = [_]RetainedDeletion{
-        try prepareRetainedDeletion(alloc, &snap.segments[0], 0, first_deleted),
-        // A stale position: the install finds the segment by id.
-        try prepareRetainedDeletion(alloc, &snap.segments[1], 7, second_deleted),
-    };
-    defer for (&items) |*item| item.deinit(alloc);
-    try std.testing.expectEqual(@as(?u32, 61), items[0].missing_live[0]);
-    try std.testing.expectEqual(@as(?u32, 63), items[1].missing_live[0]);
-
-    writer.installRetainedDeletions(&items);
-    const after = writer.snapshot();
-    try std.testing.expectEqual(@as(u32, 2), after.segments[0].shared.deleted_count.load(.acquire));
-    try std.testing.expectEqual(@as(u32, 61), after.segments[0].shared.typed_doc_values_coverage[0].missing_live_count.load(.acquire));
-    try std.testing.expectEqual(@as(u32, 1), after.segments[1].shared.deleted_count.load(.acquire));
-    try std.testing.expectEqual(@as(u32, 63), after.segments[1].shared.typed_doc_values_coverage[0].missing_live_count.load(.acquire));
-}
-
 test "typed doc values coverage admission honors cancellation deadline and contention" {
     const alloc = std.testing.allocator;
     const segment_bytes = try buildSparseTypedDocValuesTestSegment(alloc, 64);
@@ -5890,7 +5880,7 @@ test "replacement prepared against a pinned snapshot publishes only if current" 
         defer base.release();
         var replacements = [_]ReplacementSegmentData{.{ .id = 10, .data = SegmentData.fromOwnedHeap(try alloc.dupe(u8, seg2)) }};
         defer replacements[0].data.deinit(alloc);
-        var prepared = try writer.prepareSegmentsAgainst(base, alloc, &.{1}, &replacements);
+        var prepared = try writer.prepareSegmentsAgainst(base, alloc, &.{1}, &replacements, &.{});
         defer prepared.abort();
         // The writer moves on before the replacement publishes.
         try writer.addSegment(seg2);
@@ -5904,7 +5894,7 @@ test "replacement prepared against a pinned snapshot publishes only if current" 
     var replacements = [_]ReplacementSegmentData{.{ .id = 10, .data = SegmentData.fromOwnedHeap(try alloc.dupe(u8, seg2)) }};
     var published = false;
     defer if (!published) replacements[0].data.deinit(alloc);
-    var prepared = try writer.prepareSegmentsAgainst(base, alloc, &.{1}, &replacements);
+    var prepared = try writer.prepareSegmentsAgainst(base, alloc, &.{1}, &replacements, &.{});
     defer prepared.abort();
     published = prepared.publishIfCurrent();
     try std.testing.expect(published);
@@ -5916,6 +5906,53 @@ test "replacement prepared against a pinned snapshot publishes only if current" 
     const results = try current.search(alloc, "body", &.{"alpha"}, 10);
     defer alloc.free(results.hits);
     try std.testing.expectEqual(@as(usize, 2), results.hits.len);
+}
+
+// A replacement publishes kept segments' new tombstones with its new
+// segments, in one snapshot: an older snapshot keeps its own tombstones, and
+// no reader of the new one sees the new copy without the old copy's death.
+test "replacement publishes kept tombstones with its segments" {
+    const alloc = std.testing.allocator;
+    const seg1 = try buildTestSegmentWithIds(alloc, &.{
+        .{ .id = "a", .terms = &.{.{ .term = "alpha", .freq = 1, .norm = 10 }} },
+        .{ .id = "b", .terms = &.{.{ .term = "alpha", .freq = 1, .norm = 10 }} },
+    });
+    defer alloc.free(seg1);
+    const seg2 = try buildTestSegmentWithIds(alloc, &.{
+        .{ .id = "a", .terms = &.{.{ .term = "beta", .freq = 1, .norm = 10 }} },
+    });
+    defer alloc.free(seg2);
+    var writer = try IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(seg1);
+
+    const before = writer.acquireSnapshot();
+    defer before.release();
+    var dead = roaring.RoaringBitmap.init(alloc);
+    try dead.add(0);
+    var kept = [_]KeptDeletion{.{ .id = before.segments[0].id, .bitmap = dead }};
+    defer for (&kept) |*item| item.deinit();
+    var replacements = [_]ReplacementSegmentData{.{ .id = 10, .data = SegmentData.fromOwnedHeap(try alloc.dupe(u8, seg2)) }};
+    var published = false;
+    defer if (!published) replacements[0].data.deinit(alloc);
+    var prepared = try writer.prepareSegmentsAgainst(before, alloc, &.{}, &replacements, &kept);
+    defer prepared.abort();
+    try std.testing.expectEqual(@as(u32, 2), before.liveDocCount());
+    published = prepared.publishIfCurrent();
+    try std.testing.expect(published);
+
+    // The overwrite: the old copy is dead exactly where the new one is live.
+    try std.testing.expectEqual(@as(u32, 2), before.liveDocCount());
+    const after = writer.acquireSnapshot();
+    defer after.release();
+    try std.testing.expectEqual(@as(usize, 2), after.segments.len);
+    try std.testing.expectEqual(@as(u32, 2), after.liveDocCount());
+    const alpha = try after.search(alloc, "body", &.{"alpha"}, 10);
+    defer alloc.free(alpha.hits);
+    try std.testing.expectEqual(@as(usize, 1), alpha.hits.len);
+    const old_alpha = try before.search(alloc, "body", &.{"alpha"}, 10);
+    defer alloc.free(old_alpha.hits);
+    try std.testing.expectEqual(@as(usize, 2), old_alpha.hits.len);
 }
 
 test "empty index search" {

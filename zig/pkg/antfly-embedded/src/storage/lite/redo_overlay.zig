@@ -1026,18 +1026,19 @@ pub const SharedRedoOverlay = struct {
     /// for `root` (a key count, not a version count -- matches
     /// `std.HashMap.count`'s own meaning). Used by `check()`'s
     /// `record_count` accounting; see `NativeFile.redoOverlayEntryCount`.
-    /// Whether any of `items`' keys has a version under `root` newer than
-    /// `fold_floor`: one the tree does not hold yet.
-    pub fn holdsUnfoldedKey(self: *SharedRedoOverlay, io: std.Io, root: u8, comptime T: type, items: []const T, fold_floor: u64) bool {
-        std.debug.assert(root < 3);
+    /// Marks which of `items`' keys have a version under `root` newer than
+    /// `fold_floor` (one the tree does not hold yet), in one locked pass,
+    /// and returns how many do.
+    pub fn markUnfoldedKeys(self: *SharedRedoOverlay, io: std.Io, root: u8, comptime T: type, items: []const T, fold_floor: u64, held: []bool) usize {
+        std.debug.assert(root < 3 and items.len == held.len);
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
-        if (self.maps[root].count() == 0) return false;
-        for (items) |item| {
-            const head = self.maps[root].get(item.key) orelse continue;
-            if (head.sequence > fold_floor) return true;
+        var total: usize = 0;
+        for (items, held) |item, *slot| {
+            slot.* = if (self.maps[root].get(item.key)) |head| head.sequence > fold_floor else false;
+            if (slot.*) total += 1;
         }
-        return false;
+        return total;
     }
 
     pub fn count(self: *SharedRedoOverlay, io: std.Io, root: u8) usize {
@@ -1145,6 +1146,7 @@ pub const SharedRedoOverlay = struct {
     pub const OwnedHead = struct {
         key: []u8,
         value: []u8,
+        sequence: u64,
         is_delete: bool,
         external_value_root_page: u64,
         external_value_len: usize,
@@ -1197,6 +1199,7 @@ pub const SharedRedoOverlay = struct {
             list.appendAssumeCapacity(.{
                 .key = try allocator.dupe(u8, kv.key_ptr.*),
                 .value = try allocator.dupe(u8, head.value),
+                .sequence = head.sequence,
                 .is_delete = head.is_delete,
                 .external_value_root_page = head.external_value_root_page,
                 .external_value_len = head.external_value_len,
