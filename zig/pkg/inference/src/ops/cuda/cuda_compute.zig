@@ -41741,7 +41741,8 @@ fn physicalReplayKernelSupportedOp(ctx: *anyopaque, descriptor: *const ops.kerne
         // A capture cannot freeze that check without an immutable proof.
         .gather => false,
         .add_mul_scalar => |attrs| !attrs.scale_before_add or platform.env.getenvBoolDefault("ANTFLY_CUDA_ENABLE_ADD_MUL_SCALAR_FUSION", true),
-        .transpose, .broadcast, .unary, .binary, .norm, .softmax, .rope, .reduction, .concat, .slice => true,
+        .binary => descriptor.hasFlatBinaryOperands(),
+        .transpose, .broadcast, .unary, .norm, .softmax, .rope, .reduction, .concat, .slice => true,
     };
 }
 
@@ -42864,7 +42865,8 @@ fn assignedProjectionWeightSupported(weight: *const CudaTensor, bias: bool) bool
 }
 
 fn runAssignedKernelOp(ctx: *anyopaque, request: ops.kernel_descriptor.Invocation) anyerror!bool {
-    if (request.descriptor.operation == .paged_attention) return false;
+    if (request.descriptor.operation == .paged_attention or
+        (request.descriptor.operation == .binary and !request.descriptor.hasFlatBinaryOperands())) return false;
     const dense_attention = request.descriptor.operation == .dense_attention_prefix or request.descriptor.operation == .dense_attention_rows;
     // Malformed dense calls decline before opaque provider or tensor access.
     if (dense_attention and (request.inputs.len != request.descriptor.input_count or DenseAssignedAttention.geometry(request.descriptor) == null)) return false;

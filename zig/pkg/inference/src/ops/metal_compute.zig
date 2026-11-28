@@ -81,7 +81,7 @@ pub fn supportsAssignedDescriptor(descriptor: *const ops.kernel_descriptor.Descr
             !descriptor.input_shapes[0].eq(descriptor.output_shape) or !descriptor.input_shapes[1].eq(descriptor.output_shape) or
             descriptor.input_shapes[2].numElements() != 1) return false,
         .binary => |binary| if ((binary == .add or binary == .multiply) and descriptor.input_shapes[0].numElements().? != descriptor.input_shapes[1].numElements().?) {
-            return false;
+            if (binary != .add or descriptor.columnBiasOperand() == null) return false;
         },
         .dot => |dot| if (descriptor.input_shapes[0].rank() != 2 or !dot.lhs_contract_last or dot.k <= 1 or dot.n <= 1) {
             return false;
@@ -14436,7 +14436,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 assigned.slot.writable_bytes != planned.writable_bytes or !assigned.slot.logical.eq(planned.logical)) return error.InvalidPhysicalStorageAuthority;
             try self.validateProjectionOutput(out_tensor, assigned.*);
         }
-        if (descriptor.operation == .add_mul_scalar or descriptor.operation == .concat or descriptor.operation == .slice or descriptor.operation == .gather or descriptor.operation == .norm or descriptor.operation == .linear or descriptor.operation == .dot or descriptor.operation == .rope or dense_attention) {
+        const column_bias_matrix = if (descriptor.operation == .binary and descriptor.operation.binary == .add and
+            descriptor.input_shapes[0].numElements().? != descriptor.input_shapes[1].numElements().?) descriptor.columnBiasOperand() else null;
+        if (column_bias_matrix != null or descriptor.operation == .add_mul_scalar or descriptor.operation == .concat or descriptor.operation == .slice or descriptor.operation == .gather or descriptor.operation == .norm or descriptor.operation == .linear or descriptor.operation == .dot or descriptor.operation == .rope or dense_attention) {
             for (request.inputs, 0..) |source, index| {
                 const tensor = PreparedCachedOperands.deviceInput(cached_operands, source, index) orelse continue;
                 if (tensor.deviceHandle() == out_tensor.deviceHandle() and kernel_geometry.byteRangesOverlap(@intCast(tensor.deviceByteOffset()), tensor.deviceByteLen(), @intCast(out_tensor.deviceByteOffset()), out_tensor.deviceByteLen())) return error.InvalidAssignedAlias;
@@ -14503,7 +14505,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .binary => |binary| blk: {
                 const rhs = toBuf(request.inputs[1]).metal_tensor.?;
                 break :blk switch (binary) {
-                    .add => try metal_runtime.decoderRuntimeApplyAddInto(self.provider_impl, input, rhs, out_tensor, descriptor.elements()),
+                    .add => if (column_bias_matrix) |matrix|
+                        try metal_runtime.decoderRuntimeApplyAddRhsRepeatInto(self.provider_impl, if (matrix == 0) input else rhs, if (matrix == 0) rhs else input, out_tensor)
+                    else
+                        try metal_runtime.decoderRuntimeApplyAddInto(self.provider_impl, input, rhs, out_tensor, descriptor.elements()),
                     .subtract => (try metal_runtime.decoderRuntimeApplySubtractInto(self.provider_impl, input, rhs, out_tensor)) != null,
                     .multiply => try metal_runtime.decoderRuntimeApplyMultiplyInto(self.provider_impl, input, rhs, out_tensor, descriptor.elements()),
                     .divide => (try metal_runtime.decoderRuntimeApplyDivideInto(self.provider_impl, input, rhs, out_tensor)) != null,

@@ -275,6 +275,15 @@ pub const Gather = struct {
     }
 };
 /// Rank-two input plus a column bias, independent of add operand order.
+fn columnBiasMatrix(output: ml.graph.Shape, inputs: []const ml.graph.Shape) ?usize {
+    if (output.dtype != .f32 or output.rank() != 2 or inputs.len != 2) return null;
+    for (0..2) |matrix| {
+        const bias = inputs[1 - matrix];
+        if (inputs[matrix].eq(output) and bias.dtype == .f32 and bias.rank() == 1 and bias.dim(0) == output.dim(1)) return matrix;
+    }
+    return null;
+}
+
 pub const MatrixColumnBias = struct {
     matrix: ml.graph.NodeId,
     bias: ml.graph.NodeId,
@@ -838,6 +847,21 @@ pub const Descriptor = struct {
     input_count: u8,
     /// Minimum alignment; target vector/tile schedules may require more.
     alignment: u32 = @alignOf(f32),
+    pub fn hasFlatBinaryOperands(self: *const Descriptor) bool {
+        if (self.input_count != 2) return false;
+        for (self.input_shapes[0..2]) |input| {
+            if (input.numElements() != 1 and !input.eq(self.output_shape)) return false;
+        }
+        return true;
+    }
+
+    pub fn columnBiasOperand(self: *const Descriptor) ?usize {
+        if (self.operation != .binary or self.operation.binary != .add or self.input_count != 2) return null;
+        const count = self.output_shape.numElements() orelse return null;
+        if (count <= 0 or count > std.math.maxInt(u32)) return null;
+        return columnBiasMatrix(self.output_shape, self.input_shapes[0..2]);
+    }
+
     pub fn elements(self: *const Descriptor) usize {
         return @intCast(self.output_shape.numElements().?);
     }
@@ -1099,10 +1123,11 @@ pub fn lower(graph: *const ml.graph.Graph, id: ml.graph.NodeId) ?Descriptor {
             (input_shape.dtype == .i32 or input_shape.dtype == .i64);
         const integer_layout_input = integer_layout and input_shape.dtype == shape.dtype;
         if ((input_shape.dtype != .f32 and !reduced_weight and !integer_indices and !integer_layout_input) or input_count <= 0 or input_count > std.math.maxInt(i32)) return null;
-        if ((operation == .unary or operation == .binary or operation == .softmax or operation == .rope) and input_count != 1 and !std.mem.eql(i64, input_shape.dims[0..input_shape.rank()], shape.dims[0..shape.rank()])) return null;
+        if ((operation == .unary or operation == .softmax or operation == .rope) and input_count != 1 and !std.mem.eql(i64, input_shape.dims[0..input_shape.rank()], shape.dims[0..shape.rank()])) return null;
         if ((operation == .unary or operation == .softmax or operation == .rope) and input_count != count) return null;
         result.input_shapes[index] = input_shape;
     }
+    if (operation == .binary and !result.hasFlatBinaryOperands() and result.columnBiasOperand() == null) return null;
     if (operation == .add_mul_scalar and (result.input_count != 3 or !shape.eq(result.input_shapes[0]) or !shape.eq(result.input_shapes[1]) or result.input_shapes[2].numElements() != 1)) return null;
     if (operation == .dense_attention_rows and !operation.dense_attention_rows.valid(&result)) return null;
     if (operation == .linear) {

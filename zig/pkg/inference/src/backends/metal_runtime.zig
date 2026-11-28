@@ -9834,6 +9834,20 @@ pub fn decoderRuntimeApplyAddRhsRepeat(self: anytype, lhs: MetalTensor, rhs: Met
     if (lhs_count == 0 or rhs_count == 0 or lhs_count % rhs_count != 0) return null;
     var output_device = try MetalTensor.deviceAllocate(runtime, lhs_count * @sizeOf(f32), .private, lhs.shape());
     errdefer output_device.deinit();
+    if (!try decoderRuntimeApplyAddRhsRepeatInto(self, lhs, rhs, output_device)) {
+        output_device.deinit();
+        return null;
+    }
+    return output_device;
+}
+
+pub fn decoderRuntimeApplyAddRhsRepeatInto(self: anytype, lhs: MetalTensor, rhs: MetalTensor, output: MetalTensor) !bool {
+    const runtime = self.raw_decode_runtime orelse return false;
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return false;
+    if (!lhs.isDevice() or !rhs.isDevice() or !output.isDevice() or lhs.dtype != .f32 or rhs.dtype != .f32 or output.dtype != .f32) return false;
+    const lhs_count = lhs.elemCount();
+    const rhs_count = rhs.elemCount();
+    if (lhs_count == 0 or rhs_count == 0 or lhs_count % rhs_count != 0 or output.elemCount() != lhs_count) return false;
     const rc = termite_metal_decode_runtime_apply_add_device_rhs_repeat(
         runtime,
         lhs.deviceHandle(),
@@ -9842,14 +9856,10 @@ pub fn decoderRuntimeApplyAddRhsRepeat(self: anytype, lhs: MetalTensor, rhs: Met
         rhs.deviceByteOffset(),
         lhs_count,
         rhs_count,
-        output_device.deviceHandle(),
-        output_device.deviceByteOffset(),
+        output.deviceHandle(),
+        output.deviceByteOffset(),
     );
-    if (rc != 0) {
-        output_device.deinit();
-        return null;
-    }
-    return output_device;
+    return rc == 0;
 }
 
 /// Metadata-only proof for explicit decoder targets. No upload, readback or
