@@ -26,6 +26,7 @@ pub const Coverage = struct {
 // and retained unit bodies are skipped by the typed streaming JSON parser.
 const ManifestHeader = struct {
     const Merge = struct { status: ?[]const u8 = null };
+    reprocess_sequence: u64 = 0,
     generation: u64 = 0,
     route_type: ?[]const u8 = null,
     merge_plan: ?Merge = null,
@@ -88,6 +89,7 @@ pub fn inspect(alloc: std.mem.Allocator, manifest: []const u8) !Coverage {
 
 /// Coverage and generation come from the same immutable manifest snapshot.
 pub const Snapshot = struct {
+    reprocess_sequence: u64 = 0,
     generation: u64 = 0,
     state: PublicationState = .pending,
     pub fn complete(self: Snapshot) bool {
@@ -98,7 +100,7 @@ pub const Snapshot = struct {
 pub fn snapshot(alloc: std.mem.Allocator, manifest: []const u8) !Snapshot {
     var parsed = try parseHeader(alloc, manifest);
     defer parsed.deinit();
-    return .{ .generation = parsed.value.generation, .state = parsed.value.state() };
+    return .{ .generation = parsed.value.generation, .state = parsed.value.state(), .reprocess_sequence = parsed.value.reprocess_sequence };
 }
 
 pub fn isComplete(alloc: std.mem.Allocator, manifest: []const u8) !bool {

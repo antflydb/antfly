@@ -1660,6 +1660,10 @@ fn recoverReplicatedRestoreFinish(self: *DB, finish: @FieldType(@import("db/rest
     return .{ .value = self.recoverReplicatedRestoreFinish(finish) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
+fn reprocessDocumentArtifactAcceptance(self: *DB, alloc: Allocator, doc_key: []const u8, artifact_name: []const u8) engine.Outcome(types.DocumentArtifactReprocessAcceptance) {
+    return .{ .value = self.reprocessDocumentArtifactAcceptance(alloc, doc_key, artifact_name) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
 fn reprocessDocumentArtifact(self: *DB, alloc: std.mem.Allocator, doc_key: []const u8, artifact_name: []const u8) engine.Outcome(bool) {
     return .{ .value = self.reprocessDocumentArtifact(alloc, doc_key, artifact_name) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
@@ -2227,7 +2231,14 @@ fn getCAllocator() callconv(.c) ?*const Allocator {
 fn getDescriptor() callconv(.c) *const engine.Descriptor {
     return &descriptor;
 }
+const pipeline_metrics = @import("antfly_platform").document_pipeline_metrics;
+
+fn pipelineMetricsSnapshot(out: *pipeline_metrics.Snapshot) callconv(.c) void {
+    out.* = pipeline_metrics.snapshot();
+}
+
 comptime {
+    @export(&pipelineMetricsSnapshot, .{ .name = "antfly_storage_engine_pipeline_metrics_v1", .visibility = .hidden });
     for (@typeInfo(engine.VTable).@"struct".field_names) |name| {
         const Accessor = struct {
             fn get() callconv(.c) *const anyopaque {

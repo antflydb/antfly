@@ -937,7 +937,7 @@ pub const Operations = struct {
         table_name: []const u8,
         doc_key: []const u8,
         artifact_name: []const u8,
-    ) Error!void {
+    ) Error!db_mod.types.DocumentArtifactReprocessAcceptance {
         try request.ensureActive();
         const writes = self.writes orelse return error.NotFound;
         const handled = (writes.reprocessDocumentArtifactGroupLocal(
@@ -953,7 +953,8 @@ pub const Operations = struct {
             error.UnknownGroup, error.TableNotFound, error.NotFound => return error.NotFound,
             else => return error.Internal,
         }) orelse return error.NotFound;
-        if (!handled) return error.NotFound;
+        if (!handled.handled) return error.NotFound;
+        return handled;
     }
 
     /// The returned result owns its nested allocations and must be deinitialized

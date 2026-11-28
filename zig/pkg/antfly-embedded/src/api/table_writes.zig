@@ -186,10 +186,10 @@ pub const BoundTableWriteSource = struct {
         table_name: []const u8,
         doc_key: []const u8,
         artifact_name: []const u8,
-    ) !?bool {
+    ) !?db_mod.types.DocumentArtifactReprocessAcceptance {
         const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, table_name, self.table_name)) return null;
-        return try (try self.activeDb()).reprocessDocumentArtifact(alloc, doc_key, artifact_name);
+        return try (try self.activeDb()).reprocessDocumentArtifactAcceptance(alloc, doc_key, artifact_name);
     }
 
     pub fn reprocessDocumentArtifactRange(

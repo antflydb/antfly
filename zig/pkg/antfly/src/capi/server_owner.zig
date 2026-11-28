@@ -6391,12 +6391,12 @@ pub fn storageOwnerArtifactOperationJson(
                 .{},
             ) catch return .invalid_argument;
             defer parsed.deinit();
-            const handled = handle.db.reprocessDocumentArtifact(
+            const accepted = handle.db.reprocessDocumentArtifactAcceptance(
                 handle.alloc,
                 parsed.value.doc_key,
                 parsed.value.artifact_name,
             ) catch |err| return storageOwnerStatusFromError(err);
-            return storageOwnerArtifactJsonResponse(handle.alloc, out_response, .{ .handled = handled });
+            return storageOwnerArtifactJsonResponse(handle.alloc, out_response, accepted);
         },
         .reprocess_document_range => {
             var parsed = std.json.parseFromSlice(
@@ -7107,6 +7107,7 @@ pub fn storageOwnerPipelineMetricsJson(context: ?*anyopaque, version: u32, out_j
     _ = asStorageOwnerContext(context) orelse return .invalid_argument;
     const metrics = @import("antfly_platform").document_pipeline_metrics;
     var snapshot = metrics.snapshot();
+    antfly.db.DB.mergePhysicalPipelineMetrics(&snapshot) catch return .invalid_abi;
     // Native PDF compute belongs to another compiled unit. Read its counters
     // through its owning ABI, never through a host-side duplicate global.
     if (comptime !builtin.is_test) {

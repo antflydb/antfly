@@ -19265,7 +19265,7 @@ pub const ApiHttpServer = struct {
         doc_key: []const u8,
         artifact_name: []const u8,
         request: api_operation.RequestContext,
-    ) public_table_http.TableApi.ExecuteReprocessDocumentArtifactError!void {
+    ) public_table_http.TableApi.ExecuteReprocessDocumentArtifactError!db_mod.types.DocumentArtifactReprocessAcceptance {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
         try ensureTableOperationActive(request);
         const source = self.table_writes orelse return error.NotFound;
@@ -19280,7 +19280,8 @@ pub const ApiHttpServer = struct {
             },
         };
         if (handled == null) return error.MethodNotAllowed;
-        if (!handled.?) return error.NotFound;
+        if (!handled.?.handled) return error.NotFound;
+        return handled.?;
     }
 
     fn executePublicReprocessDocumentArtifactRange(

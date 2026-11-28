@@ -50,6 +50,7 @@ test {
     _ = @import("api/lake_expiring_objects.zig");
     _ = @import("api/sql_pgwire.zig");
     _ = @import("api/table_catalog.zig");
+    _ = @import("api/public_table_http.zig");
     _ = @import("api/table_reads.zig");
     _ = @import("api/table_reads.zig").document_hydration_tests;
     _ = @import("api/tables.zig");
@@ -77,6 +78,29 @@ test {
     _ = runtime_http_bridge;
     _ = table_contract;
     _ = table_read_source;
+}
+
+test "storage artifact inspection carries the reprocess intent across the owner boundary" {
+    const std = @import("std");
+    const a = std.testing.allocator;
+    var manifest = try @import("api/table_reads.zig").parseStorageKernelDocumentArtifactManifestResponse(a,
+        \\{"document_id":"doc","artifact_name":"ocr","artifact_id":"asset","manifest_json":"{}","generation":1,"reprocess":{"requested_generation":2,"status":"published","last_retry":{"reason":"provider_retry_after","stage":"ocr","error_code":"ReadRateLimited","retry_at_ms":10000},"worker":{"scanned_sequence":9,"applied_sequence":8,"target_sequence":10,"retry_queue_full":true,"backlog":{"active_tickets":127,"sleeping_tickets":4096,"oldest_unresolved_sequence":9,"admission_blocked_by":"backlog_ticket_limit"},"retrying":true,"last_error_code":"ArtifactPublicationPending","last_progress_at_ms":9000,"failed":false,"background_running":true}}}
+    );
+    defer manifest.deinit(a);
+    try std.testing.expectEqual(@as(u64, 1), manifest.generation);
+    try std.testing.expectEqual(@as(u64, 2), manifest.reprocess.?.requested_generation);
+    try std.testing.expectEqual(.published, manifest.reprocess.?.status);
+    const retry = manifest.reprocess.?.last_retry.?;
+    try std.testing.expectEqual(.ocr, retry.stage.?);
+    try std.testing.expectEqualStrings("ReadRateLimited", retry.error_code.?.slice());
+    const worker = manifest.reprocess.?.worker.?;
+    try std.testing.expectEqualStrings("ArtifactPublicationPending", worker.last_error_code.?.slice());
+    try std.testing.expectEqual(@as(?u64, 9000), worker.last_progress_at_ms);
+    const backlog = worker.backlog.?;
+    try std.testing.expectEqual(@as(u32, 4096), backlog.sleeping_tickets);
+    try std.testing.expectEqual(.backlog_ticket_limit, backlog.admission_blocked_by.?);
+    try std.testing.expectEqual(@as(u64, 10), manifest.reprocess.?.worker.?.target_sequence);
+    try std.testing.expect(manifest.reprocess.?.worker.?.next_retry_at_ms == null);
 }
 
 /// Implementation source choices for this compilation root.

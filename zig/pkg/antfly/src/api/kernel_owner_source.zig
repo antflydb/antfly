@@ -6013,7 +6013,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         table_name: []const u8,
         doc_key: []const u8,
         artifact_name: []const u8,
-    ) !?bool {
+    ) !?db_types.DocumentArtifactReprocessAcceptance {
         const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
         const request_json = try table_writes.encodeStorageKernelArtifactDocumentRequest(
             alloc,
@@ -6031,7 +6031,9 @@ pub const ProvisionedKernelOwnerSource = struct {
             false,
         );
         defer response.deinit();
-        return try table_writes.parseStorageKernelHandledResponse(alloc, response.bytes());
+        const parsed = try std.json.parseFromSlice(db_types.DocumentArtifactReprocessAcceptance, alloc, response.bytes(), .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        return parsed.value;
     }
 
     fn reprocessDocumentArtifactRangeGroupLocal(

@@ -1574,12 +1574,13 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
     try std.testing.expectEqual(@as(?u64, 7002), moved_manifest.child_ranges[0].owner_group_id);
 
     const generation_before_reprocess = moved_manifest.generation;
-    try std.testing.expectEqual(@as(?bool, true), try write_source.source().reprocessDocumentArtifact(
+    const accepted = (try write_source.source().reprocessDocumentArtifact(
         alloc,
         "articles",
         "doc:a",
         "document_units_v1",
-    ));
+    )) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(accepted.handled);
     // Reprocess acknowledges admission; inspect the newly published manifest
     // only after its explicit enrichment visibility fence.
     try owner_source.waitForCurrentSyncGroupLocal(7001, "articles", .full_index);

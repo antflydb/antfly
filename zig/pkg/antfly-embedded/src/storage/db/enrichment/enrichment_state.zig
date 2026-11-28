@@ -446,9 +446,10 @@ pub fn rewindAppliedProgress(alloc: Allocator, store: anytype, scope: []const u8
         retry.scanned_sequence = checkpoint.applied_sequence;
         retry.clearScanDocument(alloc);
         while (retry.tickets.items.len != 0) retry.removeTicket(alloc, retry.tickets.items.len - 1);
+        while (retry.sleeping.entries.items.len != 0) try retry.sleeping.remove(alloc, retry.sleeping.entries.items.len - 1);
         const prepared = try retry.preparePersistence(alloc, false);
         defer prepared.deinit(alloc);
-        try putScopedRetryStateTxn(&txn, prepared);
+        try putScopedRetryStateTxn(alloc, &txn, retry.sleeping, prepared);
     }
     const status = resetRetryStatus(try loadRuntimeStatusTxn(alloc, &txn, scope), @max(target, checkpoint.applied_sequence));
     const revision = try putVersionedStatusTxn(alloc, &txn, scope, status, try loadStatusRevisionTxn(alloc, &txn, scope));
@@ -1328,9 +1329,25 @@ pub fn loadScopedRetries(alloc: Allocator, store: anytype) !scoped_retries.State
 
 fn loadScopedRetriesTxn(alloc: Allocator, txn: anytype) !scoped_retries.State {
     const raw = txn.get(scoped_retry_key) catch |err| if (err == error.NotFound) return .{} else return err;
-    if (!scoped_retries.State.isHeader(raw)) return scoped_retries.State.decode(alloc, raw);
-    var header = try scoped_retries.State.decodeHeader(alloc, raw);
+    const backlog = scoped_retries.backlog;
+    const has_backlog = std.mem.startsWith(u8, raw, backlog.magic);
+    const payload = if (has_backlog) raw[backlog.magic.len..] else raw;
+    if (!scoped_retries.State.isHeader(payload)) {
+        if (has_backlog) return error.InvalidEnrichmentState;
+        return scoped_retries.State.decode(alloc, raw);
+    }
+    var header = try scoped_retries.State.decodeHeader(alloc, payload);
     errdefer header.state.deinit(alloc);
+    if (has_backlog) {
+        header.state.sleeping = try backlog.Backlog.decode(alloc, try txn.get(backlog.index_key));
+        if (header.state.sleeping.entries.items.len == 0)
+            return error.InvalidEnrichmentState;
+        const prune = txn.get(backlog.prune_key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        if (prune) |checkpoint| try header.state.sleeping.decodePrune(checkpoint);
+    }
     for (header.slots[0..header.count]) |slot| {
         const bytes = try txn.get(&scopedRetryTicketKey(slot));
         var ticket = try scoped_retries.State.decodeTicket(alloc, bytes, slot);
@@ -1381,13 +1398,15 @@ pub fn saveScopedRetryState(a: Allocator, store: anytype, state: *scoped_retries
     var txn = try runtime.store.beginWrite();
     errdefer txn.abort();
     try guard.validate(&txn);
-    try putScopedRetryStateTxn(&txn, prepared);
+    try putScopedRetryStateTxn(a, &txn, state.sleeping, prepared);
     try txn.commit();
+    state.sleeping.clearChanges(a);
     state.markPersisted();
     state.releasePersistedDocuments(a);
 }
 
-fn putScopedRetryStateTxn(txn: anytype, prepared: scoped_retries.State.Persistence) !void {
+fn putScopedRetryStateTxn(a: Allocator, txn: anytype, sleeping: scoped_retries.backlog.Backlog, prepared: scoped_retries.State.Persistence) !void {
+    try sleeping.write(a, txn);
     for (prepared.documents) |document| try txn.put(&scopedRetryDocumentKey(document.digest), document.bytes);
     for (prepared.rows) |row| try txn.put(&scopedRetryTicketKey(row.slot), row.bytes);
     for (prepared.removed[0..prepared.removed_len]) |slot| txn.delete(&scopedRetryTicketKey(slot)) catch |err| if (err != error.NotFound) {
@@ -1395,7 +1414,24 @@ fn putScopedRetryStateTxn(txn: anytype, prepared: scoped_retries.State.Persisten
     };
     for (prepared.removed_documents[0..prepared.removed_document_count]) |digest|
         txn.delete(&scopedRetryDocumentKey(digest)) catch |err| if (err != error.NotFound) return err;
-    try txn.put(scoped_retry_key, prepared.header);
+    if (sleeping.entries.items.len == 0) {
+        try txn.put(scoped_retry_key, prepared.header);
+    } else {
+        // A binary without backlog support must fail closed on this cursor.
+        const header = try std.mem.concat(a, u8, &.{ scoped_retries.backlog.magic, prepared.header });
+        defer a.free(header);
+        try txn.put(scoped_retry_key, header);
+    }
+}
+
+pub fn loadScopedRetryBacklogRow(a: Allocator, store: anytype, entry: scoped_retries.backlog.Entry) ![]u8 {
+    var runtime = try initRuntimeStore(a, store);
+    defer runtime.deinit();
+    var txn = try runtime.store.beginProbe();
+    defer txn.abort();
+    const raw = txn.get(&entry.id.key()) catch |err| return if (err == error.NotFound) error.InvalidEnrichmentState else err;
+    if (raw.len != entry.bytes) return error.InvalidEnrichmentState;
+    return a.dupe(u8, raw);
 }
 
 test "durable enrichment scoped retry references oversized IDs atomically and reclaims unreferenced keys" {
@@ -1729,4 +1765,103 @@ test "durable enrichment scoped retry drains configuration replans across bounde
     try std.testing.expectEqual(@as(usize, scoped_retries.max_documents - 1), final.pending_replan.count());
     try final.park(a, .{ .doc_key = "new", .sequence = 1000 }, future, .{ .fingerprint = 1000 }, null);
     try std.testing.expect(!final.pending_replan.isSet(final.tickets.items[final.tickets.items.len - 1].slot));
+}
+
+test "scoped retry workset spills and promotes debt atomically with its frontier" {
+    const a = std.testing.allocator;
+    const backend_mod = @import("../../mem_backend.zig");
+    var backend = backend_mod.Backend.init(a, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(a, .{ .name = "retry-backlog" });
+    defer store.deinit();
+    const Guard = struct {
+        reject: bool = false,
+        pub fn validate(self: @This(), _: anytype) !void {
+            if (self.reject) return error.Canceled;
+        }
+    };
+    const Resolver = struct {
+        fn get(_: *anyopaque, _: Allocator, _: [32]u8) ![]u8 {
+            return error.UnexpectedLookup;
+        }
+    };
+    var state = scoped_retries.State{};
+    defer state.deinit(a);
+    const large_document = try a.alloc(u8, scoped_retries.max_document_key_bytes + 1);
+    defer a.free(large_document);
+    @memset(large_document, 0xfd);
+    const resolver: scoped_retries.DocumentResolver = .{ .ptr = &state, .get = Resolver.get };
+    const debt: scoped_retries.Budget = .{ .fingerprint = 9, .logical_fingerprint = 8, .failures = 2 };
+    try state.park(a, .{ .doc_key = large_document, .sequence = 10 }, 12_000, debt, null);
+    try std.testing.expect(try state.spill(a, 0, resolver));
+    state.scanned_sequence = 19;
+    try std.testing.expectError(error.Canceled, saveScopedRetryState(a, &store, &state, Guard{ .reject = true }));
+    {
+        var not_committed = try loadScopedRetries(a, &store);
+        defer not_committed.deinit(a);
+        try std.testing.expect(!not_committed.hasDebt());
+        try std.testing.expectEqual(@as(u64, 0), not_committed.scanned_sequence);
+    }
+    try saveScopedRetryState(a, &store, &state, Guard{});
+    var restored = try loadScopedRetries(a, &store);
+    defer restored.deinit(a);
+    {
+        var read = try store.beginProbe();
+        defer read.abort();
+        const raw_cursor = try read.get(scoped_retry_key);
+        try std.testing.expect(std.mem.startsWith(u8, raw_cursor, scoped_retries.backlog.magic));
+        try std.testing.expect(!scoped_retries.State.isHeader(raw_cursor));
+    }
+    try std.testing.expectEqual(@as(u64, 19), restored.scanned_sequence);
+    try std.testing.expectEqual(@as(u64, 9), restored.appliedThrough(19));
+    try std.testing.expectEqual(@as(u64, 12_000), restored.deadline());
+    try std.testing.expectEqual(@as(usize, 0), restored.tickets.items.len);
+
+    // Cursor-only maintenance does not rewrite the full sleeping index.
+    var old_index: []u8 = undefined;
+    {
+        var read = try store.beginProbe();
+        defer read.abort();
+        old_index = try a.dupe(u8, try read.get(scoped_retries.backlog.index_key));
+    }
+    defer a.free(old_index);
+    restored.sleeping.prune_target = 19;
+    restored.sleeping.prune_after = restored.sleeping.entries.items[0].id;
+    restored.sleeping.prune_dirty = true;
+    try saveScopedRetryState(a, &store, &restored, Guard{});
+    {
+        var read = try store.beginProbe();
+        defer read.abort();
+        try std.testing.expectEqualSlices(u8, old_index, try read.get(scoped_retries.backlog.index_key));
+    }
+    restored.deinit(a);
+    restored = try loadScopedRetries(a, &store);
+    try std.testing.expectEqual(@as(u64, 19), restored.sleeping.prune_target);
+    try std.testing.expectEqual(restored.sleeping.entries.items[0].id, restored.sleeping.prune_after);
+
+    const entry = restored.sleeping.entries.items[0];
+    const raw = try loadScopedRetryBacklogRow(a, &store, entry);
+    defer a.free(raw);
+    try restored.activate(a, 0, raw);
+    const due = try restored.dueWithReferences(a, 12_000, resolver, 0);
+    defer due.deinit(a);
+    try std.testing.expectEqualStrings(large_document, due.groups[0].doc_key);
+    try std.testing.expectEqual(@as(u32, 2), restored.prior(9).failures);
+    try saveScopedRetryState(a, &store, &restored, Guard{});
+    try std.testing.expectError(error.InvalidEnrichmentState, loadScopedRetryBacklogRow(a, &store, entry));
+    {
+        var read = try store.beginProbe();
+        defer read.abort();
+        const raw_cursor = try read.get(scoped_retry_key);
+        var compatible = try scoped_retries.State.decodeHeader(a, raw_cursor);
+        defer compatible.state.deinit(a);
+        try std.testing.expectEqual(@as(u64, 19), compatible.state.scanned_sequence);
+        try std.testing.expectError(error.NotFound, read.get(scoped_retries.backlog.prune_key));
+    }
+    var active = try loadScopedRetries(a, &store);
+    defer active.deinit(a);
+    try std.testing.expectEqual(@as(u64, 9), active.appliedThrough(19));
+    active.retire(a, due.tokens);
+    try saveScopedRetryState(a, &store, &active, Guard{});
+    try std.testing.expectEqual(@as(u64, 19), active.appliedThrough(19));
 }
