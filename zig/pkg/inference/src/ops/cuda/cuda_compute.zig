@@ -5223,8 +5223,18 @@ pub const CudaCompute = struct {
         var outputs: [4]CT = undefined;
         var created: usize = 0;
         errdefer for (outputs[0..created]) |output| cb.free(output);
+        const owner = &self.bounded_decode_graph;
+        const assigned = owner.active and rows == owner.rows and hidden == owner.hidden;
         for (widths, 0..) |width, i| {
-            outputs[i] = (try cb.allocUninitF32Shape(&.{ @intCast(rows), @intCast(width) })).?;
+            if (assigned) {
+                const elements = try checkedMul(rows, width);
+                const bytes = try checkedMul(elements, @sizeOf(f32));
+                const destination = try owner.bindRecurrentProjection(@fromBackingInt(@intCast(i)), bytes);
+                var output = try OwnedF32Output.fromOwnedShapeDestination(self, try allocShape2(self.allocator, rows, width), elements, bytes, destination);
+                outputs[i] = output.intoTensor();
+            } else {
+                outputs[i] = (try cb.allocUninitF32Shape(&.{ @intCast(rows), @intCast(width) })).?;
+            }
             created += 1;
         }
         try self.lighton_recurrent.init(&self.ctx);
@@ -29989,6 +29999,19 @@ pub fn tryCapturedQkvProjection(cb: *const ops.ComputeBackend, input: CT, weight
     return try cb.observeBackendEntry(.linear_no_bias, &linearNoBiasWithDestination, .{ self, input, weight, rows, in_dim, out_dim, false, @as(?buffer_mod.DeviceBuffer, destination) });
 }
 
+pub fn tryCapturedRecurrentProjection(cb: *const ops.ComputeBackend, input: CT, weight: CT, rows: usize, in_dim: usize, out_dim: usize, kind: @import("bounded_decode_graph.zig").Module.RecurrentProjection) !?CT {
+    if (!acceptsPhysicalImplementation(cb.vtable)) return null;
+    const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
+    const owner = &self.bounded_decode_graph;
+    if (!owner.active or self.capability_profile != .lightonocr3 or rows != owner.rows or in_dim != owner.hidden) return null;
+    const lhs = tensorFromCt(input);
+    const rhs = tensorFromCt(weight);
+    const bytes = try lightOnLinearOutputBytes(self, rhs, rows, out_dim);
+    const destination = (try owner.bindRecurrentProjection(kind, bytes)) orelse return null;
+    if (kernel_geometry.byteRangesOverlap(destination.ptr, destination.len, lhs.bf16_mirror.ptr, lhs.bf16_mirror.len)) return error.InvalidAssignedAlias;
+    return try cb.observeBackendEntry(.linear_no_bias, &linearNoBiasWithDestination, .{ self, input, weight, rows, in_dim, out_dim, false, @as(?buffer_mod.DeviceBuffer, destination) });
+}
+
 /// Attention has consumed its input normalization before the output GEMM.
 /// Reuse that F32 range through the following residual add.
 pub fn tryCapturedAttentionOutputProjection(cb: *const ops.ComputeBackend, input: CT, weight: CT, rows: usize, in_dim: usize, out_dim: usize) !?CT {
@@ -48138,11 +48161,11 @@ test "LightOnOCR3 CUDA graph warm input and wide head write their assigned buffe
         try std.testing.expectEqualSlices(f32, &.{ 4, 6, 10, 14, 22, 26 }, first_values);
         try std.testing.expectEqualSlices(f32, &.{ 6, 9, 15, 21, 33, 39 }, second_values);
 
-        owner.storage_layout.?.attention_projections = .{ .offset = projection_offset, .bytes = 4 * norm_bytes };
+        owner.storage_layout.?.input_projections = .{ .offset = projection_offset, .bytes = 4 * norm_bytes };
         owner.storage_layout.?.attention_projection_bytes = .{ 2 * norm_bytes, norm_bytes, norm_bytes };
         owner.storage_layout.?.attention_inputs = .{ .offset = split_offset, .bytes = 3 * norm_bytes };
         defer {
-            owner.storage_layout.?.attention_projections = null;
+            owner.storage_layout.?.input_projections = null;
             owner.storage_layout.?.attention_projection_bytes = @splat(0);
             owner.storage_layout.?.attention_inputs = null;
         }
@@ -48173,6 +48196,26 @@ test "LightOnOCR3 CUDA graph warm input and wide head write their assigned buffe
             defer a.free(actual_values);
             try std.testing.expectEqualSlices(f32, values, actual_values);
         }
+    }
+
+    {
+        // The preceding attention layer released its projections before this layer.
+        owner.storage_layout.?.input_projections = .{ .offset = projection_offset, .bytes = 4 * norm_bytes };
+        owner.storage_layout.?.recurrent_projection_bytes = @splat(norm_bytes);
+        defer {
+            owner.storage_layout.?.input_projections = null;
+            owner.storage_layout.?.recurrent_projection_bytes = @splat(0);
+        }
+        const before_recurrent = compute.stats.device_alloc_calls;
+        for ([_]@import("bounded_decode_graph.zig").Module.RecurrentProjection{ .mixed, .gate, .beta, .decay }, 0..) |kind, index| {
+            const result = (try tryCapturedRecurrentProjection(&cb, input, weight, 3, 2, 2, kind)) orelse return error.TestUnexpectedResult;
+            defer cb.free(result);
+            try std.testing.expectEqual(metadata.ptr + projection_offset + index * norm_bytes, tensorFromCt(result).buffer.ptr);
+            const values = try cb.toFloat32(result, a);
+            defer a.free(values);
+            try std.testing.expectEqualSlices(f32, &.{ 2, 3, 5, 7, 11, 13 }, values);
+        }
+        try std.testing.expectEqual(before_recurrent, compute.stats.device_alloc_calls);
     }
 
     var observation = @import("../../execution/runtime_observation.zig").Scope.init();

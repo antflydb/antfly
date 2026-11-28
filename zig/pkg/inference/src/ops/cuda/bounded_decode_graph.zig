@@ -94,8 +94,9 @@ pub const StorageLayout = struct {
     projection_staging: ?Span = null,
     attention_residual: ?Span = null,
     attention_inputs: ?Span = null,
-    attention_projections: ?Span = null,
+    input_projections: ?Span = null,
     attention_projection_bytes: [3]usize = @splat(0),
+    recurrent_projection_bytes: [4]usize = @splat(0),
     layer_norm: ?Span = null,
     layer_norm_mirror: ?Span = null,
     final_norm_mirror: ?Span = null,
@@ -218,7 +219,7 @@ pub const StorageLayout = struct {
             self.ffn_outputs,
             self.attention_residual,
             self.attention_inputs,
-            self.attention_projections,
+            self.input_projections,
             self.layer_norm,
             self.layer_norm_mirror,
         }) |slot| if (slot) |span| {
@@ -292,6 +293,7 @@ pub const Descriptor = struct {
     attention_geometry: ?DecodeScratch.Geometry = null,
     attention_q_gate: bool = false,
     recurrent_heads: ?struct { key: usize, value: usize } = null,
+    recurrent_projection_widths: ?[4]usize = null,
     attention_layers: usize,
     recurrent_layers: usize,
     ffn_intermediate: usize = 0,
@@ -446,14 +448,27 @@ pub const GraphPhase = struct {
                 self.storage_layout.attention_inputs = try self.storage_layout.declareLayerRegion(offset, inputs.bytes);
             }
         }
+        var projection_bytes: usize = 0;
         if (policy.layer_norm and self.descriptor.attention_layers != 0) {
             const geometry = self.descriptor.attention_geometry orelse return error.InvalidShape;
             const inputs = try AttentionInputs.init(self.descriptor.rows, geometry.heads, geometry.kv_heads, geometry.dim);
             const query_bytes = if (self.descriptor.attention_q_gate) try std.math.mul(usize, inputs.query_bytes, 2) else inputs.query_bytes;
-            const bytes = try std.math.add(usize, query_bytes, try std.math.mul(usize, inputs.key_bytes, 2));
-            const offset = try StorageLayout.aligned(try self.storage_layout.layerLiveBytes());
-            self.storage_layout.attention_projections = try self.storage_layout.declareLayerRegion(offset, bytes);
+            projection_bytes = try std.math.add(usize, query_bytes, try std.math.mul(usize, inputs.key_bytes, 2));
             self.storage_layout.attention_projection_bytes = .{ query_bytes, inputs.key_bytes, inputs.key_bytes };
+        }
+        if (policy.layer_norm and self.descriptor.recurrent_layers != 0) {
+            if (self.descriptor.recurrent_projection_widths) |widths| {
+                var recurrent_bytes: usize = 0;
+                for (widths, &self.storage_layout.recurrent_projection_bytes) |width, *bytes| {
+                    bytes.* = try std.math.mul(usize, try std.math.mul(usize, self.descriptor.rows, width), @sizeOf(f32));
+                    recurrent_bytes = try std.math.add(usize, recurrent_bytes, bytes.*);
+                }
+                projection_bytes = @max(projection_bytes, recurrent_bytes);
+            }
+        }
+        if (projection_bytes != 0) {
+            const offset = try StorageLayout.aligned(try self.storage_layout.layerLiveBytes());
+            self.storage_layout.input_projections = try self.storage_layout.declareLayerRegion(offset, projection_bytes);
         }
         if (policy.projection_staging) try self.declareProjectionStaging();
         if (policy.final_norm_mirror) try self.declareFinalNormMirror();
@@ -994,7 +1009,7 @@ pub const Module = struct {
 
     pub fn bindAttentionProjection(self: *const Module, kind: AttentionProjection, bytes: usize) !?buffer.DeviceBuffer {
         const layout = self.storage_layout orelse return error.InvalidExecutionPlan;
-        const span = layout.attention_projections orelse return null;
+        const span = layout.input_projections orelse return null;
         const index = @backingInt(kind);
         if (layout.attention_projection_bytes[index] != bytes) return error.InvalidExecutionPlan;
         const offset: usize = switch (kind) {
@@ -1004,6 +1019,21 @@ pub const Module = struct {
         };
         const projection_bank = try self.bindLayerWorkspace(layout, span, span.bytes);
         return try projection_bank.borrowRange(offset, bytes);
+    }
+
+    pub const RecurrentProjection = enum { mixed, gate, beta, decay };
+
+    pub fn bindRecurrentProjection(self: *const Module, kind: RecurrentProjection, bytes: usize) !?buffer.DeviceBuffer {
+        const layout = self.storage_layout orelse return error.InvalidExecutionPlan;
+        const span = layout.input_projections orelse return null;
+        const sizes = layout.recurrent_projection_bytes;
+        const index = @backingInt(kind);
+        if (sizes[index] == 0) return null;
+        if (sizes[index] != bytes) return error.InvalidExecutionPlan;
+        var offset: usize = 0;
+        for (sizes[0..index]) |size| offset = try std.math.add(usize, offset, size);
+        const backing = try self.bindLayerWorkspace(layout, span, span.bytes);
+        return try backing.borrowRange(offset, bytes);
     }
 
     pub fn bindSplitQueryGate(self: *const Module, bytes: usize) !?[2]buffer.DeviceBuffer {
@@ -1244,6 +1274,8 @@ test "bounded CUDA decoder shares declared attention and recurrent workspace" {
     for ([_]bool{ false, true }) |gated| {
         var projected = descriptor;
         projected.attention_q_gate = gated;
+        const recurrent_widths: [4]usize = .{ 8192, 4096, 32, 32 };
+        projected.recurrent_projection_widths = recurrent_widths;
         try phase.initInto(projected);
         var projection_policy = mirror_policy;
         projection_policy.layer_norm = true;
@@ -1262,6 +1294,16 @@ test "bounded CUDA decoder shares declared attention and recurrent workspace" {
         try std.testing.expectEqual(k_dst.ptr + k_dst.len, v_dst.ptr);
         try std.testing.expect(v_dst.ptr + v_dst.len <= projection_owner.metadata.ptr + projection_layout.projection_staging.?.offset);
         try std.testing.expectError(error.InvalidExecutionPlan, projection_owner.bindAttentionProjection(.query, q_bytes - @sizeOf(f32)));
+        var next_ptr = q_dst.ptr;
+        for (recurrent_widths, 0..) |width, index| {
+            const bytes = rows * width * @sizeOf(f32);
+            const slot = (try projection_owner.bindRecurrentProjection(@fromBackingInt(@intCast(index)), bytes)).?;
+            try std.testing.expectEqual(next_ptr, slot.ptr);
+            try std.testing.expectEqual(bytes, slot.len);
+            next_ptr += slot.len;
+        }
+        try std.testing.expect(next_ptr <= projection_owner.metadata.ptr + projection_layout.projection_staging.?.offset);
+        try std.testing.expectError(error.InvalidExecutionPlan, projection_owner.bindRecurrentProjection(.gate, 4));
         if (gated) {
             const split = (try projection_owner.bindSplitQueryGate(q_bytes / 2)).?;
             try std.testing.expectEqual(q_bytes / 2, split[0].len);

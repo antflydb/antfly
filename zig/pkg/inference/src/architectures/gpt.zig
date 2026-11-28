@@ -9045,6 +9045,14 @@ fn qwen35OutputProjection(cb: *const ComputeBackend, core: CT, weight: CT, resid
     return layerAttentionProjection(cb, core, weight, rows, in_dim, hidden);
 }
 
+fn recurrentInputProjection(cb: *const ComputeBackend, input: CT, weight: CT, rows: usize, hidden: usize, width: usize, kind: @import("../ops/cuda/bounded_decode_graph.zig").Module.RecurrentProjection) !CT {
+    if (comptime build_options.enable_cuda) {
+        const cuda = @import("../ops/cuda/cuda_compute.zig");
+        if (try cuda.tryCapturedRecurrentProjection(cb, input, weight, rows, hidden, width, kind)) |result| return result;
+    }
+    return cb.linearNoBias(input, weight, rows, hidden, width);
+}
+
 fn qwen35LinearAttentionWithResidual(
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
@@ -9114,25 +9122,25 @@ fn qwen35LinearAttentionWithResidual(
         break :fused null;
     };
     defer if (fused_projections) |projections| for (projections) |projection| cb.free(projection);
-    const mixed = if (fused_projections) |projections| projections[0] else try cb.linearNoBias(input, mixed_w, total, hidden_size, conv_dim);
+    const mixed = if (fused_projections) |projections| projections[0] else try recurrentInputProjection(cb, input, mixed_w, total, hidden_size, conv_dim, .mixed);
     defer if (fused_projections == null) cb.free(mixed);
 
     const z_w_name = std.fmt.bufPrint(name_buf, "model.layers.{d}.linear_attn.in_proj_z.weight", .{layer}) catch return error.NameTooLong;
     const z_w = try getModelWeight(cb, config, z_w_name);
     defer cb.free(z_w);
-    const z = if (fused_projections) |projections| projections[1] else try cb.linearNoBias(input, z_w, total, hidden_size, value_dim);
+    const z = if (fused_projections) |projections| projections[1] else try recurrentInputProjection(cb, input, z_w, total, hidden_size, value_dim, .gate);
     defer if (fused_projections == null) cb.free(z);
 
     const b_w_name = std.fmt.bufPrint(name_buf, "model.layers.{d}.linear_attn.in_proj_b.weight", .{layer}) catch return error.NameTooLong;
     const b_w = try getModelWeight(cb, config, b_w_name);
     defer cb.free(b_w);
-    const beta_proj = if (fused_projections) |projections| projections[2] else try cb.linearNoBias(input, b_w, total, hidden_size, value_heads);
+    const beta_proj = if (fused_projections) |projections| projections[2] else try recurrentInputProjection(cb, input, b_w, total, hidden_size, value_heads, .beta);
     defer if (fused_projections == null) cb.free(beta_proj);
 
     const a_w_name = std.fmt.bufPrint(name_buf, "model.layers.{d}.linear_attn.in_proj_a.weight", .{layer}) catch return error.NameTooLong;
     const a_w = try getModelWeight(cb, config, a_w_name);
     defer cb.free(a_w);
-    const a_proj = if (fused_projections) |projections| projections[3] else try cb.linearNoBias(input, a_w, total, hidden_size, value_heads);
+    const a_proj = if (fused_projections) |projections| projections[3] else try recurrentInputProjection(cb, input, a_w, total, hidden_size, value_heads, .decay);
     defer if (fused_projections == null) cb.free(a_proj);
 
     if (comptime build_options.enable_metal) {
