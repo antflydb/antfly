@@ -4521,7 +4521,7 @@ pub const DocumentArtifactReprocessWorker = struct {
     applied_sequence: u64,
     /// Latest enrichment replay watermark requested of the worker.
     target_sequence: u64,
-    /// Whether parked requests have filled the worker's bounded retry queue.
+    /// Whether retry debt is preventing the worker from admitting new source groups.
     retry_queue_full: bool,
     /// Whether the worker has retry work.
     retrying: bool,
