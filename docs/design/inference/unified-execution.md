@@ -2941,6 +2941,17 @@ the production mask bank and matched isolated clips. The three-clip,
 bytes within its 134,217,728-byte ceiling. The frontend submission
 fixture preserved the caller's frame ownership.
 
+### Spark qualification of declared decoder Q/K/V storage
+
+Spark passed all 34 focused checks at `4a5809a18b` with zero skips. The
+physical fixture verified assigned Q/K/V destinations and the standalone
+query/gate split. The released LightOnOCR-3-0.8B HTTP test matched serial
+output for both pages and captured one two-row graph followed by six
+replays. Readback used the admitted 44-byte pinned buffer, and the shared
+layer workspace remained 2,004,992 bytes. The replay readback, including
+GPU completion, took 17.15–17.35 ms. This fixture measured correctness
+and physical ownership. It did not compare request latency distributions.
+
 ### Metal validation of the grouped audio follow-up
 
 The M4 Max production HTTP server built from `78a42df545` served the

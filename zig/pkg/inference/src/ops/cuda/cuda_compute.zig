@@ -3977,6 +3977,30 @@ pub const CudaCompute = struct {
                 self.launch_route = .warmed;
             }
         }
+        fn logLearnedWorkspace(plan: *const @import("../../execution/stream_workspace.zig").Plan, rows: usize) void {
+            var bins: [24]struct { bytes: u32 = 0, scratch: bool = false, count: usize = 0 } = @splat(.{});
+            var used: usize = 0;
+            var omitted: usize = 0;
+            for (plan.events[0..plan.event_count]) |event| {
+                if (!event.allocate) continue;
+                const bytes = plan.allocations[event.slot].bytes;
+                for (bins[0..used]) |*bin| {
+                    if (bin.bytes != bytes or bin.scratch != event.operation_scratch) continue;
+                    bin.count += 1;
+                    break;
+                } else if (used < bins.len) {
+                    bins[used] = .{ .bytes = bytes, .scratch = event.operation_scratch, .count = 1 };
+                    used += 1;
+                } else {
+                    omitted += 1;
+                }
+            }
+            std.log.info("CUDA decoder learned workspace rows={d} allocations={d} events={d} peak_bytes={d} omitted_allocations={d}", .{
+                rows, plan.count, plan.event_count, plan.peak, omitted,
+            });
+            for (bins[0..used]) |bin|
+                std.log.info("CUDA decoder learned allocation rows={d} bytes={d} operation_scratch={} count={d}", .{ rows, bin.bytes, bin.scratch, bin.count });
+        }
         pub fn read(self: *@This(), burst_value: *LightOnTokenBurst, first: []u32, second: []u32) !void {
             const owner = &self.compute.bounded_decode_graph;
             if (first.len != owner.rows or second.len != owner.rows) return error.InvalidShape;
@@ -3998,6 +4022,7 @@ pub const CudaCompute = struct {
             try layout.publishReadback(readback_words, owner.next_positions[0 .. owner.rows * 3], &owner.progress, first, second);
             const readback_host_ns = if (self.profile) platform.time.monotonicNs() -| readback_start else 0;
             if (self.log_profile) if (self.launch_route) |route| {
+                if (route == .learned) if (owner.plan) |plan| logLearnedWorkspace(plan, owner.rows);
                 std.log.info("CUDA decoder burst rows={d} route={s} submit_host_ns={d} capture_instantiate_host_ns={d} readback_host_ns={d}", .{
                     owner.rows, @tagName(route), self.submit_host_ns, self.capture_instantiate_host_ns, readback_host_ns,
                 });
