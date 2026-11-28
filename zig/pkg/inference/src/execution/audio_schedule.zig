@@ -118,22 +118,29 @@ pub const ExecutionInputs = struct {
 };
 
 pub const WorkspaceDeclaration = struct {
-    /// Borrowed for the synchronous Stage lifetime, never stored in a cache.
-    events: []const @import("stream_workspace.zig").Plan.Declaration,
-    published_slot: u15,
+    const Event = @import("stream_workspace.zig").Plan.Declaration;
 
-    pub fn cacheKey(self: WorkspaceDeclaration, seed: u64) u64 {
-        var hash = std.hash.Wyhash.init(seed);
+    /// Events remain immutable throughout the synchronous Stage lifetime.
+    events: []const Event,
+    published_slot: u15,
+    fingerprint: u64,
+
+    pub fn init(events: []const Event, published_slot: u15) WorkspaceDeclaration {
+        var hash = std.hash.Wyhash.init(0);
         hash.update("declared-audio-workspace-v1");
-        std.hash.autoHash(&hash, self.published_slot);
-        for (self.events) |event| {
+        std.hash.autoHash(&hash, published_slot);
+        for (events) |event| {
             std.hash.autoHash(&hash, std.meta.activeTag(event));
             switch (event) {
                 .allocate, .allocate_scratch => |bytes| std.hash.autoHash(&hash, bytes),
                 .release => |slot| std.hash.autoHash(&hash, slot),
             }
         }
-        return hash.final();
+        return .{ .events = events, .published_slot = published_slot, .fingerprint = hash.final() };
+    }
+
+    pub fn cacheKey(self: WorkspaceDeclaration, seed: u64) u64 {
+        return std.hash.Wyhash.hash(seed, std.mem.asBytes(&self.fingerprint));
     }
 };
 

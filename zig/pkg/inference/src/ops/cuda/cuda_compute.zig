@@ -60840,7 +60840,7 @@ test "CUDA audio depthwise cold inventory validates actual floating source layou
     compute.embedding_gemma2_policy.audio_graph = true;
     const output_bytes = (try recipe.rows()) * recipe.hidden * @sizeOf(f32);
     const events = [_]CudaCompute.AudioPlan.Plan.Declaration{.{ .allocate = output_bytes }};
-    recipe.workspace = .{ .events = &events, .published_slot = 0 };
+    recipe.workspace = ops.ComputeBackend.AudioWorkspaceDeclaration.init(&events, 0);
     var declared_builder = Cache.Builder{ .storage = &requests };
     try compute.appendAudioCacheWorkload(recipe, &declared_builder);
     const work = declared_builder.workload().requests;
@@ -63475,7 +63475,7 @@ test "CUDA cold audio declaration dispatches before any learning invocation" {
         .{ .allocate = publication_bytes },
         .{ .release = 0 },
     };
-    const workspace: ops.ComputeBackend.AudioWorkspaceDeclaration = .{ .events = &events, .published_slot = 2 };
+    const workspace = ops.ComputeBackend.AudioWorkspaceDeclaration.init(&events, 2);
     const bindings = try compute.audioCacheBase(workspace.cacheKey(cold_key), &geometry, null);
     const executes_before = compute.audio_arena_executes;
     const first = (try audioExecutionOp(&compute, cold_key, &inputs, @constCast(&cb), Run.call, .{
@@ -63491,8 +63491,7 @@ test "CUDA cold audio declaration dispatches before any learning invocation" {
     try std.testing.expect(!entry.warmed);
     try std.testing.expect(entry.owner.?.plan.origin == .declared);
     try std.testing.expectEqual(executes_before + 1, compute.audio_arena_executes);
-    var changed = workspace;
-    changed.published_slot = 0; // released, so it cannot publish
+    const changed = ops.ComputeBackend.AudioWorkspaceDeclaration.init(&events, 0); // released output
     try std.testing.expectError(error.InvalidExecutionPlan, audioExecutionOp(&compute, cold_key, &inputs, @constCast(&cb), Run.call, .{ .workspace = changed }));
     try std.testing.expectEqual(executes_before + 1, compute.audio_arena_executes);
     try std.testing.expect(entry.executableFor(bindings) != null);
