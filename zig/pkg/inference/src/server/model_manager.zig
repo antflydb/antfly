@@ -10343,7 +10343,12 @@ pub const ModelManager = struct {
         // still-resident eviction victim and emits a predictable resource
         // warning. Skip that speculative work; generation prepares the runtime
         // lazily after publication has reclaimed the victim.
-        if (build_options.enable_metal and
+        // The shared-BF16 Memorilla profile prepares only its admitted
+        // request slots. The generic prewarm can treat an encoder's
+        // unaligned embedding table as a tied decoder output projection.
+        const memorilla_shared_bf16 = model.manifest.memorilla_profile != null and
+            @import("../models/memorilla_qualification.zig").researchBf16Matrices();
+        if (build_options.enable_metal and !memorilla_shared_bf16 and
             self.canPrewarmBeforeModelPublication() and
             shouldUseMetalWholeModelExecutor(session))
         {
