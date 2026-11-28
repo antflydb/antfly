@@ -2852,6 +2852,14 @@ fixture verified terminal logits storage reuse and the sizes of the
 attention normalization, mirror and residual regions. This is a
 correctness and storage receipt, with latency still to qualify.
 
+Spark repeated the released reader and grouped audio checks at `68933620f2`.
+All 33 selected checks passed with zero skips. The fused attention input
+fixture verified both head geometries using prebound query, key and gate
+spans, exact agreement with ordinary fused outputs, and zero device
+allocations in the assigned calls. The released reader again replayed two
+rows with the 44-byte pinned receipt and 2,004,992-byte shared layer
+workspace. The paired serving comparison runs separately.
+
 ### Isolated Metal E4B HTTP comparison at `58b3917a89`
 
 The local M4 Max used the same pinned binaries as the mixed serving
