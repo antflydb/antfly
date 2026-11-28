@@ -3898,16 +3898,8 @@ pub fn openDirectoryHandleAlloc(path: []const u8, resolved: LiteResolvedOpenOpti
     // Restore providers before any generated replay can start. Resolution and
     // other optional runtimes may still be constructed by the ordinary open.
     if (resolved.profile == .native) options.enrichment = null;
-    // Any C API caller's thread can reach a directory restore open (a
-    // standalone `DB.open`, same shape as `tables.zig`'s own table open);
-    // its stack is not ours, and Debug frames on this path are megabytes
-    // each (see `callOnOpenStack`'s own doc comment, and
-    // `lite_connection.runtime_open_stack_size`). Opens are rare, so each
-    // gets its own thread rather than queueing behind an owner's runtime
-    // opens -- confirmed live as a main-thread Debug stack overflow
-    // (segfault) in "capi directory restore coordinates with open handles
-    // and publishes atomically" / "... publishes with derived work
-    // drained" before this call ran on a sized stack.
+    // On a sized stack, like every other runtime open: Debug frames on this
+    // path take megabytes, and the caller's thread is not ours.
     var db = try @import("lite_connection.zig").callOnOpenStack(null, db_mod.DB.open, .{ alloc, path, options });
     var handle_owns_db = false;
     errdefer if (!handle_owns_db) db.close();

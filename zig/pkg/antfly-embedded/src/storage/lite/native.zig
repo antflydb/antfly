@@ -10986,30 +10986,10 @@ pub const NativeFile = struct {
         self.releaseCrossProcessRedoReaderSlot();
         self.releaseRegionBinding();
         if (self.inode_lock_ref.load(.acquire)) |entry| {
-            // This instance is permanently done with this inode -- every
-            // fence/pin it held above is already released. A still-open
-            // sibling `NativeFile` on the same inode (this process's own
-            // writer, most commonly) keeps reacquiring and releasing its
-            // own grants cheaply by relying on the registry's kernel lock
-            // staying parked exactly as it last was; that optimization is
-            // only sound while *something* is still around to eventually
-            // touch this entry again. Once this instance -- cold-opened
-            // for a one-shot read (`coldRedoExtent`'s extent fence, a
-            // `refreshMaintenanceSnapshot` certified-ledger probe, a
-            // `checkWithCancel` snapshot, ...) or simply the last reader
-            // of a burst -- closes with nothing else holding a live grant,
-            // nothing else in this process is guaranteed to ever release
-            // on this entry again to trigger `inode_lock.zig`'s own
-            // fairness probe (gated on "the next release", which may never
-            // come). Left merely parked, the registry's dedicated fd then
-            // keeps the kernel-level lock indefinitely, blocking even an
-            // unrelated, independent `flock()` from this same process (see
-            // `inode_lock.cedeParked`'s own doc comment) -- confirmed live
-            // via a hang entering a plain `.read` handle on a freshly
-            // created, otherwise-idle Lite database, then trying to
-            // `flock(LOCK_EX)` the same data file on a fresh fd. Cede
-            // proactively here instead of leaving that to chance; a no-op
-            // while any other live grant remains outstanding.
+            // Nothing may ever release on this entry again, and the
+            // registry's fairness probe runs only on a later release: cede
+            // a parked kernel lock now, or it blocks an independent flock()
+            // from this process forever. A no-op while a grant remains.
             inode_lock.cedeParked(entry, io);
             inode_lock.unref(entry, io);
             self.inode_lock_ref.store(null, .release);
@@ -12834,28 +12814,10 @@ pub const NativeFile = struct {
         if (self.reader_fence_lock) |handle| {
             handle.release(self.runtime());
             self.reader_fence_lock = null;
-            // `self.read_only` identifies a dedicated reader (a plain
-            // read-only open, a `refreshMaintenanceSnapshot` certified-
-            // ledger probe, ...), never the writer-capable root serving
-            // its own live read traffic -- that root's own repeated
-            // `acquireReaderFence`/`releaseReaderFence` cycles across
-            // successive read generations are exactly the case the
-            // registry's parking optimization exists for (the next cycle
-            // reacquires for free), so only a dedicated reader cedes here.
-            // Without this, a read-only reader that advances across many
-            // read generations (observed live: a single `Lite` bootstrap
-            // doing hundreds of such cycles while setting up its initial
-            // system tables) leaves the kernel lock parked on whichever
-            // generation happened to be last; nothing else in this process
-            // is guaranteed to ever release on this entry again (the
-            // writer-capable root may stay open indefinitely), so
-            // `inode_lock.zig`'s own fairness probe -- gated on "the next
-            // release", which then never comes -- never runs, and the
-            // parked lock blocks even an unrelated, independent `flock()`
-            // from this same process indefinitely. Cede proactively
-            // instead; a no-op while any other live grant remains
-            // outstanding (including this same reader's very next cycle,
-            // already past this point).
+            // A dedicated reader may cycle generations and then stay idle:
+            // cede its parked lock rather than leave it held with no later
+            // release to probe fairness. The writer-capable root keeps
+            // parking, since its next cycle reacquires for free.
             if (self.read_only) {
                 if (self.inode_lock_ref.load(.acquire)) |entry| inode_lock.cedeParked(entry, self.runtime());
             }
