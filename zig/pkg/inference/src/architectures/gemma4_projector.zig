@@ -5161,28 +5161,6 @@ const F32AudioDeclaration = struct {
         return clamped;
     }
 
-    pub fn feedForward(self: *F32AudioDeclaration, _: Value, second: bool) !Value {
-        const down = project: {
-            const up = activate: {
-                const pre = try self.normalizeStage(.ffn_pre, second);
-                defer self.release(pre);
-                break :activate try self.linear(.ffn_up, second, pre);
-            };
-            defer self.release(up);
-            break :project try self.linear(.ffn_down, second, up);
-        };
-        const scaled = scale: {
-            const post = normalize: {
-                defer self.release(down);
-                break :normalize try self.normalizeStage(.ffn_post, second);
-            };
-            defer self.release(post);
-            break :scale try self.make(post.width);
-        };
-        defer self.release(scaled);
-        return self.make(scaled.width);
-    }
-
     pub fn normalize(self: *F32AudioDeclaration, kind: grouped_audio_block.Norm, _: Value) !Value {
         return self.normalizeStage(kind, false);
     }
@@ -5480,14 +5458,56 @@ const AudioLayer = struct {
         self.cb.free(value);
     }
 
-    pub fn feedForward(self: *const AudioLayer, input: CT, second: bool) !CT {
-        const result = try audioFeedForward(self.cb, self.allocator, self.store, self.cfg, input, self.inputs.valid_mask.len, self.layer, second);
-        errdefer self.cb.free(result);
+    pub fn projectFfnUp(self: *const AudioLayer, input: CT, second: bool) !CT {
+        const cb = self.cb;
+        const cfg = self.cfg;
+        const store = self.store;
+        const allocator = self.allocator;
+        const rows = self.inputs.valid_mask.len;
+        var buffer: [128]u8 = undefined;
+        const norm_w = try projectorVectorWeightCt(cb, allocator, store, try groupedNormName(&buffer, self.layer, .ffn_pre, second), cfg.audio_hidden);
+        const up_name = try groupedProjectionName(&buffer, self.layer, .ffn_up, second);
+        const preparation: AudioFfnPreparation = normalize: {
+            const input_bounded = try audioSourceGradientBounded(cb, cfg, input);
+            defer if (input_bounded != input) cb.free(input_bounded);
+            break :normalize if (cfg.source_scalar_storage == .bf16)
+                .{ .normed = try audioSourceRms(cb, cfg, input_bounded, norm_w, rows, cfg.audio_hidden, .contiguous, rows) }
+            else
+                try audioFfnPreparation(cb, allocator, store, input, norm_w, up_name, rows, cfg.audio_hidden, cfg.layer_norm_eps);
+        };
+        const normed = preparation.normed;
+        defer cb.free(normed);
+        return if (cfg.source_scalar_storage == .bf16)
+            try audioSourceLinear(cb, allocator, store, cfg, normed, up_name, rows, cfg.audio_hidden, cfg.intermediate_size, .row_major, true, false)
+        else if (preparation.spec) |spec| fused: {
+            const name = try std.fmt.allocPrint(allocator, "{s}.weight", .{up_name});
+            defer allocator.free(name);
+            break :fused try linearNoBiasScalarClipped(cb, allocator, store, normed, name, spec, rows, cfg.audio_hidden, cfg.intermediate_size, true);
+        } else if (store.gguf == null)
+            try linearNoBiasMaybeClippedInternal(cb, allocator, store, normed, up_name, rows, cfg.audio_hidden, cfg.intermediate_size, true)
+        else blk: {
+            const up = try audioSourceLinear(cb, allocator, store, cfg, normed, up_name, rows, cfg.audio_hidden, cfg.intermediate_size, .row_major, false, false);
+            defer cb.free(up);
+            break :blk try cb.silu(up);
+        };
+    }
+
+    pub fn finishFfnNorm(self: *const AudioLayer, input: CT, down: CT, second: bool) !grouped_audio_block.FfnPost(CT) {
+        var buffer: [128]u8 = undefined;
+        const name = try groupedNormName(&buffer, self.layer, .ffn_post, second);
+        const weight = try projectorVectorWeightCt(self.cb, self.allocator, self.store, name, self.cfg.audio_hidden);
+        if (self.cfg.source_scalar_storage == .full_f32 and self.store.gguf == null and !audioHostOps().scale) {
+            if (try self.cb.rmsNormResidual(down, weight, input, self.cfg.audio_hidden, self.cfg.layer_norm_eps, self.cfg.residual_weight, 1)) |fused|
+                return .{ .fused = fused };
+        }
+        return .{ .normalized = try self.boundedRms(down, weight) };
+    }
+
+    pub fn afterFeedForward(self: *const AudioLayer, result: CT, second: bool) !void {
         if (@import("builtin").is_test and self.layer == 0) {
             try embeddingGemma2StageTensor(self.cb, self.allocator, if (second) "audio_0_feed_forward2" else "audio_0_feed_forward1", result);
         }
         audioProfileMark(.ffn);
-        return result;
     }
 
     fn boundedRms(self: *const AudioLayer, input: CT, weight: CT) !CT {
@@ -5556,66 +5576,6 @@ const AudioLayer = struct {
         audioProfileMark(.lconv);
     }
 };
-
-fn audioFeedForward(
-    cb: *const ComputeBackend,
-    allocator: std.mem.Allocator,
-    store: *ProjectorWeights,
-    cfg: AudioConfig,
-    input: CT,
-    rows: usize,
-    layer: usize,
-    second: bool,
-) !CT {
-    var buf: [128]u8 = undefined;
-    const suffix = if (second) "_1" else "";
-    const norm_w = try projectorVectorWeightCt(cb, allocator, store, try fmt(&buf, "a.blk.{d}.ffn_norm{s}.weight", .{ layer, suffix }), cfg.audio_hidden);
-    const up_name = try fmt(&buf, "a.blk.{d}.ffn_up{s}", .{ layer, suffix });
-    const down = project: {
-        const activated = activate: {
-            const preparation: AudioFfnPreparation = normalize: {
-                const input_bounded = try audioSourceGradientBounded(cb, cfg, input);
-                defer if (input_bounded != input) cb.free(input_bounded);
-                break :normalize if (cfg.source_scalar_storage == .bf16)
-                    .{ .normed = try audioSourceRms(cb, cfg, input_bounded, norm_w, rows, cfg.audio_hidden, .contiguous, rows) }
-                else
-                    try audioFfnPreparation(cb, allocator, store, input, norm_w, up_name, rows, cfg.audio_hidden, cfg.layer_norm_eps);
-            };
-            const normed = preparation.normed;
-            defer cb.free(normed);
-            break :activate if (cfg.source_scalar_storage == .bf16)
-                try audioSourceLinear(cb, allocator, store, cfg, normed, up_name, rows, cfg.audio_hidden, cfg.intermediate_size, .row_major, true, false)
-            else if (preparation.spec) |spec| fused: {
-                const name = try std.fmt.allocPrint(allocator, "{s}.weight", .{up_name});
-                defer allocator.free(name);
-                break :fused try linearNoBiasScalarClipped(cb, allocator, store, normed, name, spec, rows, cfg.audio_hidden, cfg.intermediate_size, true);
-            } else if (store.gguf == null)
-                try linearNoBiasMaybeClippedInternal(cb, allocator, store, normed, up_name, rows, cfg.audio_hidden, cfg.intermediate_size, true)
-            else blk: {
-                const up = try audioSourceLinear(cb, allocator, store, cfg, normed, up_name, rows, cfg.audio_hidden, cfg.intermediate_size, .row_major, false, false);
-                defer cb.free(up);
-                break :blk try cb.silu(up);
-            };
-        };
-        defer cb.free(activated);
-        break :project try audioSourceLinear(cb, allocator, store, cfg, activated, try fmt(&buf, "a.blk.{d}.ffn_down{s}", .{ layer, suffix }), rows, cfg.intermediate_size, cfg.audio_hidden, .row_major, false, false);
-    };
-    const scaled = scale: {
-        const post = normalize: {
-            defer cb.free(down);
-            const post_w = try projectorVectorWeightCt(cb, allocator, store, try fmt(&buf, "a.blk.{d}.ffn_post_norm{s}.weight", .{ layer, suffix }), cfg.audio_hidden);
-            if (cfg.source_scalar_storage == .full_f32 and store.gguf == null and !audioHostOps().scale)
-                if (try cb.rmsNormResidual(down, post_w, input, cfg.audio_hidden, cfg.layer_norm_eps, cfg.residual_weight, 1)) |fused| return fused;
-            const down_bounded = try audioSourceGradientBounded(cb, cfg, down);
-            defer if (down_bounded != down) cb.free(down_bounded);
-            break :normalize try audioSourceRms(cb, cfg, down_bounded, post_w, rows, cfg.audio_hidden, .contiguous, rows);
-        };
-        defer cb.free(post);
-        break :scale try audioSourceRoundOwned(cb, cfg, try scaleRows(cb, allocator, post, rows, cfg.audio_hidden, cfg.residual_weight));
-    };
-    defer cb.free(scaled);
-    return audioSourceRoundOwned(cb, cfg, try cb.add(input, scaled));
-}
 
 /// `input * scale`, on device when the backend keeps scalar multiplies there.
 fn scaleRows(cb: *const ComputeBackend, allocator: std.mem.Allocator, input: CT, rows: usize, dim: usize, scale: f32) !CT {

@@ -37,11 +37,17 @@ fn boundedNorm(ctx: anytype, input: @TypeOf(ctx.*).Value, kind: Norm, second: bo
     return ctx.norm(kind, second, bounded);
 }
 
+pub fn FfnPost(comptime Value: type) type {
+    return union(enum) { normalized: Value, fused: Value };
+}
+
 fn feedForward(ctx: anytype, input: @TypeOf(ctx.*).Value, second: bool) !@TypeOf(ctx.*).Value {
+    const Context = @TypeOf(ctx.*);
     const scaled = scale: {
         const post = normalize: {
             const down = project: {
                 const up = activate: {
+                    if (@hasDecl(Context, "projectFfnUp")) break :activate try ctx.projectFfnUp(input, second);
                     const pre = try boundedNorm(ctx, input, .ffn_pre, second);
                     defer ctx.release(pre);
                     break :activate try ctx.linear(.ffn_up, second, pre);
@@ -50,6 +56,10 @@ fn feedForward(ctx: anytype, input: @TypeOf(ctx.*).Value, second: bool) !@TypeOf
                 break :project try ctx.linear(.ffn_down, second, up);
             };
             defer ctx.release(down);
+            if (@hasDecl(Context, "finishFfnNorm")) switch (try ctx.finishFfnNorm(input, down, second)) {
+                .normalized => |value| break :normalize value,
+                .fused => |value| return value,
+            };
             break :normalize try boundedNorm(ctx, down, .ffn_post, second);
         };
         defer ctx.release(post);
@@ -107,12 +117,13 @@ fn convolve(ctx: anytype, input: @TypeOf(ctx.*).Value) !@TypeOf(ctx.*).Value {
 
 pub fn run(ctx: anytype, input: @TypeOf(ctx.*).Value) !@TypeOf(ctx.*).Value {
     const Context = @TypeOf(ctx.*);
-    const custom = @hasDecl(Context, "feedForward");
+    const custom = @hasDecl(Context, "attend");
     const ff2 = feed_forward: {
         const convolution = conv: {
             const residual = attention: {
-                const ff1 = if (custom) try ctx.feedForward(input, false) else try feedForward(ctx, input, false);
+                const ff1 = try feedForward(ctx, input, false);
                 defer ctx.release(ff1);
+                if (@hasDecl(Context, "afterFeedForward")) try ctx.afterFeedForward(ff1, false);
                 const attended = project: {
                     const normed = if (custom) try ctx.normalize(.attention_pre, ff1) else try boundedNorm(ctx, ff1, .attention_pre, false);
                     defer ctx.release(normed);
@@ -130,8 +141,9 @@ pub fn run(ctx: anytype, input: @TypeOf(ctx.*).Value) !@TypeOf(ctx.*).Value {
         };
         defer ctx.release(convolution);
         if (@hasDecl(Context, "afterConvolution")) try ctx.afterConvolution(convolution);
-        break :feed_forward if (custom) try ctx.feedForward(convolution, true) else try feedForward(ctx, convolution, true);
+        break :feed_forward try feedForward(ctx, convolution, true);
     };
     defer ctx.release(ff2);
+    if (@hasDecl(Context, "afterFeedForward")) try ctx.afterFeedForward(ff2, true);
     return if (custom) ctx.normalize(.output, ff2) else boundedNorm(ctx, ff2, .output, false);
 }

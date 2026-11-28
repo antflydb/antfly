@@ -3188,6 +3188,13 @@ E4B QAT GGUF projector on Metal. The resident single- and two-clip
 outputs matched exactly, and the fully device-executed result was
 within 0.00563 of the host reference.
 
+Feed-forward execution and both declarations also share one lifetime
+schedule. The provider-specific up projection and fused normalization
+and residual keep their existing implementations. All nine Spark
+cases again matched eager CUDA with identical arena capacities. Four
+local Native and Metal checks passed, including the official E4B
+projector with the same 0.00563 maximum device-versus-host difference.
+
 ### Isolated Metal E4B HTTP comparison at `58b3917a89`
 
 The local M4 Max used the same pinned binaries as the mixed serving
