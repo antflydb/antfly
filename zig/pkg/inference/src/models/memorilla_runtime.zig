@@ -22,6 +22,8 @@ const ops = @import("../ops/ops.zig");
 const memory = @import("../runtime/root.zig").tier.memory;
 const Control = @import("../execution_control.zig").InferenceExecutionControl;
 const cuda = if (build_options.enable_cuda) @import("../ops/cuda/cuda_compute.zig") else struct {};
+const metal = @import("memorilla_metal.zig");
+const BackendType = @import("../backends/backends.zig").BackendType;
 const A = std.mem.Allocator;
 const this_module = @This();
 pub const parameter_bytes: usize = 776_495_104;
@@ -84,15 +86,29 @@ pub const Owner = struct {
 
     allocator: A,
     bundle: module.Bundle,
-    compute: if (build_options.enable_cuda) *cuda.CudaCompute else void,
+    compute: if (build_options.enable_cuda) ?*cuda.CudaCompute else void,
+    metal_weights: ?metal.Weights = null,
+    io: std.Io,
     execution_mutex: std.atomic.Mutex = .unlocked,
 
     /// Caller owns the GPU admission lease and must release it AFTER deinit.
     pub fn open(a: A, io: std.Io, directory: []const u8, admission: *const memory.AdmissionLease, limits: memory.Limits, control: Control) !Owner {
+        return openForBackend(a, io, directory, admission, limits, control, .cuda);
+    }
+
+    pub fn openForBackend(a: A, io: std.Io, directory: []const u8, admission: *const memory.AdmissionLease, limits: memory.Limits, control: Control, backend: BackendType) !Owner {
         try control.check();
         try requireAdmission(admission, limits);
-        try @import("memorilla_qualification.zig").requireCudaEnvironment();
-        if (comptime !build_options.enable_cuda) return error.CudaNotEnabled;
+        switch (backend) {
+            .cuda => {
+                if (comptime !build_options.enable_cuda) return error.CudaNotEnabled;
+                try @import("memorilla_qualification.zig").requireCudaEnvironment();
+            },
+            .metal => {
+                if (comptime !build_options.enable_metal) return error.MetalNotEnabled;
+            },
+            else => return error.UnsupportedMemorillaBackend,
+        }
         const backing = @import("antfly_platform").allocator.reclaimingScratch(a);
         var guard = try control.enterUninterruptible(.uninterruptible);
         defer guard.deinit();
@@ -104,6 +120,13 @@ pub const Owner = struct {
         var store = try bundle.loadFloat32Store();
         defer store.deinitOwned();
         try control.check();
+        if (backend == .metal) {
+            var weights = try metal.Weights.init(backing);
+            errdefer weights.deinit();
+            try weights.adopt(&store, parameter_bytes);
+            return .{ .allocator = backing, .bundle = bundle, .compute = if (build_options.enable_cuda) null else {}, .metal_weights = weights, .io = io };
+        }
+        if (comptime !build_options.enable_cuda) return error.CudaNotEnabled;
         const compute = try backing.create(cuda.CudaCompute);
         errdefer backing.destroy(compute);
         compute.* = try cuda.CudaCompute.init(backing);
@@ -121,34 +144,39 @@ pub const Owner = struct {
         }
         _ = compute.releaseMemorillaRequestResources() catch @panic("Memorilla reader load cleanup failed; worker restart required");
         if (compute.snapshotStats().resident_weight_bytes != parameter_bytes) return error.UnsupportedMemorillaPrecision;
-        _ = io;
         try control.check();
-        return .{ .allocator = backing, .bundle = bundle, .compute = compute };
+        return .{ .allocator = backing, .bundle = bundle, .compute = compute, .io = io };
     }
 
     /// Borrowed backend. Caller serializes it with execution_mutex, propagates
     /// control, and frees every request CT before releaseRequestResources.
     pub fn computeBackend(self: *Owner) !ops.ComputeBackend {
-        if (comptime build_options.enable_cuda) return self.compute.computeBackend();
+        if (self.metal_weights) |*weights| return weights.compute(self.io);
+        if (comptime build_options.enable_cuda) return self.compute.?.computeBackend();
         return error.CudaNotEnabled;
     }
 
     pub fn computeBackendWithBudget(self: *Owner, budget: *memory.RunBudget) !ops.ComputeBackend {
-        if (comptime build_options.enable_cuda) return self.compute.computeBackendWithStepRunBudget(budget, @intFromPtr(self));
+        if (self.metal_weights != null) return self.computeBackend();
+        if (comptime build_options.enable_cuda) return self.compute.?.computeBackendWithStepRunBudget(budget, @intFromPtr(self));
         return error.CudaNotEnabled;
     }
 
     pub fn releaseRequestResources(self: *Owner) !void {
+        if (self.metal_weights != null) return; // The request owns and retires its Metal compute handle.
         if (comptime build_options.enable_cuda) {
-            _ = try self.compute.releaseMemorillaRequestResources();
+            _ = try self.compute.?.releaseMemorillaRequestResources();
         } else return error.CudaNotEnabled;
     }
 
     pub fn deinit(self: *Owner) void {
         if (comptime build_options.enable_cuda) {
-            self.compute.deinit();
-            self.allocator.destroy(self.compute);
+            if (self.compute) |compute| {
+                compute.deinit();
+                self.allocator.destroy(compute);
+            }
         }
+        if (self.metal_weights) |*weights| weights.deinit();
         self.bundle.deinit();
         self.* = undefined;
     }

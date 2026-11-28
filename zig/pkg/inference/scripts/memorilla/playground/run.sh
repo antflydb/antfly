@@ -2,25 +2,18 @@
 # Copyright 2026 Antfly, Inc.
 # SPDX-License-Identifier: Apache-2.0
 #
-# Memorilla playground (plan section 8.35): starts the Zig inference server
-# with one hybrid_research profile (span1-35k-cascade over the released stage3
-# reader) and the playground page server, both on 127.0.0.1.
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
 #
-#   run.sh [start]   start both (the Zig server only if it is not running)
-#   run.sh stop      stop both
-#   run.sh status    show the PIDs and ports
+#     http://www.apache.org/licenses/LICENSE-2.0
 #
-# Environment (defaults in brackets):
-#   PORT [8765]           page server port
-#   ZIG_PORT [18090]      Zig inference server port
-#   BIN                   [zig/pkg/inference/zig-out/bin/antfly-inference-dev]
-#                         build: cd zig/pkg/inference && zig build -Dcuda=true -Doptimize=ReleaseFast --prefix zig-out
-#   BUNDLE                hybrid span bundle [$D/span1-35k-cascade/hybrid-span-bundle]
-#   STATE                 config, logs and PIDs [.benchmark-results/memorilla/playground]
-#   RANKING [dense]       dense (server /ai/v1/embed, stock Qwen3-Embedding-4B) or bm25
-#   RESEARCH [1]          research mode of the latency studies (BF16 matrices + fast prefill)
-#   FORCE [0]             start even if another process holds the GPU
-# A, D and PY come from .benchmark-results/memorilla/qwen-span-copy/env.sh.
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 set -euo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 W=$(cd "$HERE/../../../../../.." && pwd)
@@ -33,8 +26,33 @@ BIN=${BIN:-$W/zig/pkg/inference/zig-out/bin/antfly-inference-dev}
 BUNDLE=${BUNDLE:-$D/span1-35k-cascade/hybrid-span-bundle}
 STATE=${STATE:-$W/.benchmark-results/memorilla/playground}
 RANKING=${RANKING:-dense}
+BACKEND=${BACKEND:-cuda}
+case "$BACKEND" in
+  cuda)
+    RESEARCH=${RESEARCH:-1}
+    PROCESS_MEMORY_MB=114688
+    HOST_MEMORY_GIB=48
+    COMBINED_MEMORY_GIB=104
+    ;;
+  metal)
+    RESEARCH=${RESEARCH:-0}
+    PROCESS_MEMORY_MB=147456
+    HOST_MEMORY_GIB=96
+    COMBINED_MEMORY_GIB=144
+    ;;
+  *) echo "BACKEND must be cuda or metal"; exit 1 ;;
+esac
+if [ "$BACKEND" = metal ] && [ "$RESEARCH" != 0 ]; then
+  echo "Metal requires RESEARCH=0"; exit 1
+fi
 PROFILE=memorilla-span-cascade
 mkdir -p "$STATE"
+
+# macOS has no setsid executable. Use the same process-group lifecycle on
+# both platforms and exec in place so the recorded PID is the group leader.
+start_detached() {
+  exec nohup "$PY" -I -c 'import os, sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' "$@"
+}
 
 alive() { [ -s "$1" ] && kill -0 "$(cat "$1")" 2>/dev/null; }
 
@@ -63,12 +81,12 @@ write_config() {
   cat > "$STATE/config.json" <<EOF
 {
   "resources": {
-    "memory": {"max_bytes": 120259084288},
+    "memory": {"max_bytes": $((PROCESS_MEMORY_MB * 1024 * 1024))},
     "inference": {
       "memory": {
-        "max_host_bytes": 51539607552,
+        "max_host_bytes": $((HOST_MEMORY_GIB * 1024 * 1024 * 1024)),
         "max_device_bytes": 107374182400,
-        "max_combined_bytes": 111669149696,
+        "max_combined_bytes": $((COMBINED_MEMORY_GIB * 1024 * 1024 * 1024)),
         "max_kv_bytes": 4294967296,
         "max_scratch_bytes": 17179869184
       },
@@ -112,19 +130,27 @@ start() {
   else
     [ -x "$BIN" ] || { echo "missing $BIN (build it first, see the header)"; exit 1; }
     local foreign
-    foreign=$(nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv,noheader 2>/dev/null || true)
+    foreign=""
+    if [ "$BACKEND" = cuda ]; then
+      foreign=$(nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv,noheader 2>/dev/null || true)
+    fi
     if [ -n "$foreign" ] && [ "${FORCE:-0}" != 1 ]; then
       echo "GPU in use, not starting (FORCE=1 overrides):"; echo "$foreign"; exit 1
     fi
     write_config
     (
-      export CUDA_CACHE_PATH=$W/zig/pkg/inference/.zig-cache/cuda
-      if [ "${RESEARCH:-1}" = 1 ]; then
-        export ANTFLY_MEMORILLA_RESEARCH_BF16_MATRICES=1 ANTFLY_MEMORILLA_RESEARCH_FAST_PREFILL=1
+      if [ "$BACKEND" = metal ]; then
+        export ANTFLY_INFERENCE_REQUIRED_BACKEND=metal
+        unset ANTFLY_MEMORILLA_RESEARCH_BF16_MATRICES ANTFLY_MEMORILLA_RESEARCH_FAST_PREFILL
+      else
+        export CUDA_CACHE_PATH=$W/zig/pkg/inference/.zig-cache/cuda
+        if [ "$RESEARCH" = 1 ]; then
+          export ANTFLY_MEMORILLA_RESEARCH_BF16_MATRICES=1 ANTFLY_MEMORILLA_RESEARCH_FAST_PREFILL=1
+        fi
       fi
       cd "$W"
-      setsid nohup "$BIN" run --host 127.0.0.1 --port "$ZIG_PORT" --config "$STATE/config.json" \
-        --process-memory-budget-mb 114688 > "$STATE/zig.log" 2>&1 < /dev/null &
+      start_detached "$BIN" run --host 127.0.0.1 --port "$ZIG_PORT" --config "$STATE/config.json" \
+        --process-memory-budget-mb "$PROCESS_MEMORY_MB" > "$STATE/zig.log" 2>&1 < /dev/null &
       echo $! > "$STATE/zig.pid"
     )
     echo "zig server starting (pid $(cat "$STATE/zig.pid"), log $STATE/zig.log)"
@@ -139,7 +165,7 @@ start() {
   else
     (
       cd "$W"
-      setsid nohup "$PY" -I "$HERE/server.py" --host 127.0.0.1 --port "$PORT" \
+      start_detached "$PY" -I "$HERE/server.py" --host 127.0.0.1 --port "$PORT" \
         --zig-url "http://127.0.0.1:$ZIG_PORT" --profile "$PROFILE" --embed-model encoder \
         --tokenizer "$A/managed-f32/encoder/tokenizer.json" --bundle "$BUNDLE" --ranking "$RANKING" --warm \
         > "$STATE/page.log" 2>&1 < /dev/null &

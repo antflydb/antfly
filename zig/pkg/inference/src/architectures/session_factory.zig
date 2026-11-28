@@ -959,7 +959,7 @@ pub fn createSessionFromManifest(
 ) !Session {
     return switch (backend) {
         .native => createNativeSessionForCudaUpload(allocator, model_path, null, false, manifest),
-        .metal => createGpuHostedSessionWithTaskOverride(allocator, model_path, null, .metal, jit, load_context, a4b, manifest),
+        .metal => createGpuHostedSessionWithTaskOverride(allocator, model_path, null, .metal, jit, load_context, a4b, manifest, .{}),
         .cuda => blk: {
             if (precision) |value| {
                 try requireQualifiedGlinerCudaPrecision(value, allow_unqualified_precision);
@@ -1662,7 +1662,18 @@ pub fn createMetalSessionWithKernelJitAndLoadContextAndA4bRequest(
     load_context: kernel_jit.LoadContext,
     a4b_request: ?backend_contracts.A4bInferenceRequest,
 ) !Session {
-    return createGpuHostedSessionWithTaskOverride(allocator, model_path, null, .metal, config, load_context, a4b_request, null);
+    return createGpuHostedSessionWithTaskOverride(allocator, model_path, null, .metal, config, load_context, a4b_request, null, .{});
+}
+
+pub fn createMetalSessionWithManagedMemorillaProfile(
+    allocator: std.mem.Allocator,
+    model_path: []const u8,
+    config: kernel_jit.Config,
+    load_context: kernel_jit.LoadContext,
+    control: ?InferenceExecutionControl,
+    manifest: ?*const manifest_mod.ModelManifest,
+) !Session {
+    return createGpuHostedSessionWithTaskOverride(allocator, model_path, null, .metal, config, load_context, null, manifest, control orelse .{});
 }
 
 pub fn createMetalSessionWithTaskOverrideAndKernelJit(
@@ -1681,7 +1692,7 @@ pub fn createMetalSessionWithTaskOverrideAndKernelJitAndLoadContext(
     config: kernel_jit.Config,
     load_context: kernel_jit.LoadContext,
 ) !Session {
-    return createGpuHostedSessionWithTaskOverride(allocator, model_path, override, .metal, config, load_context, null, null);
+    return createGpuHostedSessionWithTaskOverride(allocator, model_path, override, .metal, config, load_context, null, null, .{});
 }
 
 pub fn createCudaSession(allocator: std.mem.Allocator, model_path: []const u8) !Session {
@@ -2833,6 +2844,7 @@ fn createGpuHostedSessionWithTaskOverride(
     kernel_jit_load_context: kernel_jit.LoadContext,
     a4b_request: ?backend_contracts.A4bInferenceRequest,
     borrowed_manifest: ?*const manifest_mod.ModelManifest,
+    control: InferenceExecutionControl,
 ) !Session {
     try kernel_jit_config.validate();
     try metal_runtime.validateMetalJitLoadContext(kernel_jit_config, kernel_jit_load_context);
@@ -2847,6 +2859,17 @@ fn createGpuHostedSessionWithTaskOverride(
     const model_weight_bytes = estimateNativeWeightBytes(allocator, mf) catch 0;
 
     var arch_config = try detectArchitecture(allocator, model_path, mf);
+    const memorilla_generation = if (mf.memorilla_profile) |profile| blk: {
+        if (backend_type != .metal or override != null or a4b_request != null or arch_config != .gpt or arch_config.gpt.family != .qwen3)
+            return error.UnsupportedMemorillaArtifact;
+        if (memorilla_qualification.researchBf16Matrices() or memorilla_qualification.researchFastPrefill())
+            return error.UnsupportedMemorillaPrecision;
+        const before = try memorilla_qualification.artifactGeneration(allocator, std.Options.debug_io, model_path, profile, control);
+        try memorilla_qualification.requireRecipe(profile, mf);
+        try memorilla_qualification.verifyArtifacts(allocator, model_path, profile, control);
+        try memorilla_qualification.verifySelectedPaths(allocator, std.Options.debug_io, model_path, mf);
+        break :blk before;
+    } else null;
     if (arch_config == .embedding_gemma2 and backend_type != .metal) return error.UnsupportedEmbeddingGemma2Backend;
     if (arch_config == .gliner_boundary and backend_type != .metal) return error.UnsupportedGlinerBoundaryBackend;
     var boundary_identity: ?boundary_bundle.Identity = null;
@@ -2857,7 +2880,7 @@ fn createGpuHostedSessionWithTaskOverride(
     // which was fast but measurably changed the normalized embedding. Keep
     // this exception exact-geometry qualified; all other BERT checkpoints
     // retain the existing direct-quant policy.
-    const session_direct_quant_enabled = sessionDirectQuantEnabled(direct_quant_enabled, mf, arch_config);
+    const session_direct_quant_enabled = mf.memorilla_profile == null and sessionDirectQuantEnabled(direct_quant_enabled, mf, arch_config);
     const quant_mode = gpuHostedQuantExecutionMode(session_direct_quant_enabled);
     var metal_jit_scope: MetalJitRouteScope = if (build_options.enable_metal)
         metal_runtime.MetalJitRouteScope.none()
@@ -2919,9 +2942,11 @@ fn createGpuHostedSessionWithTaskOverride(
         gpuHostedBudgetPolicy(backend_type, model_weight_bytes, mf, arch_config, quant_mode);
     // Boundary artifacts have an exact per-tensor precision contract. Keep
     // original F16 matrix bytes available to the strict resident operations.
-    const prefer_f32_dense_tensors = if (arch_config == .gliner_boundary) false else budget_policy.prefer_f32_dense_tensors;
+    const prefer_f32_dense_tensors = mf.memorilla_profile != null or (arch_config != .gliner_boundary and budget_policy.prefer_f32_dense_tensors);
     const budget_floor = budget_policy.budget_floor;
-    const shared_cache_floor = budget_policy.shared_cache_floor;
+    var shared_cache_floor = budget_policy.shared_cache_floor;
+    if (mf.memorilla_profile != null)
+        shared_cache_floor.host_limit_bytes = @max(shared_cache_floor.host_limit_bytes, model_weight_bytes);
     const plan_context = budget_policy.plan_context;
 
     const resident_prefix: []const u8 = if (mf.safetensors_path != null or mf.safetensors_index_path != null or mf.gguf_path != null) blk: {
@@ -2990,7 +3015,7 @@ fn createGpuHostedSessionWithTaskOverride(
             }
             break :detected detected_prefix;
         };
-        eager_dense = shouldUseGpuHostedEagerDenseLoad(backend_type, allocator, mf, arch_config);
+        eager_dense = mf.memorilla_profile == null and shouldUseGpuHostedEagerDenseLoad(backend_type, allocator, mf, arch_config);
         if (eager_dense) {
             if (comptime !false) {
                 std.log.err("metal backend no longer supports eager dense resident loading", .{});
@@ -3107,6 +3132,12 @@ fn createGpuHostedSessionWithTaskOverride(
         }
     }
 
+    if (mf.memorilla_profile) |profile| {
+        const expected: usize = if (memorilla_qualification.role(profile) == .encoder) 398 else 399;
+        if (lazy_weights.count() != expected) return error.UnsupportedMemorillaArtifact;
+        const after = try memorilla_qualification.artifactGeneration(allocator, std.Options.debug_io, model_path, profile, control);
+        if (!std.mem.eql(u8, &after, &memorilla_generation.?)) return error.ModelArtifactsChanging;
+    }
     const task = sessionTaskForModelType(mf.model_type, override);
     const impl = try allocator.create(ArchSession);
     impl.* = .{
@@ -3127,6 +3158,7 @@ fn createGpuHostedSessionWithTaskOverride(
         // it in a session that may be published and reused post-startup.
         .kernel_jit_load_context = .dynamic,
         .metal_jit_scope = metal_jit_scope,
+        .memorilla_profile = mf.memorilla_profile,
         .budget_floor = budget_floor,
         .shared_cache_budget_floor = shared_cache_floor,
         .backend_data = makeGpuHostedBackendData(backend_type, .{
@@ -6588,7 +6620,8 @@ fn makeMetalHostedComputeBackend(
             .load_context = self.kernel_jit_load_context,
         },
     );
-    compute.require_f32_linears = self.arch_config == .embedding_gemma2;
+    compute.require_f32_linears = self.arch_config == .embedding_gemma2 or self.memorilla_profile != null;
+    compute.force_f32_dense_weights = self.memorilla_profile != null;
     compute.qwen35_ocr_deferred_attention = switch (self.arch_config) {
         .gpt => |cfg| cfg.hasQwen35VisionArchitectureContract() and
             ((cfg.hidden_size == 1024 and cfg.intermediate_size == 3584 and cfg.num_hidden_layers == 24) or
@@ -8845,10 +8878,17 @@ pub fn getCudaRuntimeStats(session: Session) ?CudaRuntimeStats {
 /// Validate the actual managed execution owner, not a caller supplied label.
 /// Diagnostic constructors deliberately have no production profile proof.
 pub fn requireMemorillaProfile(session: Session, expected: memorilla_qualification.Profile) !void {
-    if (comptime !build_options.enable_cuda) return error.CudaNotEnabled;
     if (session.vtable != &arch_vtable) return error.UnsupportedMemorillaProfile;
     const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
-    if (self.backend_type != .cuda or self.memorilla_profile != expected) return error.UnsupportedMemorillaProfile;
+    if (self.memorilla_profile != expected) return error.UnsupportedMemorillaProfile;
+    if (self.backend_type == .metal) {
+        if (comptime !build_options.enable_metal) return error.MetalNotEnabled;
+        const data = gpuBackendData(self);
+        if (!data.prefer_f32_dense_tensors or data.allow_direct_quant) return error.UnsupportedMemorillaPrecision;
+        return;
+    }
+    if (comptime !build_options.enable_cuda) return error.CudaNotEnabled;
+    if (self.backend_type != .cuda) return error.UnsupportedMemorillaProfile;
     const compute = &self.backend_data.cuda.compute;
     const encoder = memorilla_qualification.role(expected) == .encoder;
     if (!compute.strict_f32_weights or compute.lazy_host_store != null or compute.capture_gates.persistent_replay or compute.capture_gates.update_exec or compute.capture_gates.device_scalars or
@@ -8895,9 +8935,9 @@ pub fn logMemorillaOpProfile(session: Session, label: []const u8) void {
     cuda_compute_mod.drainCudaProfile(compute);
     const s = &compute.stats;
     std.log.info("memorilla_op_profile label={s} events={d} bf16_linear_us={d} bf16_qkv_us={d} bf16_pair_us={d} f16_linear_us={d} attention_us={d} staging_us={d} norm_us={d} rope_us={d} elementwise_us={d} embedding_us={d} kv_write_us={d}", .{
-        label,                             s.prefill_profile_events,     s.prefill_profile_bf16_linear_us, s.prefill_profile_bf16_qkv_us,      s.prefill_profile_bf16_pair_us,
-        s.prefill_profile_f16_linear_us,   s.prefill_profile_attention_us, s.prefill_profile_staging_us,   s.prefill_profile_norm_us,          s.prefill_profile_rope_us,
-        s.prefill_profile_elementwise_us,  s.prefill_profile_embedding_us, s.prefill_profile_kv_write_us,
+        label,                            s.prefill_profile_events,       s.prefill_profile_bf16_linear_us, s.prefill_profile_bf16_qkv_us, s.prefill_profile_bf16_pair_us,
+        s.prefill_profile_f16_linear_us,  s.prefill_profile_attention_us, s.prefill_profile_staging_us,     s.prefill_profile_norm_us,     s.prefill_profile_rope_us,
+        s.prefill_profile_elementwise_us, s.prefill_profile_embedding_us, s.prefill_profile_kv_write_us,
     });
     s.prefill_profile_events = 0;
     s.prefill_profile_bf16_qkv_us = 0;
@@ -8915,8 +8955,15 @@ pub fn logMemorillaOpProfile(session: Session, label: []const u8) void {
 
 pub fn requireMemorillaBackend(session: Session, expected: memorilla_qualification.Profile, backend: *const ops.ComputeBackend) !void {
     try requireMemorillaProfile(session, expected);
+    const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
+    if (self.backend_type == .metal) {
+        if (comptime !build_options.enable_metal) return error.MetalNotEnabled;
+        if (backend.kind() != .metal) return error.UnsupportedMemorillaBackend;
+        const compute: *const MetalCompute = @ptrCast(@alignCast(backend.ptr));
+        if (compute.data != gpuBackendData(self) or !compute.require_f32_linears or !compute.force_f32_dense_weights) return error.UnsupportedMemorillaPrecision;
+        return;
+    }
     if (comptime build_options.enable_cuda) {
-        const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
         if (backend.kind() != .cuda or backend.ptr != @as(*anyopaque, @ptrCast(&self.backend_data.cuda.compute)))
             return error.UnsupportedMemorillaProfile;
     }
@@ -8924,6 +8971,7 @@ pub fn requireMemorillaBackend(session: Session, expected: memorilla_qualificati
 
 pub fn releaseMemorillaRequestResources(session: Session, expected: memorilla_qualification.Profile) !void {
     try requireMemorillaProfile(session, expected);
+    if (session.backend() == .metal) return; // Metal compute handles are scoped to each encoder invocation.
     if (comptime build_options.enable_cuda) {
         const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
         _ = try self.backend_data.cuda.compute.releaseMemorillaRequestResources();
@@ -9518,7 +9566,8 @@ pub fn getComputeBackendBorrowingSharedProvider(session: Session, allocator: std
             .load_context = self.kernel_jit_load_context,
         },
     );
-    compute.require_f32_linears = self.arch_config == .embedding_gemma2;
+    compute.require_f32_linears = self.arch_config == .embedding_gemma2 or self.memorilla_profile != null;
+    compute.force_f32_dense_weights = self.memorilla_profile != null;
     var cb = compute.ownedComputeBackend();
     errdefer cb.deinit();
     try cb.beginRequest();
@@ -9908,6 +9957,13 @@ pub fn getCoordinatedCudaComputeBackend(session: Session, budget: *runtime.tier.
         try bindCudaVideoAdmission(session, &cb);
         return cb;
     } else return error.CudaNotEnabled;
+}
+
+pub fn getMemorillaDecoderBackend(session: Session, allocator: std.mem.Allocator, budget: *runtime.tier.memory.RunBudget, owner: u64) !ops.ComputeBackend {
+    try requireMemorillaProfile(session, .qwen3_decoder_f32_kv_f32_v1);
+    if (session.backend() == .cuda) return getCoordinatedCudaComputeBackend(session, budget, owner);
+    const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
+    return makeComputeBackend(self, allocator, budget);
 }
 
 pub fn getGenericEncoderArchConfig(session: Session) !GenericEncoderArchConfig {
@@ -10629,10 +10685,16 @@ fn archRunManaged(ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Al
 
 fn archRunAdmitted(ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator, control: ?InferenceExecutionControl, amounts: ?runtime.tier.memory.AdmissionAmounts) ![]Tensor {
     const self: *ArchSession = @ptrCast(@alignCast(ptr));
+    if (self.backend_type == .metal) if (self.memorilla_profile) |profile| {
+        if (memorilla_qualification.role(profile) == .encoder) {
+            const held = amounts orelse return error.MemorillaAdmissionRequired;
+            if (held.backend_scratch_bytes == 0) return error.MemorillaAdmissionRequired;
+        }
+    };
     if (comptime build_options.enable_cuda) {
         // Both encoder tags (released and research) run only under an
         // explicit admitted device budget; the role decides, not the tag.
-        if (if (self.memorilla_profile) |profile| memorilla_qualification.role(profile) == .encoder else false) {
+        if (self.backend_type == .cuda and if (self.memorilla_profile) |profile| memorilla_qualification.role(profile) == .encoder else false) {
             const held = amounts orelse return error.MemorillaAdmissionRequired;
             if (held.backend_scratch_bytes == 0) return error.MemorillaAdmissionRequired;
             var physical = try self.backend_data.cuda.compute.beginMemorillaDeviceBudget(held.backend_scratch_bytes);

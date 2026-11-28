@@ -293,7 +293,6 @@ pub const ResourcePlan = struct {
 
     fn createInternal(config: gpt_model.Config, backend: runtime.kv.pool.BackendKind, prompt_tokens: usize, prompt_bytes: usize, memory_rows: usize, max_new_tokens: usize, limits: Limits, mode: @FieldType(ResourcePlan, "mode")) !ResourcePlan {
         try validateConfig(config);
-        if (backend != .cuda and backend != .native) return error.UnsupportedMemorillaBackend;
         if (prompt_tokens == 0 or prompt_tokens > limits.max_prompt_tokens or prompt_bytes > limits.max_prompt_bytes or
             memory_rows > limits.max_memory_rows or max_new_tokens == 0 or max_new_tokens > limits.max_new_tokens or
             try add(prompt_tokens, max_new_tokens) > config.max_position_embeddings) return error.MemorillaPromptBudgetExceeded;
@@ -316,7 +315,7 @@ pub const ResourcePlan = struct {
         const decoder_bytes = try add(estimate.kv_bytes, estimate.scratch_bytes);
         const total_host_bytes = try add(host_bytes, if (backend == .native) decoder_bytes else 0);
         if (estimate.kv_bytes > limits.max_kv_bytes or
-            (backend == .cuda and decoder_bytes > limits.max_backend_bytes) or total_host_bytes > limits.max_host_bytes)
+            (backend != .native and decoder_bytes > limits.max_backend_bytes) or total_host_bytes > limits.max_host_bytes)
             return error.MemorillaResourceBudgetExceeded;
         return .{
             .mode = mode,
@@ -459,19 +458,26 @@ pub const Decoder = struct {
     tokenizer: tok.Tokenizer,
     execution_mutex: *std.atomic.Mutex,
     execution_lane: ?*control_mod.ExecutionLane = null,
-    policy: enum { cuda_f32, native_f32_reference } = .cuda_f32,
+    policy: enum { cuda_f32, metal_f32, native_f32_reference } = .cuda_f32,
 
     pub fn fromQualifiedSession(session: @import("../backends/session.zig").Session, backend: *const CB, tokenizer: tok.Tokenizer, mutex: *std.atomic.Mutex) !Decoder {
         const factory = @import("../architectures/session_factory.zig");
         try factory.requireMemorillaBackend(session, .qwen3_decoder_f32_kv_f32_v1, backend);
         const config = try factory.requireMemorillaDecoderF32(session);
-        return .{ .backend = backend, .config = config, .tokenizer = tokenizer, .execution_mutex = mutex };
+        return .{ .backend = backend, .config = config, .tokenizer = tokenizer, .execution_mutex = mutex, .policy = if (backend.kind() == .metal) .metal_f32 else .cuda_f32 };
     }
 
     fn validate(self: Decoder) !void {
         try validateConfig(self.config);
         if (self.policy == .native_f32_reference) {
             if (self.backend.kind() != .native) return error.UnsupportedMemorillaBackend;
+            return;
+        }
+        if (self.policy == .metal_f32) {
+            if (comptime !build_options.enable_metal) return error.MetalNotEnabled;
+            if (self.backend.kind() != .metal) return error.UnsupportedMemorillaBackend;
+            const compute: *const @import("../ops/metal_compute.zig").MetalCompute = @ptrCast(@alignCast(self.backend.ptr));
+            if (!compute.require_f32_linears) return error.UnqualifiedMemorillaDecoderPrecision;
             return;
         }
         if (self.backend.kind() != .cuda) return error.UnsupportedMemorillaBackend;
@@ -501,7 +507,7 @@ fn compose(cb: *const CB, a: A, config: gpt_model.Config, text: *const PreparedT
     if (shape.len != 2 or shape[0] != text.recipe.memory_rows or shape[1] != config.hidden_size) return error.InvalidMemorillaMemoryRows;
     const imported = if (cb.kind() == .cuda and rows.backend.kind() == .cuda)
         (try cb.copyTensorFromBackend(rows.backend, rows.tensor)) orelse return error.UnsupportedMemorillaDeviceTransfer
-    else if (cb.kind() == .native and rows.backend.kind() == .native) blk: {
+    else if (cb.kind() == rows.backend.kind() and (cb.kind() == .native or cb.kind() == .metal)) blk: {
         const values = try rows.backend.toFloat32(rows.tensor, a);
         defer a.free(values);
         const imported_shape = [_]i32{ @intCast(text.recipe.memory_rows), @intCast(config.hidden_size) };
@@ -581,7 +587,7 @@ fn generateInternal(a: A, decoder: Decoder, prompt: Prompt, request: Request, re
         reservation.plan.layers != decoder.config.num_hidden_layers or reservation.plan.heads != decoder.config.num_attention_heads or
         reservation.plan.kv_heads != decoder.config.effectiveKVHeads() or reservation.plan.head_dim != decoder.config.headDim() or
         reservation.plan.intermediate != decoder.config.intermediate_size or reservation.plan.vocab != decoder.config.vocab_size or
-        reservation.plan.backend != (if (decoder.backend.kind() == .cuda) runtime.kv.pool.BackendKind.cuda else .native) or
+        reservation.plan.backend != try kvBackend(decoder.backend.kind()) or
         request.max_new_tokens == 0 or request.max_new_tokens > limits.max_new_tokens) return error.InvalidMemorillaReservation;
     switch (prompt) {
         .memory => |input| {
@@ -673,19 +679,28 @@ fn releaseTransientResources(cb: *const CB) void {
     }
 }
 
+pub fn kvBackend(backend: anytype) !runtime.kv.pool.BackendKind {
+    return switch (backend) {
+        .cuda => .cuda,
+        .metal => .metal,
+        .native => .native,
+        else => error.UnsupportedMemorillaBackend,
+    };
+}
+
 fn run(a: A, decoder: Decoder, cb: *const CB, prompt: Prompt, request: Request, limits: Limits, control: Control) !generation.GenerationResult {
     try control.check();
     const input_ids = prompt.ids();
     var manager = runtime.kv.manager.KvManager.init(a);
     defer manager.deinit();
-    const backend: runtime.kv.pool.BackendKind = if (cb.kind() == .cuda) .cuda else .native;
+    const backend = try kvBackend(cb.kind());
     var pool_config = generation.kvPoolConfig(backend, .f32, decoder.config, false);
-    if (backend == .cuda) pool_config.store_cpu_bytes = false;
+    if (backend != .native) pool_config.store_cpu_bytes = false;
     const pool = try manager.addPool(pool_config);
     var storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(a, pool_config);
     defer storage.deinit();
     try cb.provisionKvDeviceWriteHook(&storage);
-    if (backend == .cuda and storage.device_write_hook == null) return error.UnsupportedMemorillaDeviceKv;
+    if (backend != .native and storage.device_write_hook == null) return error.UnsupportedMemorillaDeviceKv;
     var state = generation.NativeDecodeState.initPaged(a, &manager, pool, null);
     state.configureForGptConfig(decoder.config);
     state.kv_storage = &storage;
@@ -864,6 +879,121 @@ const TestTokenizer = struct {
 
 fn testConfig() gpt_model.Config {
     return .{ .family = .qwen3, .hidden_size = 32, .intermediate_size = 64, .num_hidden_layers = 2, .num_attention_heads = 4, .num_key_value_heads = 2, .attention_head_dim = 8, .vocab_size = 512, .max_position_embeddings = 2048, .norm_type = .rms_norm, .position_encoding = .rope, .activation = .silu };
+}
+
+test "Memorilla Metal Qwen3 tapped encoder and F32 KV decoder match native" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const native = @import("../ops/native_compute.zig");
+    const Tensor = @import("../backends/tensor.zig").Tensor;
+    const hidden = 128;
+    const vocab = 8;
+    var config = testConfig();
+    config.hidden_size = hidden;
+    config.intermediate_size = hidden;
+    config.num_hidden_layers = 1;
+    config.num_attention_heads = 1;
+    config.num_key_value_heads = 1;
+    config.attention_head_dim = hidden;
+    config.vocab_size = vocab;
+    var metal_weights = try @import("../models/memorilla_metal.zig").Weights.init(a);
+    defer metal_weights.deinit();
+    var native_store = native.WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty };
+    defer native_store.deinitOwned();
+    const dimensions = [_]i64{hidden};
+    const matrix_dimensions = [_]i64{ hidden, hidden };
+    const embedding_dimensions = [_]i64{ vocab, hidden };
+    const specs = [_]struct { name: []const u8, shape: []const i64 }{
+        .{ .name = "model.embed_tokens.weight", .shape = &embedding_dimensions },
+        .{ .name = "lm_head.weight", .shape = &embedding_dimensions },
+        .{ .name = "model.layers.0.self_attn.q_proj.weight", .shape = &matrix_dimensions },
+        .{ .name = "model.layers.0.self_attn.k_proj.weight", .shape = &matrix_dimensions },
+        .{ .name = "model.layers.0.self_attn.v_proj.weight", .shape = &matrix_dimensions },
+        .{ .name = "model.layers.0.self_attn.o_proj.weight", .shape = &matrix_dimensions },
+        .{ .name = "model.layers.0.mlp.gate_proj.weight", .shape = &matrix_dimensions },
+        .{ .name = "model.layers.0.mlp.up_proj.weight", .shape = &matrix_dimensions },
+        .{ .name = "model.layers.0.mlp.down_proj.weight", .shape = &matrix_dimensions },
+        .{ .name = "model.layers.0.self_attn.q_norm.weight", .shape = &dimensions },
+        .{ .name = "model.layers.0.self_attn.k_norm.weight", .shape = &dimensions },
+        .{ .name = "model.layers.0.input_layernorm.weight", .shape = &dimensions },
+        .{ .name = "model.layers.0.post_attention_layernorm.weight", .shape = &dimensions },
+        .{ .name = "model.norm.weight", .shape = &dimensions },
+    };
+    for (specs, 0..) |spec, index| {
+        var count: usize = 1;
+        for (spec.shape) |dimension| count *= @intCast(dimension);
+        const values = try a.alloc(f32, count);
+        defer a.free(values);
+        for (values, 0..) |*value, j| value.* = if (spec.shape.len == 1) 1 else @sin(@as(f32, @floatFromInt((j + 1) * (index + 1))) * 0.17) * 0.1;
+        const native_key = try a.dupe(u8, spec.name);
+        {
+            errdefer a.free(native_key);
+            var tensor = try Tensor.initFloat32(a, spec.name, spec.shape, values);
+            errdefer tensor.deinit();
+            try native_store.resident_weights.putNoClobber(a, native_key, .{ .tensor = tensor });
+        }
+        const metal_key = try a.dupe(u8, spec.name);
+        errdefer a.free(metal_key);
+        try metal_weights.insertWeightFromTensor(metal_key, &native_store.resident_weights.getPtr(native_key).?.tensor);
+    }
+    var metal_cb = try metal_weights.compute(std.testing.io);
+    defer metal_cb.deinit();
+    var native_compute = native.NativeCompute.init(a, &native_store, null);
+    defer native_compute.deinit();
+    const native_cb = native_compute.computeBackend();
+    const Scores = struct {
+        rows: [3][vocab]f32 = undefined,
+        count: usize = 0,
+        fn record(raw: *anyopaque, step: usize, logits: []const f32) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(self.count, step);
+            try std.testing.expectEqual(@as(usize, vocab), logits.len);
+            @memcpy(&self.rows[step], logits);
+            self.count += 1;
+        }
+    };
+    var adapters: [4 * hidden * 8]f32 = undefined;
+    for (&adapters, 0..) |*value, i| value.* = @sin(@as(f32, @floatFromInt(i)) * 0.29) * 0.05;
+    const encoder_ids = [_]i64{ 1, 2, 3 };
+    var encoded: [2]gpt.TappedHidden = undefined;
+    var encoded_count: usize = 0;
+    defer for (encoded[0..encoded_count]) |*result| result.deinit(a);
+    for ([_]*const CB{ &native_cb, &metal_cb }) |cb| {
+        var lora = try gpt.OwnedEncoderLora.upload(cb, a, config, &adapters, 1, 2);
+        defer lora.deinit(cb);
+        encoded[encoded_count] = try gpt.hiddenForwardTappedWithLora(cb, a, config, &encoder_ids, 1, encoder_ids.len, null, 1, &lora.lora);
+        encoded_count += 1;
+    }
+    for (encoded[0].last_hidden_state, encoded[1].last_hidden_state) |want, got|
+        try std.testing.expectApproxEqAbs(want, got, 0.001);
+    for (encoded[0].tap.?, encoded[1].tap.?) |want, got|
+        try std.testing.expectApproxEqAbs(want, got, 0.001);
+    var expected: Scores = .{};
+    var actual: Scores = .{};
+    var ids = [_]i64{ 1, 7, 2 };
+    var rendered = [_]u8{ 1, 7, 2 };
+    const text = PreparedText{ .allocator = a, .input_ids = &ids, .rendered = &rendered, .memory_start = 1, .recipe = .{ .memory_rows = 1, .memory_token_id = 7 } };
+    var features: [hidden]f32 = undefined;
+    for (&features, 0..) |*value, i| value.* = @cos(@as(f32, @floatFromInt(i)) * 0.19);
+    var mutex: std.atomic.Mutex = .unlocked;
+    const cap = 32 * 1024 * 1024;
+    for ([_]*const CB{ &native_cb, &metal_cb }, [_]*Scores{ &expected, &actual }) |cb, scores| {
+        const plan = try ResourcePlan.create(config, try kvBackend(cb.kind()), ids.len, rendered.len, 1, 2, .{});
+        var budget = memory.RunBudget.init(.{ .host_limit_bytes = cap, .backend_limit_bytes = cap, .combined_limit_bytes = cap });
+        var reservation = try plan.reserve(&budget);
+        defer reservation.deinit();
+        const rows = try cb.fromFloat32Shape(&features, &.{ 1, hidden });
+        defer cb.free(rows);
+        const decoder = Decoder{ .backend = cb, .config = config, .tokenizer = TestTokenizer.handle(), .execution_mutex = &mutex, .policy = if (cb.kind() == .metal) .metal_f32 else .native_f32_reference };
+        var result = try generate(a, decoder, &text, .{ .backend = cb, .tensor = rows }, .{ .max_new_tokens = 2, .teacher_forced_ids = &.{ 3, 4 }, .trace = .{ .context = scores, .logits = Scores.record } }, &reservation, .{}, .{ .native_call_policy = .in_process });
+        defer result.deinit();
+        try std.testing.expectEqualSlices(i32, &.{ 3, 4 }, result.token_ids.?);
+        try std.testing.expectEqual(@as(usize, 3), scores.count);
+    }
+    for (expected.rows, actual.rows) |want, got| {
+        for (want, got) |x, y| try std.testing.expectApproxEqAbs(x, y, 0.001);
+    }
 }
 
 test "memorilla generation virtual added token preserves text and tokenizer identity" {

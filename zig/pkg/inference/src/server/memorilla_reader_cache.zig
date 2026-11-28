@@ -23,6 +23,7 @@ const reader = @import("../models/memorilla_runtime.zig");
 const research = @import("../models/memorilla_research_runtime.zig");
 const span_head = @import("../models/memorilla_span_head_runtime.zig");
 const memory = @import("../runtime/root.zig").tier.memory;
+const BackendType = @import("../backends/backends.zig").BackendType;
 const Control = @import("../execution_control.zig").InferenceExecutionControl;
 const A = std.mem.Allocator;
 
@@ -76,7 +77,7 @@ pub fn ReaderCache(comptime Owner: type) type {
         const Self = @This();
         const runtime = Owner.runtime;
         const identity_files: []const []const u8 = &Owner.identity_files;
-        const Entry = struct { owner: Owner, lease: memory.AdmissionLease, identity: Identity, invalid: bool = false };
+        const Entry = struct { owner: Owner, lease: memory.AdmissionLease, identity: Identity, backend: BackendType, invalid: bool = false };
         mutex: std.atomic.Mutex = .unlocked,
         entry: ?Entry = null,
 
@@ -132,7 +133,7 @@ pub fn ReaderCache(comptime Owner: type) type {
             self.* = undefined;
         }
 
-        fn inspect(self: *Self, a: A, io: std.Io, directory: []const u8, limits: memory.Limits, control: Control) !Identity {
+        fn inspect(self: *Self, a: A, io: std.Io, directory: []const u8, limits: memory.Limits, control: Control, backend: BackendType) !Identity {
             const observed = identity(a, io, directory, identity_files, control) catch |err| switch (err) {
                 error.FileNotFound, error.NotDir => {
                     if (self.entry != null) {
@@ -144,7 +145,7 @@ pub fn ReaderCache(comptime Owner: type) type {
                 else => return err,
             };
             if (self.entry) |*entry| {
-                if (std.mem.eql(u8, &entry.identity.path, &observed.path)) {
+                if (entry.backend == backend and std.mem.eql(u8, &entry.identity.path, &observed.path)) {
                     if (!std.meta.eql(entry.identity, observed)) {
                         self.retire();
                         return error.ModelArtifactsChanging;
@@ -159,27 +160,36 @@ pub fn ReaderCache(comptime Owner: type) type {
         /// racing miss can reserve a temporary second lease, then reuse the
         /// winner and immediately refund its unused reservation.
         pub fn acquire(self: *Self, a: A, io: std.Io, manager: anytype, directory: []const u8, limits: memory.Limits, control: Control) !Handle {
+            return self.acquireForBackend(a, io, manager, directory, limits, control, .cuda);
+        }
+
+        pub fn acquireForBackend(self: *Self, a: A, io: std.Io, manager: anytype, directory: []const u8, limits: memory.Limits, control: Control, backend: BackendType) !Handle {
+            if (!@hasDecl(Owner, "openForBackend") and backend != .cuda) return error.UnsupportedMemorillaBackend;
             try runtime.requireLimits(limits);
             try control.lock(&self.mutex);
-            const first = self.inspect(a, io, directory, limits, control) catch |err| {
+            const first = self.inspect(a, io, directory, limits, control, backend) catch |err| {
                 self.mutex.unlock();
                 return err;
             };
             if (self.entry != null) return .{ .cache = self, .allocator = a, .io = io, .directory = directory };
             self.mutex.unlock();
-            var lease = try manager.acquireRunResourceAmounts(.gpu, limits, runtime.weightPlan());
+            const plan = if (@hasDecl(runtime, "weightPlanForBackend")) runtime.weightPlanForBackend(backend) else runtime.weightPlan();
+            var lease = try manager.acquireRunResourceAmounts(.gpu, limits, plan);
             var transferred = false;
             defer if (!transferred) lease.release();
             try control.lock(&self.mutex);
             errdefer self.mutex.unlock();
-            const before = try self.inspect(a, io, directory, limits, control);
+            const before = try self.inspect(a, io, directory, limits, control, backend);
             if (!std.meta.eql(first, before)) return error.ModelArtifactsChanging;
             if (self.entry == null) {
-                var owner = try Owner.open(a, io, directory, &lease, limits, control);
+                var owner = if (@hasDecl(Owner, "openForBackend"))
+                    try Owner.openForBackend(a, io, directory, &lease, limits, control, backend)
+                else
+                    try Owner.open(a, io, directory, &lease, limits, control);
                 errdefer owner.deinit();
                 const after = try identity(a, io, directory, identity_files, control);
                 if (!std.meta.eql(before, after)) return error.ModelArtifactsChanging;
-                self.entry = .{ .owner = owner, .lease = lease, .identity = after };
+                self.entry = .{ .owner = owner, .lease = lease, .identity = after, .backend = backend };
                 transferred = true;
             }
             return .{ .cache = self, .allocator = a, .io = io, .directory = directory };

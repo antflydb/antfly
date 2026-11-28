@@ -270,6 +270,17 @@ pub fn executionIdentity(profile: Profile) [64]u8 {
     return std.fmt.bytesToHex(hash.finalResult(), .lower);
 }
 
+pub fn executionIdentityForBackend(profile: Profile, backend: @import("../backends/backends.zig").BackendType) [64]u8 {
+    if (backend != .metal) return executionIdentity(profile);
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update("antfly.memorilla.execution.metal-f32.v1\x00");
+    hash.update(@tagName(profile));
+    hash.update(canonicalManifest(profile));
+    if (isResearch(profile)) hash.update("research-lock-in-directory") else hash.update(lock_bytes);
+    hash.update(question_recipe);
+    return std.fmt.bytesToHex(hash.finalResult(), .lower);
+}
+
 /// Exact `model_manifest.json` bytes a directory must carry for `profile`.
 pub fn canonicalManifest(profile: Profile) []const u8 {
     return switch (profile) {

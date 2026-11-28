@@ -631,3 +631,24 @@ Before enabling a deployment, evaluate representative answer quality and measure
 capacity for its workload. The released reader's exact latent-only operational
 QA remains unqualified. Serving stays disabled by default; database collection
 integration and Gemma training remain [separate work](../../plans/memorilla-native-memory.md).
+
+
+## Metal hybrid span-window serving
+
+On macOS, build inference with `-Dmetal=true` and set
+`ANTFLY_INFERENCE_REQUIRED_BACKEND=metal`. Use a `hybrid_research` profile
+whose pinned protocol has `record_kind: span-window`, with the managed
+Qwen3 encoder and decoder and the released memory-module bundle. Both the
+span-window and `read_mode: none` paths use the Metal profile. Supply the
+`model_identity` returned by that encoder on the same Metal server as
+`encoder_execution_identity`.
+
+The Metal profile uses F32 weights and fresh F32 decoder KV. Set finite host,
+device, combined, KV and scratch limits and provision memory for both model
+working sets. Leave the CUDA BF16 and fast-prefill research flags unset.
+The standalone released and copy17 research profiles still require CUDA.
+The Metal route is experimental pending an end-to-end run on the pinned
+checkpoints.
+
+The playground launcher accepts `BACKEND=metal` with the same bundle
+and tokenizer inputs as the CUDA launcher.

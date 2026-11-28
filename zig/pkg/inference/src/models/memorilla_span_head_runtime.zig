@@ -13,17 +13,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Device-resident Memorilla span head (docs/plans/memorilla-copy17-native.md
-//! 8.21): the `span-head.safetensors` of a hybrid span-window bundle, verified
-//! against `manifest.json` on load (`memorilla_span.Head.loadBundle`), uploaded
-//! once as F32 resident weights of its own CUDA compute and run per request
-//! on the device. `Owner.forward` computes what the host
-//! `memorilla_span.forward` computes (projection + LayerNorm, segment and
-//! position rows, the no-answer row, two pre-norm encoder layers with exact
-//! GELU, final LayerNorm, start/end logits) with cuBLASLt F32 GEMMs, the
-//! backend's LayerNorm/GELU/add and full self-attention on the tiled F32
-//! kernel; only the `[T + 1, 2]` logits come back to the host. Results agree
-//! with the host head to F32 rounding, not bit for bit.
+//! Device-resident Memorilla span head for a pinned hybrid span-window
+//! bundle. The owner caches F32 weights for CUDA or Metal and scores
+//! each request using projection, LayerNorm, exact GELU and full
+//! self-attention. Only the `[T + 1, 2]` logits return to the host.
 //!
 //! Cached per decoder by `memorilla_reader_cache.SpanHeadCache` (stat-fenced
 //! identity of the bundle directory, `manifest.json`, `protocol.json` and the
@@ -38,6 +31,8 @@ const c_file = @import("../util/c_file.zig");
 const memory = @import("../runtime/root.zig").tier.memory;
 const Control = @import("../execution_control.zig").InferenceExecutionControl;
 const cuda = if (build_options.enable_cuda) @import("../ops/cuda/cuda_compute.zig") else struct {};
+const metal = @import("memorilla_metal.zig");
+const BackendType = @import("../backends/backends.zig").BackendType;
 const A = std.mem.Allocator;
 const CB = ops.ComputeBackend;
 const CT = ops.CT;
@@ -58,6 +53,12 @@ pub fn weightPlan() memory.AdmissionAmounts {
         .backend_weight_bytes = max_weight_bytes,
         .backend_scratch_bytes = max_scratch_bytes,
     };
+}
+
+pub fn weightPlanForBackend(backend: BackendType) memory.AdmissionAmounts {
+    var plan = weightPlan();
+    if (backend == .metal) plan.host_weight_bytes += max_weight_bytes;
+    return plan;
 }
 
 pub fn requireLimits(limits: memory.Limits) !void {
@@ -134,7 +135,9 @@ pub const Owner = struct {
     pub const identity_files = [_][]const u8{ "manifest.json", "protocol.json", span.weights_file_name };
 
     allocator: A,
-    compute: if (build_options.enable_cuda) *cuda.CudaCompute else void,
+    compute: if (build_options.enable_cuda) ?*cuda.CudaCompute else void,
+    metal_weights: ?metal.Weights = null,
+    io: std.Io,
     geometry: Geometry,
     /// sha256 of `span-head.safetensors`.
     sha256: [64]u8,
@@ -146,11 +149,24 @@ pub const Owner = struct {
 
     /// Caller owns the GPU admission lease and must release it AFTER deinit.
     pub fn open(a: A, io: std.Io, directory: []const u8, admission: *const memory.AdmissionLease, limits: memory.Limits, control: Control) !Owner {
-        _ = io;
+        return openForBackend(a, io, directory, admission, limits, control, .cuda);
+    }
+
+    pub fn openForBackend(a: A, io: std.Io, directory: []const u8, admission: *const memory.AdmissionLease, limits: memory.Limits, control: Control, backend: BackendType) !Owner {
         try control.check();
         try requireAdmission(admission, limits);
-        if (comptime !build_options.enable_cuda) return error.CudaNotEnabled;
-        try @import("memorilla_qualification.zig").requireCudaEnvironment();
+        if (admission.amounts.host_weight_bytes < weightPlanForBackend(backend).host_weight_bytes)
+            return error.MemorillaReaderAdmissionRequired;
+        switch (backend) {
+            .cuda => {
+                if (comptime !build_options.enable_cuda) return error.CudaNotEnabled;
+                try @import("memorilla_qualification.zig").requireCudaEnvironment();
+            },
+            .metal => {
+                if (comptime !build_options.enable_metal) return error.MetalNotEnabled;
+            },
+            else => return error.UnsupportedMemorillaBackend,
+        }
         const backing = @import("antfly_platform").allocator.reclaimingScratch(a);
         var guard = try control.enterUninterruptible(.uninterruptible);
         defer guard.deinit();
@@ -160,6 +176,10 @@ pub const Owner = struct {
             span.Head.weightBytes(protocol) > max_weight_bytes) return error.UnsupportedMemorillaProfile;
         var head = try span.Head.loadBundle(backing, directory, protocol);
         defer head.deinit();
+        return fromHead(backing, io, &head, geometry, control, backend);
+    }
+
+    pub fn fromHead(backing: A, io: std.Io, head: *const span.Head, geometry: Geometry, control: Control, backend: BackendType) !Owner {
         try control.check();
         const null_row = try backing.dupe(f32, head.null_row);
         errdefer backing.free(null_row);
@@ -167,6 +187,14 @@ pub const Owner = struct {
         errdefer backing.free(position);
         const segment = try backing.dupe(f32, head.segment);
         errdefer backing.free(segment);
+        if (backend == .metal) {
+            var weights = try metal.Weights.init(backing);
+            errdefer weights.deinit();
+            try upload(backing, &weights, head, control);
+            try control.check();
+            return .{ .allocator = backing, .compute = if (build_options.enable_cuda) null else {}, .metal_weights = weights, .io = io, .geometry = geometry, .sha256 = head.sha256, .null_row = null_row, .position = position, .segment = segment };
+        }
+        if (comptime !build_options.enable_cuda) return error.CudaNotEnabled;
         const compute = try backing.create(cuda.CudaCompute);
         errdefer backing.destroy(compute);
         compute.* = try cuda.CudaCompute.init(backing);
@@ -174,18 +202,21 @@ pub const Owner = struct {
         if (compute.ctx.info.compute_major != 12 or compute.ctx.info.compute_minor != 1) return error.UnsupportedMemorillaDevice;
         compute.strict_f32_weights = true;
         compute.capture_gates = .{};
-        try upload(backing, compute, &head, control);
+        try upload(backing, compute, head, control);
         _ = compute.releaseMemorillaRequestResources() catch @panic("Memorilla span head load cleanup failed; worker restart required");
         if (compute.snapshotStats().resident_weight_bytes != geometry.deviceBytes()) return error.UnsupportedMemorillaPrecision;
         try control.check();
-        return .{ .allocator = backing, .compute = compute, .geometry = geometry, .sha256 = head.sha256, .null_row = null_row, .position = position, .segment = segment };
+        return .{ .allocator = backing, .compute = compute, .io = io, .geometry = geometry, .sha256 = head.sha256, .null_row = null_row, .position = position, .segment = segment };
     }
 
     pub fn deinit(self: *Owner) void {
         if (comptime build_options.enable_cuda) {
-            self.compute.deinit();
-            self.allocator.destroy(self.compute);
+            if (self.compute) |compute| {
+                compute.deinit();
+                self.allocator.destroy(compute);
+            }
         }
+        if (self.metal_weights) |*weights| weights.deinit();
         self.allocator.free(self.null_row);
         self.allocator.free(self.position);
         self.allocator.free(self.segment);
@@ -197,14 +228,21 @@ pub const Owner = struct {
     /// tensor is freed and the compute's request resources are released before
     /// this returns; on an error the caller retires the entry.
     pub fn forward(self: *Owner, a: A, protocol: span.Protocol, features: []const f32, counts: []const usize) !span.Logits {
-        if (comptime !build_options.enable_cuda) return error.CudaNotEnabled;
         if (!std.meta.eql(self.geometry, Geometry.of(protocol))) return error.ModelArtifactsChanging;
-        var logits = forwardDevice(self, a, features, counts) catch |err| {
-            _ = self.compute.releaseMemorillaRequestResources() catch {};
+        if (self.metal_weights) |*weights| {
+            const backend = try weights.compute(self.io);
+            defer backend.deinit();
+            return forwardDevice(self, &backend, a, features, counts);
+        }
+        if (comptime !build_options.enable_cuda) return error.CudaNotEnabled;
+        const compute = self.compute.?;
+        const backend = compute.computeBackend();
+        var logits = forwardDevice(self, &backend, a, features, counts) catch |err| {
+            _ = compute.releaseMemorillaRequestResources() catch {};
             return err;
         };
         errdefer logits.deinit();
-        _ = try self.compute.releaseMemorillaRequestResources();
+        _ = try compute.releaseMemorillaRequestResources();
         return logits;
     }
 };
@@ -281,7 +319,7 @@ fn shape2(rows: usize, cols: usize) ![2]i32 {
     return .{ std.math.cast(i32, rows) orelse return error.InvalidMemorillaStates, std.math.cast(i32, cols) orelse return error.InvalidMemorillaStates };
 }
 
-fn forwardDevice(owner: *Owner, a: A, features: []const f32, counts: []const usize) !span.Logits {
+fn forwardDevice(owner: *Owner, cb: *const CB, a: A, features: []const f32, counts: []const usize) !span.Logits {
     const g = owner.geometry;
     var rows: usize = 0;
     for (counts) |count| rows = try std.math.add(usize, rows, count);
@@ -312,8 +350,6 @@ fn forwardDevice(owner: *Owner, a: A, features: []const f32, counts: []const usi
     defer a.free(zero);
     @memset(zero, 0);
 
-    const backend = owner.compute.computeBackend();
-    const cb = &backend;
     if (cb.vtable.concatRows2D == null or cb.vtable.geluExact == null) return error.UnsupportedMemorillaBackend;
 
     var x = blk: {
@@ -348,7 +384,12 @@ fn forwardDevice(owner: *Owner, a: A, features: []const f32, counts: []const usi
             defer cb.free(k);
             const v = try linear(cb, try std.fmt.bufPrint(&buf, "blocks.{d}.v", .{i}), normed, n, h, h);
             defer cb.free(v);
-            const attended = try owner.compute.memorillaFullAttention(q, k, v, n, g.heads);
+            const attended = if (cb.kind() == .metal)
+                (try cb.scaledDotProductAttentionFull(q, k, v, null, 1, n, g.heads, h / g.heads)) orelse return error.UnsupportedMemorillaBackend
+            else if (comptime build_options.enable_cuda)
+                try owner.compute.?.memorillaFullAttention(q, k, v, n, g.heads)
+            else
+                return error.CudaNotEnabled;
             defer cb.free(attended);
             try residual(cb, &x, try linear(cb, try std.fmt.bufPrint(&buf, "blocks.{d}.out", .{i}), attended, n, h, h));
         }

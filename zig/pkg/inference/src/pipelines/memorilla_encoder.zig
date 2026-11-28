@@ -41,6 +41,7 @@ pub const research_lock_file = "memorilla_lock.json";
 pub const research_lock_max_bytes: usize = 1024 * 1024;
 
 pub const Producer = struct {
+    backend: @import("../backends/backends.zig").BackendType = .cuda,
     /// The actual qualification tag that produced these features.
     profile: qualified.Profile,
     publication: [32]u8,
@@ -102,7 +103,7 @@ fn isLowerHex(text: []const u8) bool {
 pub fn requireProducer(producer: Producer, expected_publication: [32]u8, expected: qualified.Profile) !void {
     if (producer.profile != expected or
         !std.mem.eql(u8, &producer.publication, &expected_publication) or
-        !std.mem.eql(u8, &producer.identity, &qualified.executionIdentity(expected)) or
+        !std.mem.eql(u8, &producer.identity, &qualified.executionIdentityForBackend(expected, producer.backend)) or
         !std.mem.eql(u8, &producer.recipe_sha256, &(try recipeSha256(expected))))
         return error.IncompatibleMemorillaProducer;
     if (expected == v1_profile) {
@@ -342,7 +343,7 @@ fn encodeImpl(a: A, handle: *const manager.ModelHandle, documents: []const []con
         entry.key = cache_key.?;
     };
     owns_lease = false;
-    return .{ .allocator = backing, .document_count = documents.len, .question_tokens = budget.question_tokens, .documents_fp16 = documents_fp16, .question_fp16 = question_fp16, .documents = document_features, .question = question_features, .question_text = question_text, .document_sha256 = document_sha256, .producer = .{ .profile = v1_profile, .publication = publication, .identity = identity, .source_lock_sha256 = v1SourceLockSha256(), .recipe_sha256 = recipe_hash }, .lease = lease };
+    return .{ .allocator = backing, .document_count = documents.len, .question_tokens = budget.question_tokens, .documents_fp16 = documents_fp16, .question_fp16 = question_fp16, .documents = document_features, .question = question_features, .question_text = question_text, .document_sha256 = document_sha256, .producer = .{ .backend = model.session.backend(), .profile = v1_profile, .publication = publication, .identity = identity, .source_lock_sha256 = v1SourceLockSha256(), .recipe_sha256 = recipe_hash }, .lease = lease };
 }
 
 // --- per-token (copy17 `tokens-dual`) encoder entry ---
@@ -741,7 +742,7 @@ pub fn encodeSpanTokenFeatures(a: A, handle: *const manager.ModelHandle, documen
         .counts = counts,
         .sources = sources,
         .seq_len = batch.seq_len,
-        .producer = .{ .profile = profile, .publication = publication, .identity = identity, .source_lock_sha256 = v1SourceLockSha256(), .recipe_sha256 = recipe_hash },
+        .producer = .{ .backend = model.session.backend(), .profile = profile, .publication = publication, .identity = identity, .source_lock_sha256 = v1SourceLockSha256(), .recipe_sha256 = recipe_hash },
         .adapter_sha256 = adapter.sha256,
         .lease = lease,
     };
@@ -980,7 +981,7 @@ fn encodeTokenFeaturesImpl(a: A, handle: *const manager.ModelHandle, documents: 
         .allocator = backing,
         .features = features,
         .question_tokens = batch.active[batch.batch - 1],
-        .producer = .{ .profile = profile, .publication = publication, .identity = identity, .source_lock_sha256 = source_lock, .recipe_sha256 = recipe_hash },
+        .producer = .{ .backend = model.session.backend(), .profile = profile, .publication = publication, .identity = identity, .source_lock_sha256 = source_lock, .recipe_sha256 = recipe_hash },
         .adapter_sha256 = if (options.adapter) |adapter| adapter.sha256 else null,
         .lease = lease,
     };

@@ -3504,7 +3504,7 @@ pub const LoadedModel = struct {
                 return err;
             },
         };
-        const identity = qualified.executionIdentity(profile);
+        const identity = qualified.executionIdentityForBackend(profile, self.session.backend());
         if (!std.mem.eql(u8, &expected, &actual) or self.embedding_identity == null or
             !std.mem.eql(u8, &identity, &self.embedding_identity.?))
         {
@@ -10275,7 +10275,7 @@ pub const ModelManager = struct {
                 },
                 .preserve_inline_specials = if (sp_tok) |sp| sp.preserve_inline_specials_after_literal_bos else false,
             } else null,
-            .embedding_identity = if (man.memorilla_profile) |profile| @import("../models/memorilla_qualification.zig").executionIdentity(profile) else if (embedding_snapshot) |snapshot| eg2_identity.forBackend(snapshot.digest, session.backend()) else null,
+            .embedding_identity = if (man.memorilla_profile) |profile| @import("../models/memorilla_qualification.zig").executionIdentityForBackend(profile, session.backend()) else if (embedding_snapshot) |snapshot| eg2_identity.forBackend(snapshot.digest, session.backend()) else null,
             .embedding_validation = if (embedding_snapshot) |snapshot| .{ .value = snapshot } else null,
             .manifest = man,
             .hf_tok = hf_tok,
@@ -11951,10 +11951,15 @@ fn estimateBaseModelLoadAdmission(
     laya_packed: bool,
 ) !ModelLoadAdmissionPlan {
     if (man.memorilla_profile) |profile| {
-        if (backend_runtime.backend != .cuda) return error.MemorillaRequiresCuda;
+        if (backend_runtime.backend != .cuda and backend_runtime.backend != .metal) return error.UnsupportedMemorillaBackend;
         const qualified = @import("../models/memorilla_qualification.zig");
         try qualified.requireRecipe(profile, man);
-        const amounts = try qualified.residencyPlan(man.allocator, profile, model_path);
+        var amounts = try qualified.residencyPlan(man.allocator, profile, model_path);
+        if (backend_runtime.backend == .metal) {
+            // The Metal store keeps widened host weights for lazy device upload.
+            amounts.peak.host_weight_bytes = try std.math.add(usize, amounts.peak.host_weight_bytes, amounts.peak.backend_weight_bytes);
+            amounts.resident.host_weight_bytes = amounts.peak.host_weight_bytes;
+        }
         return .{ .peak = amounts.peak, .resident = amounts.resident };
     }
     const weights = try estimateModelArtifactBytes(man);
@@ -12352,15 +12357,30 @@ fn memorillaBackendOrder(
         scratch[0] = .cuda;
         return scratch;
     };
-    return error.MemorillaRequiresCuda;
+    for (candidates) |candidate| if (candidate == .metal) {
+        scratch[0] = .metal;
+        return scratch;
+    };
+    return error.UnsupportedMemorillaBackend;
 }
 
-test "Memorilla managed models require CUDA without changing ordinary fallback order" {
+pub fn memorillaServingBackend(manager: *const ModelManager, control: InferenceExecutionControl) !backends.BackendType {
+    const sessions = &manager.session_manager;
+    var available_scratch: backends.BackendOrderBuffer = undefined;
+    const available = try sessions.executionBackendOrder(&available_scratch, sessions.preferred_backends, control);
+    var required_scratch: [1]backends.BackendType = undefined;
+    const candidates = try sessions.requiredBackendCandidates(available, &required_scratch);
+    var scratch: [1]backends.BackendType = undefined;
+    return (try memorillaBackendOrder(.qwen3_encoder_f32_v1, candidates, &scratch))[0];
+}
+
+test "Memorilla managed models allow Metal without changing ordinary fallback order" {
     var scratch: [1]backends.BackendType = undefined;
     const ordinary: []const backends.BackendType = &.{ .native, .cuda, .metal };
     try std.testing.expectEqualSlices(backends.BackendType, ordinary, try memorillaBackendOrder(null, ordinary, &scratch));
     try std.testing.expectEqualSlices(backends.BackendType, &.{.cuda}, try memorillaBackendOrder(.qwen3_encoder_f32_v1, ordinary, &scratch));
-    try std.testing.expectError(error.MemorillaRequiresCuda, memorillaBackendOrder(.qwen3_decoder_f32_kv_f32_v1, &.{ .native, .metal }, &scratch));
+    try std.testing.expectEqualSlices(backends.BackendType, &.{.metal}, try memorillaBackendOrder(.qwen3_decoder_f32_kv_f32_v1, &.{ .native, .metal }, &scratch));
+    try std.testing.expectError(error.UnsupportedMemorillaBackend, memorillaBackendOrder(.qwen3_decoder_f32_kv_f32_v1, &.{.native}, &scratch));
 }
 
 fn loadSessionForPreferredBackends(

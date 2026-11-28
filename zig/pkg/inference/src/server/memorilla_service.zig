@@ -404,7 +404,7 @@ fn generateImpl(a: A, io: std.Io, manager: *manager_mod.ModelManager, profile: P
     var reader_scope = try execution.Scope.acquire(control, .{ .mutex = &reader.execution_mutex });
     defer reader_scope.deinit();
     var reader_physical: PhysicalBudgetScope = if (comptime @import("build_options").enable_cuda)
-        try reader.compute.beginMemorillaDeviceBudget(reader_request.backendTotalBytes())
+        try reader.compute.?.beginMemorillaDeviceBudget(reader_request.backendTotalBytes())
     else
         return error.CudaNotEnabled;
     defer reader_physical.deinit();
@@ -436,7 +436,7 @@ fn generateImpl(a: A, io: std.Io, manager: *manager_mod.ModelManager, profile: P
     errdefer result.deinit();
     if (comptime @import("build_options").enable_cuda) {
         if (options.reader_physical_resources) |record| {
-            const snapshot = reader.compute.ctx.device_allocations.snapshot();
+            const snapshot = reader.compute.?.ctx.device_allocations.snapshot();
             try record(options.context, .{ .baseline = reader_physical.baseline, .held_transient_bytes = reader_request.backendTotalBytes(), .limit = snapshot.limit, .live = snapshot.live, .lifetime_peak = snapshot.peak });
         }
     }

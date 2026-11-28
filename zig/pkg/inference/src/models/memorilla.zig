@@ -580,6 +580,62 @@ const TinyBundle = struct {
     }
 };
 
+test "Memorilla Metal released-reader layout matches native soft rows" {
+    if (comptime !@import("build_options").enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    try TinyBundle.write(a, io, temp.dir, "pooled", released_encoder_pooling, null, TinyBundle.protocol_json);
+    const directory = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", temp.sub_path[0..], "pooled" });
+    defer a.free(directory);
+    var bundle = try Bundle.open(a, directory, true);
+    defer bundle.deinit();
+    var store = try bundle.loadFloat32Store();
+    defer store.deinitOwned();
+    var bytes: usize = 0;
+    var weights = store.resident_weights.valueIterator();
+    while (weights.next()) |weight| {
+        const values = weight.tensor.asFloat32Mut();
+        for (values, 0..) |*value, i| value.* = @cos(@as(f32, @floatFromInt(i + 1)) * 0.23) * 0.2;
+        bytes += weight.tensor.data.len;
+    }
+    const Compare = struct {
+        fn run(cb: *const @import("../ops/ops.zig").ComputeBackend, config: Config) ![]f32 {
+            const docs = try cb.fromFloat32Shape(&.{ 0, 1, 2, 3, 4, 5, 6, 7, 7, 6, 5, 4, 3, 2, 1, 0 }, &.{ 2, TinyBundle.dim });
+            defer cb.free(docs);
+            const question = try cb.fromFloat32Shape(&.{ 1, 0, 0, 1, 0, 1, 0, 1 }, &.{ 1, TinyBundle.dim });
+            defer cb.free(question);
+            const output = try @import("../pipelines/memorilla.zig").forward(cb, a, config, .{
+                .documents = docs,
+                .question = question,
+                .padding_mask = &.{ false, false },
+                .batch = 1,
+                .num_documents = 2,
+            }, null);
+            defer cb.free(output);
+            return cb.toFloat32(output, a);
+        }
+    };
+    const expected = blk: {
+        var compute = @import("../ops/native_compute.zig").NativeCompute.init(a, &store, null);
+        defer compute.deinit();
+        break :blk try Compare.run(&compute.computeBackend(), bundle.config);
+    };
+    defer a.free(expected);
+    var resident = try @import("memorilla_metal.zig").Weights.init(a);
+    defer resident.deinit();
+    try resident.adopt(&store, bytes);
+    try std.testing.expectEqual(@as(usize, 0), store.resident_weights.count());
+    var cb = try resident.compute(io);
+    defer cb.deinit();
+    const actual = try Compare.run(&cb, bundle.config);
+    defer a.free(actual);
+    try std.testing.expectEqual(expected.len, actual.len);
+    for (expected, actual) |want, got| try std.testing.expectApproxEqAbs(want, got, 0.0003);
+}
+
 test "memorilla research bundle verifies its pinned files and reads the protocol" {
     const a = std.testing.allocator;
     const io = std.testing.io;

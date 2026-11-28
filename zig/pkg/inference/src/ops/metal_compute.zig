@@ -1208,6 +1208,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
     allocator: std.mem.Allocator,
     require_f32_linears: bool = false,
+    /// Widen loaded dense tensors instead of handing 16-bit weights to
+    /// projection and token-lookup kernels.
+    force_f32_dense_weights: bool = false,
     require_prepared_vision: bool = false,
     require_qwen_vision_resident: bool = false,
     embedding_stage_suspended: bool = false,
@@ -5087,7 +5090,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     }
 
     fn nativeDenseLinearBytesForRuntime(self: *MetalCompute, name: []const u8, tensor: *const tensor_mod.Tensor) !?NativeDenseBytes {
-        _ = self;
+        if (self.force_f32_dense_weights) return null;
         const position_table = std.mem.eql(u8, name, "vision_tower.patch_embedder.position_embedding_table") and tensor.shape.len == 3 and tensor.shape[0] == 2;
         const eligible = (tensor.dtype == .bf16 or tensor.dtype == .f16) and (tensor.shape.len == 2 or position_table);
         if (getenvBool("TERMITE_METAL_TRACE_DENSE_LINEAR_PREPARE") and (eligible or tensor.shape.len == 2)) {

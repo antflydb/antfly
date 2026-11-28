@@ -1163,13 +1163,12 @@ test "Memorilla span protocol parses span fields and rejects others" {
 
 /// A tiny head with deterministic weights (the Python reference values in
 /// the forward test come from the same formula).
-fn tinyHead(a: A) !Head {
-    const protocol = Protocol{ .window_tokens = 4, .left_fraction = 0.5, .max_span_tokens = 3, .gate_threshold = 0, .gate_policy = .always, .width = 6, .hidden = 4, .layers = 1, .heads = 2, .max_positions = 3, .max_documents = 2 };
+fn tinyHead(a: A, hidden: usize, heads: usize) !Head {
     var head = Head{
         .allocator = a,
         .width = 6,
-        .hidden = 4,
-        .heads = 2,
+        .hidden = hidden,
+        .heads = heads,
         .max_positions = 3,
         .max_documents = 2,
         .project_w = &.{},
@@ -1200,37 +1199,36 @@ fn tinyHead(a: A) !Head {
             return values;
         }
     }.make;
-    head.project_w = try fill(&head, 4 * 6, &counter);
-    head.project_b = try fill(&head, 4, &counter);
-    head.project_ln_w = try fill(&head, 4, &counter);
-    head.project_ln_b = try fill(&head, 4, &counter);
-    head.segment = try fill(&head, 2 * 4, &counter);
-    head.position = try fill(&head, 4 * 4, &counter);
-    head.null_row = try fill(&head, 4, &counter);
+    head.project_w = try fill(&head, hidden * 6, &counter);
+    head.project_b = try fill(&head, hidden, &counter);
+    head.project_ln_w = try fill(&head, hidden, &counter);
+    head.project_ln_b = try fill(&head, hidden, &counter);
+    head.segment = try fill(&head, 2 * hidden, &counter);
+    head.position = try fill(&head, 4 * hidden, &counter);
+    head.null_row = try fill(&head, hidden, &counter);
     const b = &head.blocks[0];
-    b.in_w = try fill(&head, 12 * 4, &counter);
-    b.in_b = try fill(&head, 12, &counter);
-    b.out_w = try fill(&head, 4 * 4, &counter);
-    b.out_b = try fill(&head, 4, &counter);
-    b.l1_w = try fill(&head, 16 * 4, &counter);
-    b.l1_b = try fill(&head, 16, &counter);
-    b.l2_w = try fill(&head, 4 * 16, &counter);
-    b.l2_b = try fill(&head, 4, &counter);
-    b.n1_w = try fill(&head, 4, &counter);
-    b.n1_b = try fill(&head, 4, &counter);
-    b.n2_w = try fill(&head, 4, &counter);
-    b.n2_b = try fill(&head, 4, &counter);
-    head.norm_w = try fill(&head, 4, &counter);
-    head.norm_b = try fill(&head, 4, &counter);
-    head.out_w = try fill(&head, 8, &counter);
+    b.in_w = try fill(&head, 3 * hidden * hidden, &counter);
+    b.in_b = try fill(&head, 3 * hidden, &counter);
+    b.out_w = try fill(&head, hidden * hidden, &counter);
+    b.out_b = try fill(&head, hidden, &counter);
+    b.l1_w = try fill(&head, 4 * hidden * hidden, &counter);
+    b.l1_b = try fill(&head, 4 * hidden, &counter);
+    b.l2_w = try fill(&head, 4 * hidden * hidden, &counter);
+    b.l2_b = try fill(&head, hidden, &counter);
+    b.n1_w = try fill(&head, hidden, &counter);
+    b.n1_b = try fill(&head, hidden, &counter);
+    b.n2_w = try fill(&head, hidden, &counter);
+    b.n2_b = try fill(&head, hidden, &counter);
+    head.norm_w = try fill(&head, hidden, &counter);
+    head.norm_b = try fill(&head, hidden, &counter);
+    head.out_w = try fill(&head, 2 * hidden, &counter);
     head.out_b = try fill(&head, 2, &counter);
-    _ = protocol;
     return head;
 }
 
 test "Memorilla span head forward matches the PyTorch reference on a tiny head" {
     const a = std.testing.allocator;
-    var head = try tinyHead(a);
+    var head = try tinyHead(a, 4, 2);
     defer head.deinit();
     // Three document tokens in two documents plus one beyond the position
     // table (clamped), features i/7 - 0.4.
@@ -1245,6 +1243,29 @@ test "Memorilla span head forward matches the PyTorch reference on a tiny head" 
     const want_end = [_]f32{ 0.14552, 0.21032, 0.07271, 0.20211, 0.22415 };
     for (logits.start, want_start) |got, want| try std.testing.expectApproxEqAbs(want, got, 2e-4);
     for (logits.end, want_end) |got, want| try std.testing.expectApproxEqAbs(want, got, 2e-4);
+}
+
+test "Memorilla Metal span head matches the host oracle" {
+    if (comptime !@import("build_options").enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+    const device = @import("../models/memorilla_span_head_runtime.zig");
+    const a = std.testing.allocator;
+    const protocol = Protocol{ .window_tokens = 4, .left_fraction = 0.5, .max_span_tokens = 3, .gate_threshold = 0, .gate_policy = .always, .width = 6, .hidden = 128, .layers = 1, .heads = 1, .max_positions = 3, .max_documents = 2 };
+    var head = try tinyHead(a, protocol.hidden, protocol.heads);
+    defer head.deinit();
+    var owner = try device.Owner.fromHead(a, std.testing.io, &head, device.Geometry.of(protocol), .{}, .metal);
+    defer owner.deinit();
+    var features: [5 * 6]f32 = undefined;
+    for (&features, 0..) |*value, i| value.* = @as(f32, @floatFromInt(i % 7)) / 7 - 0.4;
+    for ([_]usize{ 4, 5 }) |rows| {
+        const counts = &.{ 2, rows - 2 };
+        var expected = try forward(a, null, &head, features[0 .. rows * 6], counts);
+        defer expected.deinit();
+        var actual = try owner.forward(a, protocol, features[0 .. rows * 6], counts);
+        defer actual.deinit();
+        for (expected.start, actual.start) |want, got| try std.testing.expectApproxEqAbs(want, got, 3e-4);
+        for (expected.end, actual.end) |want, got| try std.testing.expectApproxEqAbs(want, got, 3e-4);
+    }
 }
 
 const span_protocol_base =

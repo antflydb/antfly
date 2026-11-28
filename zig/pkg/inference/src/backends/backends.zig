@@ -404,7 +404,7 @@ pub const SessionManager = struct {
 
         if (self.gliner_cuda_precision != null and self.a4b_inference_request != null) return error.IncompatibleCudaLoadPolicies;
         for (effective_backends) |backend| {
-            if (memorilla_profile != null and backend != .cuda) continue;
+            if (memorilla_profile != null and backend != .cuda and backend != .metal) continue;
             if (self.gliner_cuda_precision != null and backend != .cuda) continue;
             if (fail_closed_cuda_a4b and !backend.supportsA4bSession()) {
                 std.log.err(
@@ -469,7 +469,10 @@ pub const SessionManager = struct {
                         continue;
                     }
                 else if (build_options.enable_metal)
-                    self.createDirectSession(source, .metal) catch |err| {
+                    (if (memorilla_profile != null and self.a4b_inference_request == null)
+                        session_factory.createMetalSessionWithManagedMemorillaProfile(self.allocator, model_path, self.kernel_jit, self.kernel_jit_load_context, self.model_load_control, if (manifest) |*m| m else null)
+                    else
+                        self.createDirectSession(source, .metal)) catch |err| {
                         std.log.err("Metal session create failed for {s}: {s}", .{ model_path, @errorName(err) });
                         if (self.kernel_jit.qualified_profile_path != null or self.kernel_jit.profile_capture_only) return err;
                         if (kernel_jit_mod.isRequiredFailure(self.kernel_jit.mode, err)) return err;

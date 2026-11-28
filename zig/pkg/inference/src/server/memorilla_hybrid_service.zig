@@ -66,6 +66,7 @@ const PhysicalBudgetScope = if (@import("build_options").enable_cuda) @import(".
     fn deinit(_: *@This()) void {}
 };
 const A = std.mem.Allocator;
+const BackendType = @import("../backends/backends.zig").BackendType;
 
 pub const Profile = common.Profile;
 /// `encoder` is the stock managed encoder (both passes), `decoder` the
@@ -563,7 +564,8 @@ pub fn validateInputs(profile: Profile, question: []const u8, documents: []const
     if (profile.reader_kind != .hybrid_research or profile.released_memory_module_path == null) return error.UnsupportedMemorillaProfile;
     if (question.len > grounding.max_document_bytes) return error.MemorillaTextLimitExceeded;
     _ = try qualified.canonicalQuestion(question);
-    if (!std.mem.eql(u8, identity, &qualified.executionIdentity(encoder_profile))) return error.IncompatibleMemorillaProducer;
+    if (!std.mem.eql(u8, identity, &qualified.executionIdentity(encoder_profile)) and
+        !std.mem.eql(u8, identity, &qualified.executionIdentityForBackend(encoder_profile, .metal))) return error.IncompatibleMemorillaProducer;
     if (max_new_tokens == 0 or max_new_tokens > profile.max_new_tokens) return error.MemorillaGenerationLimitExceeded;
     if (documents.len == 0) return error.EmptyMemorillaCollection;
     if (documents.len > profile.max_documents) return error.MemorillaCollectionBudgetExceeded;
@@ -670,7 +672,10 @@ fn generateImpl(a: A, io: std.Io, manager: *manager_mod.ModelManager, profile: P
     try validateInputs(profile, question, documents, identity, max_new_tokens);
     try common.validateRequestLimits(options.request_limits, documents.len, max_new_tokens);
     try requireLimits(limits);
-    try qualified.requireCudaEnvironment();
+    const serving_backend = try manager_mod.memorillaServingBackend(manager, control);
+    if (!std.mem.eql(u8, identity, &qualified.executionIdentityForBackend(encoder_profile, serving_backend)))
+        return error.IncompatibleMemorillaProducer;
+    if (serving_backend == .cuda) try qualified.requireCudaEnvironment();
     if (paths.encoder.publication == null or paths.decoder.publication == null) return error.MemorillaManagedProducerRequired;
     try paths.encoder.verify(a, io);
     try paths.decoder.verify(a, io);
@@ -681,9 +686,10 @@ fn generateImpl(a: A, io: std.Io, manager: *manager_mod.ModelManager, profile: P
     // A span-window bundle (plan 8.11) replaces the copy17 record half.
     if (try readSpanProtocol(platform.allocator.reclaimingScratch(a), profile.memory_module_path)) |span_protocol| {
         if (options.span_soft_only)
-            return generateSoftOnlyImpl(a, io, manager, profile, paths, canonical, documents, max_new_tokens, limits, control, options, span_protocol, released_directory);
-        return generateSpanImpl(a, io, manager, profile, paths, canonical, documents, max_new_tokens, limits, control, options, span_protocol, released_directory);
+            return generateSoftOnlyImpl(a, io, manager, profile, paths, canonical, documents, max_new_tokens, limits, control, options, span_protocol, released_directory, serving_backend);
+        return generateSpanImpl(a, io, manager, profile, paths, canonical, documents, max_new_tokens, limits, control, options, span_protocol, released_directory, serving_backend);
     }
+    if (serving_backend != .cuda) return error.UnsupportedMemorillaProfile;
     // Read modes (and the soft-only comparison) are span-bundle features.
     if (options.span_read_mode != null or options.span_soft_only) return error.UnsupportedMemorillaReadMode;
     // Stored soft-half vectors are a span-bundle feature.
@@ -813,7 +819,7 @@ fn generateImpl(a: A, io: std.Io, manager: *manager_mod.ModelManager, profile: P
         var soft_scope = try execution.Scope.acquire(control, .{ .mutex = &reader.execution_mutex });
         defer soft_scope.deinit();
         var soft_physical: PhysicalBudgetScope = if (comptime @import("build_options").enable_cuda)
-            try reader.compute.beginMemorillaDeviceBudget(soft_request.backendTotalBytes())
+            try reader.compute.?.beginMemorillaDeviceBudget(soft_request.backendTotalBytes())
         else
             return error.CudaNotEnabled;
         defer soft_physical.deinit();
@@ -1243,7 +1249,7 @@ fn spanPassHead(a: A, io: std.Io, manager: *manager_mod.ModelManager, decoder_mo
         defer logits.deinit();
         return span_window.bestSpan(logits.start, logits.end, bounds, protocol.max_span_tokens);
     }
-    var head_handle = try decoder_model.memorilla_span_head_device_cache.acquire(decoder_model.allocator, io, manager, profile.memory_module_path, limits, control);
+    var head_handle = try decoder_model.memorilla_span_head_device_cache.acquireForBackend(decoder_model.allocator, io, manager, profile.memory_module_path, limits, control, decoder_model.session.backend());
     defer head_handle.deinit();
     const owner = head_handle.owner();
     head_sha256.* = owner.sha256;
@@ -1305,7 +1311,7 @@ fn finishSpanRead(a: A, io: std.Io, manager: *manager_mod.ModelManager, decoder_
     return ms;
 }
 
-fn generateSpanImpl(a: A, io: std.Io, manager: *manager_mod.ModelManager, profile: Profile, paths: Paths, canonical: []const u8, documents: []const []const u8, max_new_tokens: usize, limits: memory.Limits, control: Control, options: Options, protocol: span_window.Protocol, released_directory: []const u8) !OwnedResult {
+fn generateSpanImpl(a: A, io: std.Io, manager: *manager_mod.ModelManager, profile: Profile, paths: Paths, canonical: []const u8, documents: []const []const u8, max_new_tokens: usize, limits: memory.Limits, control: Control, options: Options, protocol: span_window.Protocol, released_directory: []const u8, serving_backend: BackendType) !OwnedResult {
     const encoder_control = paths.encoder.bind(control);
     const decoder_control = paths.decoder.bind(control);
     const policy = options.span_gate_policy orelse protocol.gate_policy;
@@ -1354,8 +1360,8 @@ fn generateSpanImpl(a: A, io: std.Io, manager: *manager_mod.ModelManager, profil
     defer closed_text.deinit();
     try common.validateInputTokenLimit(options.request_limits, @max(open_text.input_ids.len, closed_text.input_ids.len));
     if (options.prepared_text) |callback| try callback(options.context, &open_text);
-    const open_plan = try decode.ResourcePlan.create(config, .cuda, open_text.input_ids.len, open_text.rendered.len, admitted_open_rows, max_new_tokens, bounded);
-    const closed_plan = try decode.ResourcePlan.create(config, .cuda, closed_text.input_ids.len, closed_text.rendered.len, slots, max_new_tokens, bounded);
+    const open_plan = try decode.ResourcePlan.create(config, try decode.kvBackend(serving_backend), open_text.input_ids.len, open_text.rendered.len, admitted_open_rows, max_new_tokens, bounded);
+    const closed_plan = try decode.ResourcePlan.create(config, try decode.kvBackend(serving_backend), closed_text.input_ids.len, closed_text.rendered.len, slots, max_new_tokens, bounded);
 
     // Admission: either decoder plan plus the embedding-lookup transients;
     // the released reader over the pooled rows plus the composed memory rows
@@ -1395,6 +1401,7 @@ fn generateSpanImpl(a: A, io: std.Io, manager: *manager_mod.ModelManager, profil
     var encoder_handle = try common.acquireResidentModel(manager, paths.encoder.path, encoder_control);
     defer encoder_handle.release();
     const encoder_model = encoder_handle.get();
+    if (encoder_model.session.backend() != serving_backend) return error.UnsupportedMemorillaBackend;
     try encoder_model.verifyMemorillaIdentityWithControl(encoder_control);
     try notify(options, .encoder_loaded, manager);
     var timer = SpanTimer.start(io);
@@ -1451,6 +1458,7 @@ fn generateSpanImpl(a: A, io: std.Io, manager: *manager_mod.ModelManager, profil
     var decoder_handle = try common.acquireResidentModel(manager, paths.decoder.path, decoder_control);
     defer decoder_handle.release();
     const decoder_model = decoder_handle.get();
+    if (decoder_model.session.backend() != serving_backend) return error.UnsupportedMemorillaBackend;
     try decoder_model.verifyMemorillaIdentityWithControl(decoder_control);
     try notify(options, .decoder_loaded, manager);
 
@@ -1489,7 +1497,7 @@ fn generateSpanImpl(a: A, io: std.Io, manager: *manager_mod.ModelManager, profil
         // prompt and plan.
         var narrowed = try decode.prepareText(backing, assets.tokenizer(), template, config, user_text, .{ .system_prompt = open_system, .memory_rows = open_rows }, bounded, decoder_control);
         errdefer narrowed.deinit();
-        const narrowed_plan = try decode.ResourcePlan.create(config, .cuda, narrowed.input_ids.len, narrowed.rendered.len, open_rows, max_new_tokens, bounded);
+        const narrowed_plan = try decode.ResourcePlan.create(config, try decode.kvBackend(serving_backend), narrowed.input_ids.len, narrowed.rendered.len, open_rows, max_new_tokens, bounded);
         reservation.deinit();
         reservation = try narrowed_plan.reserve(&decoder_budget);
         open_text.deinit();
@@ -1540,7 +1548,7 @@ fn generateSpanImpl(a: A, io: std.Io, manager: *manager_mod.ModelManager, profil
     // The released reader produces the soft rows and stays borrowed through
     // generation: its backend carries the composed memory rows (the decoder
     // compute must hold only resident weights when generation starts).
-    var soft_handle = try decoder_model.memorilla_reader_cache.acquire(decoder_model.allocator, io, manager, released_directory, limits, control);
+    var soft_handle = try decoder_model.memorilla_reader_cache.acquireForBackend(decoder_model.allocator, io, manager, released_directory, limits, control, serving_backend);
     defer soft_handle.deinit();
     var soft_clean = false;
     defer if (!soft_clean) soft_handle.invalidate();
@@ -1549,15 +1557,16 @@ fn generateSpanImpl(a: A, io: std.Io, manager: *manager_mod.ModelManager, profil
     if (!reader.bundle.release or reader.bundle.config.num_memories != slots or reader.bundle.config.output_dim != config.hidden_size) return error.UnsupportedMemorillaProfile;
     const soft_module_sha256 = reader.bundle.weights_sha256;
     var soft_backend = try reader.computeBackendWithBudget(&soft_budget);
+    defer if (serving_backend == .metal) soft_backend.deinit();
     soft_backend.execution_control = control;
     soft_backend.execution_budget = &soft_budget;
     var soft_scope = try execution.Scope.acquire(control, .{ .mutex = &reader.execution_mutex });
     defer soft_scope.deinit();
-    var soft_physical: PhysicalBudgetScope = if (comptime @import("build_options").enable_cuda)
-        try reader.compute.beginMemorillaDeviceBudget(soft_request.backendTotalBytes())
-    else
-        return error.CudaNotEnabled;
-    defer soft_physical.deinit();
+    var soft_physical: ?PhysicalBudgetScope = null;
+    if (comptime @import("build_options").enable_cuda) {
+        if (serving_backend == .cuda) soft_physical = try reader.compute.?.beginMemorillaDeviceBudget(soft_request.backendTotalBytes());
+    }
+    defer if (soft_physical) |*physical| physical.deinit();
     try soft_scope.bind(soft_backend);
     const output = blk: {
         defer {
@@ -1575,26 +1584,37 @@ fn generateSpanImpl(a: A, io: std.Io, manager: *manager_mod.ModelManager, profil
             defer soft_backend.free(query);
             try encoder_model.verifyMemorillaIdentityWithControl(encoder_control);
             try decoder_model.verifyMemorillaIdentityWithControl(decoder_control);
-            try factory.requireMemorillaCudaExecution(&soft_backend);
+            if (serving_backend == .cuda) try factory.requireMemorillaCudaExecution(&soft_backend);
             const memories = try memory_pipeline.forward(&soft_backend, backing, reader.bundle.config, .{ .documents = docs, .question = query, .padding_mask = mask, .batch = 1, .num_documents = rows, .max_document_rows = qualified.max_documents }, null);
             defer soft_backend.free(memories);
-            try factory.requireMemorillaCudaExecution(&soft_backend);
+            if (serving_backend == .cuda) try factory.requireMemorillaCudaExecution(&soft_backend);
             break :inner try soft_backend.toFloat32(memories, backing);
         };
         defer backing.free(soft_rows);
         if (soft_rows.len != slots * config.hidden_size) return error.InvalidMemorillaMemoryRows;
         timer.mark("soft_rows");
         try control.check();
-        var decoder_backend = try factory.getCoordinatedCudaComputeBackend(decoder_model.session, &decoder_budget, @intFromPtr(&reservation));
+        // Take the model lock before leasing its shared Metal provider, as
+        // other generation routes do. The Metal compute is exclusive until
+        // deinit, so its calls can use the request-local lock.
+        var metal_scope = if (serving_backend == .metal)
+            try execution.Scope.acquire(decoder_control, .{ .mutex = decoder_model.nativeGenerationMutex(), .lane = &decoder_model.native_reader_execution_lane })
+        else
+            null;
+        defer if (metal_scope) |*scope| scope.deinit();
+        var metal_mutex: std.atomic.Mutex = .unlocked;
+        const decoder_mutex = if (metal_scope != null) &metal_mutex else decoder_model.nativeGenerationMutex();
+        const decoder_lane = if (metal_scope != null) null else &decoder_model.native_reader_execution_lane;
+        var decoder_backend = try factory.getMemorillaDecoderBackend(decoder_model.session, backing, &decoder_budget, @intFromPtr(&reservation));
         defer decoder_backend.deinit();
         // The window's decoder input-embedding rows (gate open only).
         const window_values: []f32 = if (gate == .closed) &.{} else rows: {
             decoder_backend.execution_control = decoder_control;
             decoder_backend.execution_budget = &decoder_budget;
-            var decoder_scope = try execution.Scope.acquire(control, .{ .mutex = decoder_model.nativeGenerationMutex(), .lane = &decoder_model.native_reader_execution_lane });
+            var decoder_scope = try execution.Scope.acquire(control, .{ .mutex = decoder_mutex, .lane = decoder_lane });
             defer decoder_scope.deinit();
             try decoder_scope.bind(decoder_backend);
-            try factory.requireMemorillaCudaExecution(&decoder_backend);
+            if (serving_backend == .cuda) try factory.requireMemorillaCudaExecution(&decoder_backend);
             const wide = try backing.alloc(i64, window_rows);
             defer backing.free(wide);
             for (record_ids, wide) |id, *w| {
@@ -1610,7 +1630,7 @@ fn generateSpanImpl(a: A, io: std.Io, manager: *manager_mod.ModelManager, profil
                 backing.free(values);
                 return error.UnexpectedEmbeddingTable;
             }
-            try factory.requireMemorillaCudaExecution(&decoder_backend);
+            if (serving_backend == .cuda) try factory.requireMemorillaCudaExecution(&decoder_backend);
             break :rows values;
         };
         defer if (gate == .open) backing.free(window_values);
@@ -1627,8 +1647,8 @@ fn generateSpanImpl(a: A, io: std.Io, manager: *manager_mod.ModelManager, profil
         const rows_ct = try soft_backend.fromFloat32Shape(composed, &.{ @intCast(memory_rows), @intCast(config.hidden_size) });
         defer soft_backend.free(rows_ct);
         timer.mark("window_rows");
-        var decoder = try decode.Decoder.fromQualifiedSession(decoder_model.session, &decoder_backend, assets.tokenizer(), decoder_model.nativeGenerationMutex());
-        decoder.execution_lane = &decoder_model.native_reader_execution_lane;
+        var decoder = try decode.Decoder.fromQualifiedSession(decoder_model.session, &decoder_backend, assets.tokenizer(), decoder_mutex);
+        decoder.execution_lane = decoder_lane;
         defer timer.mark("generate");
         break :blk try decode.generate(a, decoder, text, .{ .backend = &soft_backend, .tensor = rows_ct }, .{ .max_new_tokens = max_new_tokens, .teacher_forced_ids = options.teacher_forced_ids, .trace = options.trace, .ignore_eos = options.ignore_eos, .draft_text = span_draft, .draft_context = if (gate == .open) record_text else null }, &reservation, bounded, decoder_control);
     };
@@ -1676,8 +1696,8 @@ fn generateSpanImpl(a: A, io: std.Io, manager: *manager_mod.ModelManager, profil
         .record_gate = gate,
         .canonicalized = canonicalized,
         .memory_tokens = if (gate == .open) open_rows else slots,
-        .encoder_execution_identity = qualified.executionIdentity(encoder_profile),
-        .decoder_execution_identity = qualified.executionIdentity(decoder_profile),
+        .encoder_execution_identity = qualified.executionIdentityForBackend(encoder_profile, serving_backend),
+        .decoder_execution_identity = qualified.executionIdentityForBackend(decoder_profile, serving_backend),
         .module_sha256 = head_sha256,
         .soft_module_sha256 = soft_module_sha256,
         .candidate_sha256 = pins.?.candidate,
@@ -1781,7 +1801,7 @@ fn bundlePins(a: A, directory: []const u8) !BundlePins {
 /// a draft. It is stock Memorilla over the same pooled vectors, for
 /// side-by-side comparison with the hybrid. Only the closed plan is
 /// admitted; nothing of the record half (adapters, span head) is touched.
-fn generateSoftOnlyImpl(a: A, io: std.Io, manager: *manager_mod.ModelManager, profile: Profile, paths: Paths, canonical: []const u8, documents: []const []const u8, max_new_tokens: usize, limits: memory.Limits, control: Control, options: Options, protocol: span_window.Protocol, released_directory: []const u8) !OwnedResult {
+fn generateSoftOnlyImpl(a: A, io: std.Io, manager: *manager_mod.ModelManager, profile: Profile, paths: Paths, canonical: []const u8, documents: []const []const u8, max_new_tokens: usize, limits: memory.Limits, control: Control, options: Options, protocol: span_window.Protocol, released_directory: []const u8, serving_backend: BackendType) !OwnedResult {
     // Exclusive with a read mode; stored soft-half vectors are a cascade
     // research input this comparison does not take.
     if (options.span_read_mode != null or options.stored_documents != null or options.stored_question != null) return error.UnsupportedMemorillaReadMode;
@@ -1815,7 +1835,7 @@ fn generateSoftOnlyImpl(a: A, io: std.Io, manager: *manager_mod.ModelManager, pr
     defer closed_text.deinit();
     try common.validateInputTokenLimit(options.request_limits, closed_text.input_ids.len);
     if (options.prepared_text) |callback| try callback(options.context, &closed_text);
-    const closed_plan = try decode.ResourcePlan.create(config, .cuda, closed_text.input_ids.len, closed_text.rendered.len, slots, max_new_tokens, bounded);
+    const closed_plan = try decode.ResourcePlan.create(config, try decode.kvBackend(serving_backend), closed_text.input_ids.len, closed_text.rendered.len, slots, max_new_tokens, bounded);
 
     // Admission: the closed decoder plan; the released reader over the
     // pooled rows plus the 16 memory rows it uploads.
@@ -1842,6 +1862,7 @@ fn generateSoftOnlyImpl(a: A, io: std.Io, manager: *manager_mod.ModelManager, pr
     var encoder_handle = try common.acquireResidentModel(manager, paths.encoder.path, encoder_control);
     defer encoder_handle.release();
     const encoder_model = encoder_handle.get();
+    if (encoder_model.session.backend() != serving_backend) return error.UnsupportedMemorillaBackend;
     try encoder_model.verifyMemorillaIdentityWithControl(encoder_control);
     try notify(options, .encoder_loaded, manager);
     var timer = SpanTimer.start(io);
@@ -1857,6 +1878,7 @@ fn generateSoftOnlyImpl(a: A, io: std.Io, manager: *manager_mod.ModelManager, pr
     var decoder_handle = try common.acquireResidentModel(manager, paths.decoder.path, decoder_control);
     defer decoder_handle.release();
     const decoder_model = decoder_handle.get();
+    if (decoder_model.session.backend() != serving_backend) return error.UnsupportedMemorillaBackend;
     try decoder_model.verifyMemorillaIdentityWithControl(decoder_control);
     try notify(options, .decoder_loaded, manager);
     try paths.encoder.verify(a, io);
@@ -1866,7 +1888,7 @@ fn generateSoftOnlyImpl(a: A, io: std.Io, manager: *manager_mod.ModelManager, pr
     defer native_guard.deinit();
 
     // The released reader, borrowed through generation as on the span path.
-    var soft_handle = try decoder_model.memorilla_reader_cache.acquire(decoder_model.allocator, io, manager, released_directory, limits, control);
+    var soft_handle = try decoder_model.memorilla_reader_cache.acquireForBackend(decoder_model.allocator, io, manager, released_directory, limits, control, serving_backend);
     defer soft_handle.deinit();
     var soft_clean = false;
     defer if (!soft_clean) soft_handle.invalidate();
@@ -1875,15 +1897,16 @@ fn generateSoftOnlyImpl(a: A, io: std.Io, manager: *manager_mod.ModelManager, pr
     if (!reader.bundle.release or reader.bundle.config.num_memories != slots or reader.bundle.config.output_dim != config.hidden_size) return error.UnsupportedMemorillaProfile;
     const soft_module_sha256 = reader.bundle.weights_sha256;
     var soft_backend = try reader.computeBackendWithBudget(&soft_budget);
+    defer if (serving_backend == .metal) soft_backend.deinit();
     soft_backend.execution_control = control;
     soft_backend.execution_budget = &soft_budget;
     var soft_scope = try execution.Scope.acquire(control, .{ .mutex = &reader.execution_mutex });
     defer soft_scope.deinit();
-    var soft_physical: PhysicalBudgetScope = if (comptime @import("build_options").enable_cuda)
-        try reader.compute.beginMemorillaDeviceBudget(soft_request.backendTotalBytes())
-    else
-        return error.CudaNotEnabled;
-    defer soft_physical.deinit();
+    var soft_physical: ?PhysicalBudgetScope = null;
+    if (comptime @import("build_options").enable_cuda) {
+        if (serving_backend == .cuda) soft_physical = try reader.compute.?.beginMemorillaDeviceBudget(soft_request.backendTotalBytes());
+    }
+    defer if (soft_physical) |*physical| physical.deinit();
     try soft_scope.bind(soft_backend);
     const output = blk: {
         defer {
@@ -1901,22 +1924,33 @@ fn generateSoftOnlyImpl(a: A, io: std.Io, manager: *manager_mod.ModelManager, pr
             defer soft_backend.free(query);
             try encoder_model.verifyMemorillaIdentityWithControl(encoder_control);
             try decoder_model.verifyMemorillaIdentityWithControl(decoder_control);
-            try factory.requireMemorillaCudaExecution(&soft_backend);
+            if (serving_backend == .cuda) try factory.requireMemorillaCudaExecution(&soft_backend);
             const memories = try memory_pipeline.forward(&soft_backend, backing, reader.bundle.config, .{ .documents = docs, .question = query, .padding_mask = mask, .batch = 1, .num_documents = rows, .max_document_rows = qualified.max_documents }, null);
             defer soft_backend.free(memories);
-            try factory.requireMemorillaCudaExecution(&soft_backend);
+            if (serving_backend == .cuda) try factory.requireMemorillaCudaExecution(&soft_backend);
             break :inner try soft_backend.toFloat32(memories, backing);
         };
         defer backing.free(soft_rows);
         if (soft_rows.len != slots * config.hidden_size) return error.InvalidMemorillaMemoryRows;
         timer.mark("soft_rows");
         try control.check();
-        var decoder_backend = try factory.getCoordinatedCudaComputeBackend(decoder_model.session, &decoder_budget, @intFromPtr(&reservation));
+        // Take the model lock before leasing its shared Metal provider, as
+        // other generation routes do. The Metal compute is exclusive until
+        // deinit, so its calls can use the request-local lock.
+        var metal_scope = if (serving_backend == .metal)
+            try execution.Scope.acquire(decoder_control, .{ .mutex = decoder_model.nativeGenerationMutex(), .lane = &decoder_model.native_reader_execution_lane })
+        else
+            null;
+        defer if (metal_scope) |*scope| scope.deinit();
+        var metal_mutex: std.atomic.Mutex = .unlocked;
+        const decoder_mutex = if (metal_scope != null) &metal_mutex else decoder_model.nativeGenerationMutex();
+        const decoder_lane = if (metal_scope != null) null else &decoder_model.native_reader_execution_lane;
+        var decoder_backend = try factory.getMemorillaDecoderBackend(decoder_model.session, backing, &decoder_budget, @intFromPtr(&reservation));
         defer decoder_backend.deinit();
         const rows_ct = try soft_backend.fromFloat32Shape(soft_rows, &.{ @intCast(slots), @intCast(config.hidden_size) });
         defer soft_backend.free(rows_ct);
-        var decoder = try decode.Decoder.fromQualifiedSession(decoder_model.session, &decoder_backend, assets.tokenizer(), decoder_model.nativeGenerationMutex());
-        decoder.execution_lane = &decoder_model.native_reader_execution_lane;
+        var decoder = try decode.Decoder.fromQualifiedSession(decoder_model.session, &decoder_backend, assets.tokenizer(), decoder_mutex);
+        decoder.execution_lane = decoder_lane;
         defer timer.mark("generate");
         break :blk try decode.generate(a, decoder, &closed_text, .{ .backend = &soft_backend, .tensor = rows_ct }, .{ .max_new_tokens = max_new_tokens, .teacher_forced_ids = options.teacher_forced_ids, .trace = options.trace, .ignore_eos = options.ignore_eos }, &reservation, bounded, decoder_control);
     };
@@ -1951,8 +1985,8 @@ fn generateSoftOnlyImpl(a: A, io: std.Io, manager: *manager_mod.ModelManager, pr
         .record_gate = .closed,
         .canonicalized = false,
         .memory_tokens = slots,
-        .encoder_execution_identity = qualified.executionIdentity(encoder_profile),
-        .decoder_execution_identity = qualified.executionIdentity(decoder_profile),
+        .encoder_execution_identity = qualified.executionIdentityForBackend(encoder_profile, serving_backend),
+        .decoder_execution_identity = qualified.executionIdentityForBackend(decoder_profile, serving_backend),
         .module_sha256 = pins.head,
         .soft_module_sha256 = soft_module_sha256,
         .candidate_sha256 = pins.candidate,
