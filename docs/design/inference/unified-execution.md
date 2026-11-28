@@ -3372,6 +3372,30 @@ text, image and audio in all six baseline arms of the mixed workload.
 The candidate completed those cases. The mixed run provides no paired
 latency for those three modalities.
 
+Native CPU used the same `e540d5ff64` server and baseline, with the DFT
+audio frontend pinned on both sides for grouped EmbeddingGemma 2 audio.
+All eleven workloads had 16 measured requests per side per phase and
+matched across all three controls. No request failed.
+
+| Workload | Baseline p50 / p95 (ms) | Candidate p50 / p95 (ms) |
+| --- | ---: | ---: |
+| Whisper Small | 674.70 / 676.87 | 674.24 / 678.57 |
+| EmbeddingGemma 2 text | 17.63 / 17.90 | 17.64 / 17.99 |
+| EmbeddingGemma 2 grouped audio | 242.51 / 265.02 | 241.22 / 247.97 |
+| LightOnOCR-3-0.8B | 6,849.41 / 6,874.63 | 6,830.11 / 6,858.09 |
+| GLiNER 2.5 | 15.49 / 15.77 | 15.59 / 16.07 |
+| DECIDE | 126.76 / 128.54 | 125.06 / 127.84 |
+| Qwen3 | 1,461.09 / 1,467.60 | 1,461.99 / 1,467.42 |
+| Gemma 4 E4B text | 7,916.96 / 7,946.63 | 3,065.42 / 3,099.42 |
+| Gemma 4 E4B image | 5,489.50 / 5,637.09 | 3,695.49 / 3,714.06 |
+| Gemma 4 E4B audio | 1,275.33 / 1,283.04 | 956.91 / 965.35 |
+| Gemma 4 E4B video | 5,103.07 / 5,124.95 | 3,088.03 / 3,105.37 |
+
+The grouped-audio candidate-only p95 controls spread from 242.89 to
+510.30 ms. The paired tail improvement is weak evidence under that
+variation. Native Gemma 4 has complete controls in the mixed run,
+so the subsequent isolated comparison targets the missing Metal cases.
+
 ### Released Inkling Metal checkpoint at `7f0ff56ff8`
 
 Five focused checks passed on M4 Max with zero skips. The released
