@@ -90,9 +90,10 @@ def sync_detailed(
     reprocessing regenerates vectors even when the source chunks are unchanged.
     Embedding requests and document-extraction requests on servers with an
     enrichment runtime are committed durably and queued for supervised
-    inference. Acceptance does not wait for inference. For extraction, inspect
-    the artifact generation, merge status and per-page failures; for embeddings,
-    inspect index coverage and repair issues. Embedded databases without an
+    inference. Acceptance does not wait for inference. For native extraction,
+    inspect the artifact's reprocess intent and its published generation, merge
+    status and per-page failures. For embeddings, inspect index coverage and repair issues. Embedded
+    databases without an
     enrichment runtime execute document extraction inline.
 
     Args:
@@ -137,9 +138,10 @@ def sync(
     reprocessing regenerates vectors even when the source chunks are unchanged.
     Embedding requests and document-extraction requests on servers with an
     enrichment runtime are committed durably and queued for supervised
-    inference. Acceptance does not wait for inference. For extraction, inspect
-    the artifact generation, merge status and per-page failures; for embeddings,
-    inspect index coverage and repair issues. Embedded databases without an
+    inference. Acceptance does not wait for inference. For native extraction,
+    inspect the artifact's reprocess intent and its published generation, merge
+    status and per-page failures. For embeddings, inspect index coverage and repair issues. Embedded
+    databases without an
     enrichment runtime execute document extraction inline.
 
     Args:
@@ -179,9 +181,10 @@ async def asyncio_detailed(
     reprocessing regenerates vectors even when the source chunks are unchanged.
     Embedding requests and document-extraction requests on servers with an
     enrichment runtime are committed durably and queued for supervised
-    inference. Acceptance does not wait for inference. For extraction, inspect
-    the artifact generation, merge status and per-page failures; for embeddings,
-    inspect index coverage and repair issues. Embedded databases without an
+    inference. Acceptance does not wait for inference. For native extraction,
+    inspect the artifact's reprocess intent and its published generation, merge
+    status and per-page failures. For embeddings, inspect index coverage and repair issues. Embedded
+    databases without an
     enrichment runtime execute document extraction inline.
 
     Args:
@@ -224,9 +227,10 @@ async def asyncio(
     reprocessing regenerates vectors even when the source chunks are unchanged.
     Embedding requests and document-extraction requests on servers with an
     enrichment runtime are committed durably and queued for supervised
-    inference. Acceptance does not wait for inference. For extraction, inspect
-    the artifact generation, merge status and per-page failures; for embeddings,
-    inspect index coverage and repair issues. Embedded databases without an
+    inference. Acceptance does not wait for inference. For native extraction,
+    inspect the artifact's reprocess intent and its published generation, merge
+    status and per-page failures. For embeddings, inspect index coverage and repair issues. Embedded
+    databases without an
     enrichment runtime execute document extraction inline.
 
     Args:

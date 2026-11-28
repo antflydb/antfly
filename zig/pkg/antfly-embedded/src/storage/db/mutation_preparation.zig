@@ -1396,15 +1396,18 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 defer if (document_execution) |execution| execution.destroy();
                 for (generated, 0..) |request, request_index| {
                     const force_asset = request.kind == .asset and containsName(force_generated_artifact_names, requestArtifactName(request));
+                    const precompute = try shouldPrecomputeGeneratedRequest(self, precompute_mode, request);
                     var reprocess_snapshot: @import("enrichment/document_extraction_completion.zig").Snapshot = .{};
-                    if (force_asset) {
+                    var force_extraction = false;
+                    if (force_asset and (only_incomplete_assets or !precompute)) {
                         // Generic asset bodies are not document manifests.
                         // Classify first, so forcing them never reads a second
                         // potentially large output merely to inspect coverage.
                         var producer = try @import("enrichment/asset_producer.zig").parseProducerConfig(alloc, request.producer_json);
                         defer producer.deinit(alloc);
-                        if (only_incomplete_assets and producer.type != .document_extraction) return error.InvalidArgument;
-                        if (producer.type == .document_extraction) {
+                        force_extraction = producer.type == .document_extraction;
+                        if (only_incomplete_assets and !force_extraction) return error.InvalidArgument;
+                        if (force_extraction) {
                             const key = try internal_keys.artifactNamedPrefixAlloc(alloc, request.doc_key, "asset", requestArtifactName(request));
                             defer alloc.free(key);
                             const manifest = S.ownerField(self, "core").*.store.get(alloc, key) catch |err| switch (err) {
@@ -1416,20 +1419,24 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                             if (only_incomplete_assets and reprocess_snapshot.complete()) continue;
                         }
                     }
-                    if (!try shouldPrecomputeGeneratedRequest(self, precompute_mode, request)) {
-                        if (request.kind == .asset and containsName(force_generated_artifact_names, requestArtifactName(request))) {
-                            var producer = try @import("enrichment/asset_producer.zig").parseProducerConfig(alloc, request.producer_json);
-                            defer producer.deinit(alloc);
-                            if (producer.type == .document_extraction) {
-                                const intent = @import("artifact_reprocess_intent.zig");
-                                const generation = reprocess_snapshot.generation;
-                                const encoded = intent.encode(request.producer_json, std.math.add(u64, generation, 1) catch return error.ResourceLimitExceeded);
+                    if (!precompute) {
+                        if (force_extraction) {
+                            const intent = @import("artifact_reprocess_intent.zig");
+                            const generation = reprocess_snapshot.generation;
+                            const encoded = intent.encode(request.producer_json, std.math.add(u64, generation, 1) catch return error.ResourceLimitExceeded);
+                            {
                                 const key = try intent.keyAlloc(alloc, request.doc_key, requestArtifactName(request));
                                 errdefer alloc.free(key);
                                 const value = try alloc.dupe(u8, &encoded);
                                 errdefer alloc.free(value);
-                                // Commit the target with its source mutation. It
-                                // survives request coalescing and owner restart.
+                                try artifact_writes.append(alloc, .{ .key = key, .value = value });
+                            }
+                            {
+                                const key = try intent.receiptKeyAlloc(alloc, request.doc_key, requestArtifactName(request));
+                                errdefer alloc.free(key);
+                                const receipt = intent.newReceipt(&encoded);
+                                const value = try alloc.dupe(u8, &receipt);
+                                errdefer alloc.free(value);
                                 try artifact_writes.append(alloc, .{ .key = key, .value = value });
                             }
                         }

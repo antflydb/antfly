@@ -384,7 +384,7 @@ pub const TableWriteSource = struct {
             table_name: []const u8,
             doc_key: []const u8,
             artifact_name: []const u8,
-        ) anyerror!?bool = null,
+        ) anyerror!?db_mod.types.DocumentArtifactReprocessAcceptance = null,
         reprocess_document_artifact_range: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -435,7 +435,7 @@ pub const TableWriteSource = struct {
             table_name: []const u8,
             doc_key: []const u8,
             artifact_name: []const u8,
-        ) anyerror!?bool = null,
+        ) anyerror!?db_mod.types.DocumentArtifactReprocessAcceptance = null,
         reprocess_document_artifact_range_group_local: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -1399,7 +1399,7 @@ pub const TableWriteSource = struct {
         table_name: []const u8,
         doc_key: []const u8,
         artifact_name: []const u8,
-    ) !?bool {
+    ) !?db_mod.types.DocumentArtifactReprocessAcceptance {
         const fn_ptr = self.vtable.reprocess_document_artifact orelse return null;
         return try BoundaryAbi.call("reprocess_document_artifact", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, table_name, doc_key, artifact_name });
     }
@@ -1411,7 +1411,7 @@ pub const TableWriteSource = struct {
         table_name: []const u8,
         doc_key: []const u8,
         artifact_name: []const u8,
-    ) !?bool {
+    ) !?db_mod.types.DocumentArtifactReprocessAcceptance {
         const fn_ptr = self.vtable.reprocess_document_artifact_group_local orelse return null;
         return try BoundaryAbi.call("reprocess_document_artifact_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, doc_key, artifact_name });
     }

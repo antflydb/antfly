@@ -14971,6 +14971,12 @@ pub const DB = struct {
         return artifact;
     }
 
+    /// Metrics recorded by replay belong to the physical engine, which is
+    /// independently compiled in native server builds.
+    pub fn mergePhysicalPipelineMetrics(output: *@import("antfly_platform").document_pipeline_metrics.Snapshot) !void {
+        if (comptime storage_engine.enabled) try output.merge(storage_engine.pipelineMetricsSnapshot());
+    }
+
     pub fn getDocumentArtifactManifest(
         self: *DB,
         alloc: Allocator,
@@ -15010,6 +15016,22 @@ pub const DB = struct {
             stored_manifest = try self.core.getStoreValue(alloc, manifest_key);
         }
 
+        if (stored_manifest == null) {
+            if (try self.documentArtifactReprocessStatus(alloc, doc_key, artifact_name, 0, 0)) |reprocess| {
+                if (reprocess.status == .pending) {
+                    self.core.unlockApplyShared();
+                    apply_locked = false;
+                    if (replay_capture) |*lease| lease.release();
+                    if (primary_capture) |*lease| lease.release();
+                    var result = try producedAssetManifestAlloc(alloc, doc_key, artifact_name, try alloc.dupe(u8, ""), null, "");
+                    errdefer result.deinit(alloc);
+                    result.reprocess = reprocess;
+                    result.reprocess.?.worker = self.documentArtifactReprocessWorker();
+                    try row_policy_lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
+                    return result;
+                }
+            }
+        }
         const manifest = stored_manifest orelse {
             var captured = (@import("dense_index_inspection.zig").capture(self, alloc, doc_key, artifact_name) catch |err| {
                 if (@import("privacy_read.zig").pending(err) or err == error.IndexRebuilding or err == error.DeadlineExceeded) return error.StorageReadTemporarilyUnavailable;
@@ -15041,10 +15063,69 @@ pub const DB = struct {
 
         manifest_owned = false;
         state_owned = false;
-        var result = try self.documentArtifactInspectionAlloc(alloc, doc_key, artifact_name, manifest, state);
+        var published_receipt: u64 = 0;
+        var result = try self.documentArtifactInspectionAlloc(alloc, doc_key, artifact_name, manifest, state, &published_receipt);
         errdefer result.deinit(alloc);
+        result.reprocess = try self.documentArtifactReprocessStatus(alloc, doc_key, artifact_name, result.generation, published_receipt);
+        self.core.unlockApplyShared();
+        apply_locked = false;
+        if (result.reprocess) |*reprocess| {
+            if (reprocess.status == .pending or reprocess.last_retry != null)
+                reprocess.worker = self.documentArtifactReprocessWorker();
+        }
         try row_policy_lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
         return result;
+    }
+
+    fn documentArtifactReprocessStatus(
+        self: *DB,
+        alloc: Allocator,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+        published_generation: u64,
+        published_receipt: u64,
+    ) !?types.DocumentArtifactReprocessStatus {
+        const intent = @import("artifact_reprocess_intent.zig");
+        const key = try intent.keyAlloc(alloc, doc_key, artifact_name);
+        defer alloc.free(key);
+        const raw = (try self.core.getStoreValue(alloc, key)) orelse return null;
+        defer alloc.free(raw);
+        const target = try intent.generation(raw);
+        const matches_config = blk: {
+            self.core.index_manager.catalog_mutex.lockShared();
+            defer self.core.index_manager.catalog_mutex.unlockShared();
+            const cfg = self.core.index_manager.getEnrichment(.asset, artifact_name) orelse break :blk false;
+            break :blk try intent.generationForConfig(raw, cfg.producer_json) != 0;
+        };
+        const receipt_key = try intent.receiptKeyAlloc(alloc, doc_key, artifact_name);
+        defer alloc.free(receipt_key);
+        const receipt = try self.core.getStoreValue(alloc, receipt_key);
+        defer if (receipt) |value| alloc.free(value);
+        const accepted_sequence = if (receipt) |value| intent.receiptSequence(value, raw) else null;
+        const status: @FieldType(types.DocumentArtifactReprocessStatus, "status") = if (accepted_sequence != null and intent.isPublished(accepted_sequence.?, target, published_receipt, published_generation))
+            .published
+        else if (!matches_config)
+            .superseded
+        else if (accepted_sequence == null and published_generation >= target)
+            .unverified
+        else
+            .pending;
+        return .{
+            .requested_generation = target,
+            .accepted_sequence = accepted_sequence,
+            .status = status,
+            .last_retry = if (accepted_sequence != null) intent.observeRetry(receipt.?) else null,
+        };
+    }
+
+    fn documentArtifactReprocessWorker(self: *DB) ?types.DocumentArtifactReprocessStatus.Worker {
+        // Optional telemetry must remain available during a blocked worker
+        // shutdown. Lifecycle owns the future, including its stop/join.
+        const mutex = &self.async_context.enrichment_lifecycle_mutex;
+        if (!mutex.tryLock()) return null;
+        defer mutex.unlock();
+        const runtime = self.enrichment_owner.bundle.runtime orelse return null;
+        return runtime.tryReprocessWorkerProgress(runtime.isStarted());
     }
 
     /// Builds the inspection entry for one stored asset value. Only document
@@ -15060,12 +15141,13 @@ pub const DB = struct {
         artifact_name: []const u8,
         value: []u8,
         state: ?[]u8,
+        receipt_out: ?*u64,
     ) !types.DocumentArtifactManifest {
         const content_type = (self.producedAssetContentTypeAlloc(alloc, artifact_name) catch |err| {
             alloc.free(value);
             if (state) |bytes| alloc.free(bytes);
             return err;
-        }) orelse return documentArtifactManifestFromJsonAlloc(alloc, doc_key, artifact_name, value, state);
+        }) orelse return documentArtifactManifestFromJsonAlloc(alloc, doc_key, artifact_name, value, state, receipt_out);
         return producedAssetManifestAlloc(alloc, doc_key, artifact_name, value, state, content_type);
     }
 
@@ -15127,7 +15209,7 @@ pub const DB = struct {
             };
             // Ownership of manifest_json and state moves into the inspection,
             // which frees both itself when it fails.
-            var artifact = try self.documentArtifactInspectionAlloc(alloc, doc_key, artifact_ref.name, manifest_json, state);
+            var artifact = try self.documentArtifactInspectionAlloc(alloc, doc_key, artifact_ref.name, manifest_json, state, null);
             errdefer artifact.deinit(alloc);
             try artifacts.append(alloc, artifact);
         }
@@ -15248,6 +15330,18 @@ pub const DB = struct {
         return self.reprocessDocumentArtifactWithCompletionWait(alloc, doc_key, artifact_name, false, false);
     }
 
+    pub fn reprocessDocumentArtifactAcceptance(
+        self: *DB,
+        alloc: Allocator,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+    ) !types.DocumentArtifactReprocessAcceptance {
+        if (comptime storage_engine.enabled) return storage_engine.call("reprocessDocumentArtifactAcceptance", .{ self, alloc, doc_key, artifact_name });
+        var sequence: u64 = 0;
+        const handled = try self.reprocessDocumentArtifactWithSequence(alloc, doc_key, artifact_name, false, false, &sequence);
+        return .{ .handled = handled, .accepted_sequence = if (sequence != 0) sequence else null };
+    }
+
     fn reprocessDocumentArtifactWithCompletionWait(
         self: *DB,
         alloc: Allocator,
@@ -15255,6 +15349,18 @@ pub const DB = struct {
         artifact_name: []const u8,
         wait_for_completion: bool,
         only_incomplete: bool,
+    ) !bool {
+        return self.reprocessDocumentArtifactWithSequence(alloc, doc_key, artifact_name, wait_for_completion, only_incomplete, null);
+    }
+
+    fn reprocessDocumentArtifactWithSequence(
+        self: *DB,
+        alloc: Allocator,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+        wait_for_completion: bool,
+        only_incomplete: bool,
+        sequence_out: ?*u64,
     ) !bool {
         var cfg = (try self.getEnrichment(alloc, .asset, artifact_name)) orelse {
             if (only_incomplete) return error.InvalidArgument;
@@ -15289,6 +15395,7 @@ pub const DB = struct {
             .wait_for_sync_level = wait_for_completion,
             .force_generated_artifact_names = &force_artifacts,
             .force_only_incomplete_assets = only_incomplete,
+            .reprocess_sequence_out = sequence_out,
         });
         return true;
     }
@@ -62525,6 +62632,7 @@ fn documentArtifactManifestFromJsonAlloc(
     artifact_name: []const u8,
     manifest_json: []u8,
     state_json: ?[]u8,
+    receipt_out: ?*u64,
 ) !types.DocumentArtifactManifest {
     errdefer alloc.free(manifest_json);
     errdefer if (state_json) |value| alloc.free(value);
@@ -62533,6 +62641,7 @@ fn documentArtifactManifestFromJsonAlloc(
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidDocumentExtractionManifest;
     const object = parsed.value.object;
+    if (receipt_out) |out| out.* = (try jsonObjectOptionalU64(object, "reprocess_sequence")) orelse 0;
 
     const artifact_id = try artifact_ids.artifactPublicIdAlloc(alloc, .{
         .document_id = @constCast(doc_key),
@@ -100923,11 +101032,28 @@ test "db public artifact reprocess accepts durable work despite unrelated provid
 
     // Both public endpoints acknowledge the committed request without waiting
     // for the unrelated retry debt. The repair queue still uses full_index.
-    try std.testing.expect(try db.reprocessDocumentArtifact(alloc, "doc:repair", "document_units_v1"));
+    const acceptance = try db.reprocessDocumentArtifactAcceptance(alloc, "doc:repair", "document_units_v1");
+    try std.testing.expect(acceptance.handled);
+    const receipt = acceptance.accepted_sequence orelse return error.TestUnexpectedResult;
     {
         var accepted = (try db.getDocumentArtifactManifest(alloc, "doc:repair", "document_units_v1")) orelse return error.TestUnexpectedResult;
         defer accepted.deinit(alloc);
         try std.testing.expectEqual(before.generation, accepted.generation);
+        const reprocess = accepted.reprocess orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(.pending, reprocess.status);
+        try std.testing.expectEqual(before.generation + 1, reprocess.requested_generation);
+        try std.testing.expectEqual(receipt, reprocess.accepted_sequence.?);
+        try std.testing.expect(!reprocess.worker.?.background_running);
+        try std.testing.expect(reprocess.worker.?.target_sequence > reprocess.worker.?.applied_sequence);
+    }
+    {
+        const lifecycle = &db.async_context.enrichment_lifecycle_mutex;
+        try std.testing.expect(lifecycle.tryLock());
+        defer lifecycle.unlock();
+        var accepted = (try db.getDocumentArtifactManifest(alloc, "doc:repair", "document_units_v1")) orelse return error.TestUnexpectedResult;
+        defer accepted.deinit(alloc);
+        try std.testing.expect(accepted.reprocess.?.worker == null);
+        try std.testing.expectEqual(receipt, accepted.reprocess.?.accepted_sequence.?);
     }
     // Public acceptance commits the request without entering inference. Neither
     // unrelated retries nor rejection by the requested provider can erase it.
@@ -100940,6 +101066,20 @@ test "db public artifact reprocess accepts durable work despite unrelated provid
     try std.testing.expect(!try db.reprocessDocumentArtifact(alloc, "doc:repair", "missing"));
     try std.testing.expect(!try db.reprocessDocumentEmbeddingArtifact(alloc, "missing", "dense_v1"));
 
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:first", .value = "{\"url\":\"data:text/plain;base64,YWxwaGE=\"}" }},
+        .sync_level = .write,
+    });
+    try std.testing.expect((try db.getDocumentArtifactManifest(alloc, "doc:first", "document_units_v1")) == null);
+    try std.testing.expect(try db.reprocessDocumentArtifact(alloc, "doc:first", "document_units_v1"));
+    {
+        var accepted = (try db.getDocumentArtifactManifest(alloc, "doc:first", "document_units_v1")) orelse return error.TestUnexpectedResult;
+        defer accepted.deinit(alloc);
+        try std.testing.expectEqual(@as(u64, 0), accepted.generation);
+        try std.testing.expectEqual(@as(u64, 1), accepted.reprocess.?.requested_generation);
+        try std.testing.expectEqual(.pending, accepted.reprocess.?.status);
+    }
+
     // Provider recovery lets the queued work finish; success did not discard it.
     gated.allowed_successes.store(100, .release);
     sleepNs(550 * std.time.ns_per_ms);
@@ -100947,6 +101087,10 @@ test "db public artifact reprocess accepts durable work despite unrelated provid
     var after = (try db.getDocumentArtifactManifest(alloc, "doc:repair", "document_units_v1")) orelse return error.TestUnexpectedResult;
     defer after.deinit(alloc);
     try std.testing.expectEqual(before.generation + 1, after.generation);
+    try std.testing.expectEqual(.published, after.reprocess.?.status);
+    try std.testing.expectEqual(after.generation, after.reprocess.?.requested_generation);
+    try std.testing.expectEqual(receipt, after.reprocess.?.accepted_sequence.?);
+    try std.testing.expect(after.reprocess.?.worker == null);
     const embedding_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:retry", "dense_v1");
     defer alloc.free(embedding_key);
     const embedding = try db.core.store.get(alloc, embedding_key);
@@ -101141,6 +101285,25 @@ test "db document extraction manifest inspection and reprocess API" {
     var after = (try db.getDocumentArtifactManifest(alloc, "doc:a", "document_units_v1")) orelse return error.TestUnexpectedResult;
     defer after.deinit(alloc);
     try std.testing.expectEqual(@as(u64, 2), after.generation);
+    // A published manifest can coexist with retry diagnostics for the same
+    // accepted attempt. Polling the artifact must still expose that history.
+    const intent = @import("artifact_reprocess_intent.zig");
+    const receipt_key = try intent.receiptKeyAlloc(alloc, "doc:a", "document_units_v1");
+    defer alloc.free(receipt_key);
+    const old_receipt = try db.core.store.get(alloc, receipt_key);
+    defer alloc.free(old_receipt);
+    const observation: intent.RetryObservation = .{
+        .retry_at_ms = 20_000,
+        .reason = .provider_retry_after,
+        .stage = .ocr,
+        .error_code = intent.RetryErrorCode.init("ReadRateLimited"),
+    };
+    const retry_receipt = intent.withRetry(old_receipt, after.reprocess.?.accepted_sequence.?, observation).?;
+    try db.core.store.put(receipt_key, &retry_receipt);
+    var with_retry_history = (try db.getDocumentArtifactManifest(alloc, "doc:a", "document_units_v1")).?;
+    defer with_retry_history.deinit(alloc);
+    try std.testing.expectEqual(.published, with_retry_history.reprocess.?.status);
+    try std.testing.expectEqual(observation, with_retry_history.reprocess.?.last_retry.?);
     try std.testing.expectEqualStrings("remote", after.child_ranges[0].placement);
     try std.testing.expectEqual(@as(?u64, 7001), after.child_ranges[0].owner_group_id);
     try std.testing.expectEqual(@as(?u64, 2), after.child_ranges[0].placement_generation);
@@ -166344,32 +166507,67 @@ test "db scoped retry workset processes healthy batches across restart before a 
     try db.batch(.{ .deletes = &.{"gone"}, .sync_level = .write });
     try db.runEnrichmentUntil(db.core.nextEnrichmentSequence());
     try std.testing.expectEqual(before_delete, mock.bad_calls);
-    // Saturating the bounded workset applies backpressure to the unscanned
-    // tail. A deletion must release a slot before any long provider clock.
-    const capacity_writes = try a.alloc(types.BatchWrite, 129);
+    // Full active worksets move sleeping tickets to disk. A newer healthy
+    // document can publish while the oldest unresolved sequence pins replay.
+    try db.addEnrichment(.{ .name = "other_summary", .kind = .asset, .field = "other", .content_type = "application/json", .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"independent-generator\"}}" });
+    const deferred_count = 260;
+    const capacity_writes = try a.alloc(types.BatchWrite, deferred_count);
     defer a.free(capacity_writes);
     var capacity_initialized: usize = 0;
     defer for (capacity_writes[0..capacity_initialized]) |write| a.free(write.key);
     for (capacity_writes, 0..) |*write, i| {
-        write.* = .{ .key = try std.fmt.allocPrint(a, "capacity-{d:0>3}", .{i}), .value = if (i < 128) "{\"body\":\"bad\"}" else "{\"body\":\"healthy\"}" };
+        write.* = .{ .key = try std.fmt.allocPrint(a, "capacity-{d:0>3}", .{i}), .value = "{\"body\":\"bad\"}" };
         capacity_initialized += 1;
     }
     const before_capacity = mock.bad_calls;
     const healthy_before_capacity = mock.healthy_calls;
     try db.batch(.{ .writes = capacity_writes, .sync_level = .write });
-    try std.testing.expectError(error.EnrichmentRetryInProgress, db.runEnrichmentUntil(db.core.nextEnrichmentSequence()));
-    try std.testing.expectEqual(before_capacity + 128, mock.bad_calls);
-    try std.testing.expectEqual(healthy_before_capacity, mock.healthy_calls);
-    try std.testing.expect(db.enrichment_runtime.?.scoped_retry_full);
-    try db.batch(.{ .deletes = &.{capacity_writes[0].key}, .sync_level = .write });
-    try std.testing.expectError(error.EnrichmentRetryInProgress, db.runEnrichmentUntil(db.core.nextEnrichmentSequence()));
-    try std.testing.expectEqual(before_capacity + 128, mock.bad_calls);
+    const blocked_target = db.core.nextEnrichmentSequence();
+    try std.testing.expectError(error.EnrichmentRetryInProgress, db.runEnrichmentUntil(blocked_target));
+    try std.testing.expectEqual(before_capacity + deferred_count, mock.bad_calls);
+    const blocked_deadline = db.enrichment_runtime.?.next_retry_at_ms;
+    {
+        var queue = try enrichment_state.loadScopedRetries(a, db.enrichment_runtime.?.store);
+        defer queue.deinit(a);
+        try std.testing.expect(queue.sleeping.entries.items.len > 128);
+        try std.testing.expect(queue.tickets.items.len <= 128);
+        try std.testing.expectEqual(queue.deadline(), blocked_deadline);
+    }
+    db.close();
+    opened = false;
+    clock.advanceMs(30_000);
+    db = try DB.open(a, tmp.path(), options);
+    opened = true;
+    try db.batch(.{ .writes = &.{.{ .key = "after-backlog", .value = "{\"other\":\"healthy\"}" }}, .sync_level = .write });
+    const later_target = db.core.nextEnrichmentSequence();
+    try std.testing.expectError(error.EnrichmentRetryInProgress, db.runEnrichmentUntil(later_target));
+    try std.testing.expectEqual(before_capacity + deferred_count, mock.bad_calls);
     try std.testing.expectEqual(healthy_before_capacity + 1, mock.healthy_calls);
-    var deletes: [127][]const u8 = undefined;
-    for (&deletes, capacity_writes[1..128]) |*delete_key, write| delete_key.* = write.key;
+    try std.testing.expectEqual(blocked_deadline, db.enrichment_runtime.?.next_retry_at_ms);
+    try std.testing.expect(db.enrichment_runtime.?.applied_sequence < blocked_target);
+    try std.testing.expect(db.enrichment_runtime.?.scoped_retry_scan_sequence >= later_target);
+    try std.testing.expect(!db.enrichment_runtime.?.scoped_retry_full);
+    const later_key = try internal_keys.artifactNamedPrefixAlloc(a, "after-backlog", "asset", "other_summary");
+    defer a.free(later_key);
+    const later_value = try db.core.store.get(a, later_key);
+    defer a.free(later_value);
+    try std.testing.expect(std.mem.indexOf(u8, later_value, "healthy") != null);
+
+    // Delete many sleepers and let the survivors retry at their deadline.
+    var deletes: [deferred_count - 2][]const u8 = undefined;
+    for (&deletes, capacity_writes[0..deletes.len]) |*delete_key, write| delete_key.* = write.key;
     try db.batch(.{ .deletes = &deletes, .sync_level = .write });
+    try std.testing.expectError(error.EnrichmentRetryInProgress, db.runEnrichmentUntil(db.core.nextEnrichmentSequence()));
+    {
+        var queue = try enrichment_state.loadScopedRetries(a, db.enrichment_runtime.?.store);
+        defer queue.deinit(a);
+        try std.testing.expectEqual(@as(usize, 2), queue.tickets.items.len + queue.sleeping.entries.items.len);
+    }
+    try std.testing.expectEqual(before_capacity + deferred_count, mock.bad_calls);
+    mock.recover = true;
+    clock.advanceMs(3_600_000);
     try db.runEnrichmentUntil(db.core.nextEnrichmentSequence());
-    try std.testing.expectEqual(before_capacity + 128, mock.bad_calls);
+    try std.testing.expectEqual(before_capacity + deferred_count + 2, mock.bad_calls);
 }
 
 test "db scoped retry workset never parks committed earlier chunk requests" {

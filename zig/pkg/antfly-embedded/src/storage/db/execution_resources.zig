@@ -1329,6 +1329,8 @@ pub const BatchExecutionOptions = struct {
     prepared_commit_disposition: ?*PreparedCommitDisposition = null,
     force_generated_artifact_names: []const []const u8 = &.{},
     force_only_incomplete_assets: bool = false,
+    /// Attempt-local result populated from the stamped intent in this write.
+    reprocess_sequence_out: ?*u64 = null,
     document_child_range_dispatcher: ?DocumentArtifactChildRangeDispatcher = null,
     committed_batch_effects_observer: ?CommittedBatchEffectsObserver = null,
     bypass_replication_write_gate: bool = false,

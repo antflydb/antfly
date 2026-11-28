@@ -4460,8 +4460,11 @@ pub const ApiHttpClient = struct {
         var cancellation = if (opts.cancellation) |token| http_common.RequestCancellation.fromToken(token) else http_common.RequestCancellation{};
         var buffer: [20]u8 = undefined;
         const budget = if (timeout) |milliseconds| try std.fmt.bufPrint(&buffer, "{d}", .{@min(milliseconds, @import("antfly_public_limits").Execution.max_timeout_ms)}) else "";
-        const headers = [_]http_common.RequestHeader{.{ .name = @import("antfly_public_limits").Execution.timeout_header, .value = budget }};
-        var response = try self.executeRequest(.{ .method = .POST, .uri = uri, .content_type = "application/json", .body = body, .headers = if (timeout != null) &headers else &.{}, .timeout_ms = timeout, .cancellation = if (opts.cancellation != null) &cancellation else null });
+        const headers = [_]http_common.RequestHeader{
+            .{ .name = @import("http_routes.zig").artifact_reprocess_status_header, .value = "1" },
+            .{ .name = @import("antfly_public_limits").Execution.timeout_header, .value = budget },
+        };
+        var response = try self.executeRequest(.{ .method = .POST, .uri = uri, .content_type = "application/json", .body = body, .headers = if (timeout != null) &headers else headers[0..1], .timeout_ms = timeout, .cancellation = if (opts.cancellation != null) &cancellation else null });
         defer response.deinit(self.alloc);
         switch (response.status) {
             200 => return .{ .body = try self.alloc.dupe(u8, response.body) },

@@ -192,6 +192,7 @@ pub const VTable = struct {
     batchReplicatedApply: *const fn (self: *DB, req: types.BatchRequest) Outcome(void),
     applyReplicatedRowPolicyPublication: *const fn (self: *DB, bundle_bytes: []const u8, request: @import("../system_catalog/policies.zig").InstallRequest, identity: db.OrderedApplyReceipt) Outcome(?@import("db/row_policy_bundle.zig").Receipt),
     recoverReplicatedRestoreFinish: *const fn (self: *DB, finish: @FieldType(@import("db/restore_staging_contract.zig").Control, "finish")) Outcome(void),
+    reprocessDocumentArtifactAcceptance: *const fn (*DB, Allocator, []const u8, []const u8) Outcome(types.DocumentArtifactReprocessAcceptance),
     reprocessDocumentArtifact: *const fn (self: *DB, alloc: std.mem.Allocator, doc_key: []const u8, artifact_name: []const u8) Outcome(bool),
     indexRepairIntentSummary: *const fn (self: *DB, alloc: std.mem.Allocator) Outcome(DB.IndexRepairIntentSummary),
     repairArtifactIssuesWithRequest: *const fn (self: *DB, alloc: std.mem.Allocator, req: types.ArtifactRepairRunRequest) Outcome(types.ArtifactRepairResult),
@@ -682,7 +683,10 @@ pub fn fieldsFor(comptime T: type) []const FieldLayout {
 /// Version 77 carries physical history ownership in SQL completion calls.
 /// Version 78 retains the query policy guard through the owner callback.
 /// Version 79 separates frozen PREPARE time from external vote admission time.
-pub const descriptor_version: u32 = 82;
+/// Version 83 adds reprocess state to the returned artifact manifest.
+/// Version 84 adds the committed reprocess acceptance and its write option.
+/// Version 85 includes durable retry diagnostics and extraction receipt publication fencing.
+pub const descriptor_version: u32 = 85;
 pub const Descriptor = extern struct {
     version: u32 = descriptor_version,
     table_layout: native.TypeContract,
@@ -799,6 +803,16 @@ pub const resource_manager_layout = blk: {
     @setEvalBranchQuota(100_000);
     break :blk native.TypeContract.of(@import("resource_manager.zig").ResourceManager);
 };
+const pipeline_metrics = @import("antfly_platform").document_pipeline_metrics;
+
+extern fn antfly_storage_engine_pipeline_metrics_v1(out: *pipeline_metrics.Snapshot) callconv(.c) void;
+
+pub fn pipelineMetricsSnapshot() pipeline_metrics.Snapshot {
+    var snapshot: pipeline_metrics.Snapshot = undefined;
+    antfly_storage_engine_pipeline_metrics_v1(&snapshot);
+    return snapshot;
+}
+
 extern fn antfly_storage_engine_get_descriptor_v37() callconv(.c) *const Descriptor;
 fn Result(comptime name: []const u8) type {
     const Function = @typeInfo(@FieldType(VTable, name)).pointer.child;

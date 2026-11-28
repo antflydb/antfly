@@ -5509,7 +5509,7 @@ const LegacyTableWriteSource = struct {
             table_name: []const u8,
             doc_key: []const u8,
             artifact_name: []const u8,
-        ) anyerror!?bool = null,
+        ) anyerror!?db_mod.types.DocumentArtifactReprocessAcceptance = null,
         reprocess_document_artifact_range: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -5560,7 +5560,7 @@ const LegacyTableWriteSource = struct {
             table_name: []const u8,
             doc_key: []const u8,
             artifact_name: []const u8,
-        ) anyerror!?bool = null,
+        ) anyerror!?db_mod.types.DocumentArtifactReprocessAcceptance = null,
         reprocess_document_artifact_range_group_local: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -5936,7 +5936,7 @@ const LegacyTableWriteSource = struct {
         table_name: []const u8,
         doc_key: []const u8,
         artifact_name: []const u8,
-    ) !?bool {
+    ) !?db_mod.types.DocumentArtifactReprocessAcceptance {
         const fn_ptr = self.vtable.reprocess_document_artifact orelse return null;
         return try fn_ptr(self.ptr, alloc, table_name, doc_key, artifact_name);
     }
@@ -5948,7 +5948,7 @@ const LegacyTableWriteSource = struct {
         table_name: []const u8,
         doc_key: []const u8,
         artifact_name: []const u8,
-    ) !?bool {
+    ) !?db_mod.types.DocumentArtifactReprocessAcceptance {
         const fn_ptr = self.vtable.reprocess_document_artifact_group_local orelse return null;
         return try fn_ptr(self.ptr, alloc, group_id, table_name, doc_key, artifact_name);
     }
@@ -24896,7 +24896,7 @@ pub const ProvisionedTableWriteSource = struct {
         table_name: []const u8,
         doc_key: []const u8,
         artifact_name: []const u8,
-    ) !?bool {
+    ) !?db_mod.types.DocumentArtifactReprocessAcceptance {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         if (self.localWriteOwnerSource()) |owner| return try owner.reprocessDocumentArtifact(alloc, table_name, doc_key, artifact_name);
         const group_id = (try table_catalog.resolveGroupForKey(alloc, self.catalog, table_name, doc_key)) orelse return null;
@@ -25199,7 +25199,7 @@ pub const ProvisionedTableWriteSource = struct {
         table_name: []const u8,
         doc_key: []const u8,
         artifact_name: []const u8,
-    ) !?bool {
+    ) !?db_mod.types.DocumentArtifactReprocessAcceptance {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         if (comptime !control_only_storage_sources) {
             if (self.localWriteOwnerSource()) |owner| return try owner.reprocessDocumentArtifactGroupLocal(alloc, group_id, table_name, doc_key, artifact_name);
@@ -25230,7 +25230,7 @@ pub const ProvisionedTableWriteSource = struct {
             defer alloc.free(path);
             var cached = try self.getOrOpenCachedDbMode(alloc, cache, path, group_id, table_name, .default, null, null);
             defer cached.deinit(alloc);
-            break :blk try cached.db.reprocessDocumentArtifact(alloc, doc_key, artifact_name);
+            break :blk try cached.db.reprocessDocumentArtifactAcceptance(alloc, doc_key, artifact_name);
         } else blk: {
             const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
             defer alloc.free(path);
@@ -25256,11 +25256,11 @@ pub const ProvisionedTableWriteSource = struct {
                 try openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.replication_write_gate, self.hot_standby_async_mirror, self.online_source_authority);
             defer db.close();
             try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
-            const result = try db.reprocessDocumentArtifact(alloc, doc_key, artifact_name);
+            const result = try db.reprocessDocumentArtifactAcceptance(alloc, doc_key, artifact_name);
             self.finishTransientManagedDbWriteBeforeClose(table_name, group_id, &db);
             break :blk result;
         };
-        if (handled) {
+        if (handled.handled) {
             lockAtomic(&self.local_db_mutex);
             self.invalidateReadCache(table_name);
             self.markWriteCacheDirty(table_name);
@@ -28089,7 +28089,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         table_name: []const u8,
         doc_key: []const u8,
         artifact_name: []const u8,
-    ) !?bool {
+    ) !?db_mod.types.DocumentArtifactReprocessAcceptance {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         const group_id = (try table_catalog.resolveGroupForKey(alloc, self.catalog, table_name, doc_key)) orelse return null;
         var resolved_route = try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, .prefer_leader);
@@ -28104,7 +28104,9 @@ pub const HostedProvisionedTableWriteSource = struct {
                         else => return err,
                     };
                     defer response.deinit(alloc);
-                    break :blk true;
+                    const parsed = try std.json.parseFromSlice(struct { accepted_sequence: ?u64 = null }, alloc, response.body, .{ .ignore_unknown_fields = true });
+                    defer parsed.deinit();
+                    break :blk .{ .handled = true, .accepted_sequence = parsed.value.accepted_sequence };
                 },
             };
         }
@@ -28496,7 +28498,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         table_name: []const u8,
         doc_key: []const u8,
         artifact_name: []const u8,
-    ) !?bool {
+    ) !?db_mod.types.DocumentArtifactReprocessAcceptance {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         if (comptime control_only_storage_sources) {
             const local_source = self.groupLocalWriteSource() orelse
@@ -28515,8 +28517,8 @@ pub const HostedProvisionedTableWriteSource = struct {
         const hosted_cache = try hostedManagedDbCacheForRoot(self.replica_root_dir);
         var cached = try self.getOrOpenCachedDbMode(hosted_cache, path, group_id, table_name, .default);
         defer cached.deinit(hosted_cache.write_cache.alloc);
-        const handled = try cached.db.reprocessDocumentArtifact(alloc, doc_key, artifact_name);
-        if (handled) {
+        const handled = try cached.db.reprocessDocumentArtifactAcceptance(alloc, doc_key, artifact_name);
+        if (handled.handled) {
             try drainManagedDbBeforeClose(cached.db);
             self.invalidateManagedCache(table_name);
         }
@@ -45581,12 +45583,12 @@ fn implementationTests() type {
             try std.testing.expectEqual(@as(?u64, 3), moved.child_ranges[0].placement_generation);
             try std.testing.expectEqualStrings("remote_committed", moved.child_ranges[0].route_status.?);
 
-            try std.testing.expectEqual(@as(?bool, true), try write_source.source().reprocessDocumentArtifact(
+            try std.testing.expect((try write_source.source().reprocessDocumentArtifact(
                 alloc,
                 "docs",
                 "doc:a",
                 "document_units_v1",
-            ));
+            )).?.handled);
 
             var after = (try read_source.source().documentArtifactManifest(
                 alloc,
@@ -45611,7 +45613,7 @@ fn implementationTests() type {
                 "document_units_v1",
                 .read_index,
             )) == null);
-            try std.testing.expectEqual(@as(?bool, null), try write_source.source().reprocessDocumentArtifact(
+            try std.testing.expectEqual(@as(?db_mod.types.DocumentArtifactReprocessAcceptance, null), try write_source.source().reprocessDocumentArtifact(
                 alloc,
                 "wrong",
                 "doc:a",

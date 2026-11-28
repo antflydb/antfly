@@ -16,6 +16,7 @@
 const std = @import("std");
 const A = std.mem.Allocator;
 const binary = @import("scoped_retry_encoding.zig");
+pub const backlog = @import("scoped_retry_backlog.zig");
 const Group = @import("enrichment_worker.zig").PendingDocumentGroup;
 
 /// A bounded durable workset, separate from the contiguous applied watermark.
@@ -143,6 +144,7 @@ pub const PreparedDocument = struct { delayed: []u64, changed: bool };
 const BudgetKey = struct { logical: u64, digest: ?[32]u8 };
 const BudgetCounts = struct { failures: u32 = 0, waits: u32 = 0 };
 pub const State = struct {
+    sleeping: backlog.Backlog = .{},
     config_hash: u64 = 0,
     scanned_sequence: u64 = 0,
     scan_document: []const u8 = "",
@@ -172,6 +174,8 @@ pub const State = struct {
         _ = self.tickets.swapRemove(index);
     }
     pub fn beginReplan(self: *State) void {
+        for (self.sleeping.entries.items) |*entry| entry.replan = true;
+        if (self.sleeping.entries.items.len != 0) self.sleeping.dirty = true;
         for (self.tickets.items) |ticket| self.pending_replan.set(ticket.slot);
     }
     pub fn completeReplan(self: *State, due_work: Due) void {
@@ -206,6 +210,7 @@ pub const State = struct {
     pub fn deinit(self: *State, a: A) void {
         for (self.tickets.items) |*ticket| ticket.deinit(a);
         self.tickets.deinit(a);
+        self.sleeping.deinit(a);
         self.logical_budgets.deinit(a);
         self.logical_present.deinit(a);
         self.releasePersistedDocuments(a);
@@ -492,10 +497,38 @@ pub const State = struct {
         try validateTicket(ticket);
         return ticket;
     }
+    fn ticketEncodedSize(ticket: Ticket) !usize {
+        const referenced = isReference(ticket.document);
+        const size = 4 + 4 + try binary.keyLength(wireIdentity(ticket.document)) + @as(usize, if (referenced) 9 + @as(usize, if (ticket.document_location != null) 37 else 0) else 0) + 8 + 1 + @as(usize, if (ticket.source_digest != null) 32 else 0) + 1 + @as(usize, if (ticket.source_stamp != null) 48 else 0) + 8 + 8 + 2 + ticket.budgets.items.len * 40;
+        return size;
+    }
+
+    pub fn discoverySlots(self: State) usize {
+        // Retain a promotion slot even at the durable disk bound.
+        return (max_documents - 1) -| self.tickets.items.len;
+    }
+
+    pub fn backlogAdmissionBlock(self: State) ?@import("../types.zig").DocumentArtifactReprocessStatus.AdmissionBlock {
+        if (self.discoverySlots() != 0) return null;
+        if (self.sleeping.entries.items.len >= backlog.max_entries) return .backlog_ticket_limit;
+        for (self.tickets.items) |ticket| {
+            const allowance = backlogAllowance(ticket) catch continue;
+            if (self.sleeping.canAdd(allowance)) return null;
+        }
+        return .backlog_byte_limit;
+    }
+
+    pub fn oldestUnresolvedSequence(self: State) ?u64 {
+        var oldest: u64 = std.math.maxInt(u64);
+        for (self.tickets.items) |ticket| oldest = @min(oldest, ticket.sequence);
+        for (self.sleeping.entries.items) |entry| oldest = @min(oldest, entry.id.sequence);
+        return if (self.hasDebt()) oldest else null;
+    }
+
     fn encodeTicket(ticket: Ticket, a: A) ![]u8 {
         try validateTicket(ticket);
         const referenced = isReference(ticket.document);
-        const size = 4 + 4 + try binary.keyLength(wireIdentity(ticket.document)) + @as(usize, if (referenced) 9 + @as(usize, if (ticket.document_location != null) 37 else 0) else 0) + 8 + 1 + @as(usize, if (ticket.source_digest != null) 32 else 0) + 1 + @as(usize, if (ticket.source_stamp != null) 48 else 0) + 8 + 8 + 2 + ticket.budgets.items.len * 40;
+        const size = try ticketEncodedSize(ticket);
         const bytes = try a.alloc(u8, size);
         errdefer a.free(bytes);
         var writer = binary.Writer{ .bytes = bytes };
@@ -637,6 +670,102 @@ pub const State = struct {
         };
         return result;
     }
+    pub fn hasDebt(self: State) bool {
+        return self.tickets.items.len != 0 or self.sleeping.entries.items.len != 0;
+    }
+
+    // Reserve the maximum metadata for this same document so promoting and
+    // rescheduling a sleeper cannot consume the last slot at the disk bound.
+    fn backlogAllowance(ticket: Ticket) !usize {
+        const key_bytes = try binary.keyLength(wireIdentity(ticket.document));
+        const reference_metadata: usize = if (isReference(ticket.document)) 9 + 37 else 0;
+        const document_bytes = std.math.cast(usize, ticket.document_bytes) orelse return error.InvalidEnrichmentState;
+        return (4 + max_ticket_bytes - max_document_key_bytes + reference_metadata + key_bytes) +| document_bytes;
+    }
+
+    /// Encode the retry payload with its own large-ID bytes so ordinary
+    /// working-set reference collection can proceed independently.
+    pub fn spill(self: *State, a: A, index: usize, resolver: DocumentResolver) !bool {
+        const ticket = self.tickets.items[index];
+        const allowance = try backlogAllowance(ticket);
+        if (!self.sleeping.canAdd(allowance)) return false;
+        const raw = try encodeTicket(ticket, a);
+        defer a.free(raw);
+        const size = 4 + raw.len + @as(usize, @intCast(ticket.document_bytes));
+        const bytes = try a.alloc(u8, size);
+        errdefer a.free(bytes);
+        var writer = binary.Writer{ .bytes = bytes };
+        writer.int(u32, @intCast(raw.len));
+        writer.put(raw);
+        if (ticket.document_bytes != 0) {
+            const document = try self.documentAlloc(a, ticket.document, ticket.document_bytes, resolver);
+            defer a.free(document);
+            writer.put(document);
+        }
+        try self.sleeping.insert(a, .{
+            .id = backlog.Identity.init(ticket.document, ticket.sequence),
+            .bytes = size,
+            .charged_bytes = allowance,
+            .deadline_ms = ticket.deadline_ms,
+            .replan = self.pending_replan.isSet(ticket.slot),
+        }, bytes);
+        self.removeTicket(a, index);
+        return true;
+    }
+
+    pub fn readSleeping(a: A, entry: backlog.Entry, bytes: []const u8) !struct { ticket: Ticket, key: []const u8 } {
+        if (entry.bytes != bytes.len) return error.InvalidEnrichmentState;
+        var reader = binary.Reader{ .bytes = bytes };
+        var ticket = try decodeTicket(a, try reader.take(try reader.int(u32)), 0);
+        errdefer ticket.deinit(a);
+        if (backlog.Identity.order(entry.id, backlog.Identity.init(ticket.document, ticket.sequence)) != .eq or
+            entry.deadline_ms != ticket.deadline_ms) return error.InvalidEnrichmentState;
+        if (ticket.document_bytes != bytes.len - reader.offset) return error.InvalidEnrichmentState;
+        const key = bytes[reader.offset..];
+        if (key.len != 0) {
+            var digest: Reference = undefined;
+            std.crypto.hash.sha2.Sha256.hash(key, &digest, .{});
+            if (!std.mem.eql(u8, &digest, &(try referenceDigest(ticket.document)))) return error.InvalidEnrichmentState;
+        }
+        return .{ .ticket = ticket, .key = key };
+    }
+
+    pub fn activate(self: *State, a: A, index: usize, bytes: []const u8) !void {
+        const entry = self.sleeping.entries.items[index];
+        if (self.tickets.items.len == max_documents) return error.MemoryBudgetExceeded;
+        var decoded = try readSleeping(a, entry, bytes);
+        errdefer decoded.ticket.deinit(a);
+        decoded.ticket.slot = self.nextSlot();
+        try self.tickets.ensureUnusedCapacity(a, 1);
+        try self.rememberDocument(a, decoded.ticket.document, decoded.key);
+        try self.sleeping.remove(a, index);
+        self.tickets.appendAssumeCapacity(decoded.ticket);
+        if (entry.replan) self.pending_replan.set(decoded.ticket.slot);
+        self.invalidateBudgetIndex();
+    }
+
+    fn nextSlot(self: State) u8 {
+        var used: std.StaticBitSet(max_documents) = .empty;
+        for (self.tickets.items) |existing| used.set(existing.slot);
+        var slot: usize = 0;
+        while (used.isSet(slot)) : (slot += 1) {}
+        return @intCast(slot);
+    }
+
+    pub fn priorAttempt(self: State, document: []const u8, logical: u64, fingerprint: u64, source_digest: ?[32]u8) Budget {
+        var result = Budget{ .fingerprint = fingerprint, .logical_fingerprint = logical };
+        for (self.tickets.items) |ticket| {
+            if (!std.mem.eql(u8, ticket.document, document) or !std.meta.eql(ticket.source_digest, source_digest)) continue;
+            for (ticket.budgets.items) |budget| {
+                if (budget.logical_fingerprint != logical or budget.fingerprint != fingerprint) continue;
+                result.failures = @max(result.failures, budget.failures);
+                result.waits = @max(result.waits, budget.waits);
+                result.deadline_ms = @max(result.deadline_ms, budget.deadline_ms);
+            }
+        }
+        return result;
+    }
+
     /// All members of a failed provider invocation receive the same episode.
     /// Each producer retains its own clock even when one document owns several
     /// tickets. Compatible batch rebucketing cannot reset logical budgets.
@@ -663,11 +792,7 @@ pub const State = struct {
         }
         if (selected == null) {
             if (self.tickets.items.len == max_documents) return error.MemoryBudgetExceeded;
-            var used: std.StaticBitSet(max_documents) = .empty;
-            for (self.tickets.items) |existing| used.set(existing.slot);
-            var slot: usize = 0;
-            while (used.isSet(slot)) : (slot += 1) {}
-            var ticket = Ticket{ .slot = @intCast(slot), .source_stamp = stamp, .document = try a.dupe(u8, encoded), .document_bytes = if (isReference(encoded)) group.doc_key.len else 0, .document_location = if (isReference(encoded)) location else null, .sequence = group.sequence, .source_digest = source_digest, .deadline_ms = deadline_ms, .revision = 1 };
+            var ticket = Ticket{ .slot = self.nextSlot(), .source_stamp = stamp, .document = try a.dupe(u8, encoded), .document_bytes = if (isReference(encoded)) group.doc_key.len else 0, .document_location = if (isReference(encoded)) location else null, .sequence = group.sequence, .source_digest = source_digest, .deadline_ms = deadline_ms, .revision = 1 };
             errdefer ticket.deinit(a);
             var next = budget;
             next.deadline_ms = deadline_ms;
@@ -725,12 +850,11 @@ pub const State = struct {
         if (self.pending_replan.count() != 0) return 0;
         var result: u64 = std.math.maxInt(u64);
         for (self.tickets.items) |ticket| result = @min(result, ticket.deadline_ms);
-        return if (self.tickets.items.len == 0) 0 else result;
+        for (self.sleeping.entries.items) |entry| result = @min(result, if (entry.replan) 0 else entry.deadline_ms);
+        return if (self.hasDebt()) result else 0;
     }
     pub fn appliedThrough(self: State, scanned: u64) u64 {
-        var result = scanned;
-        for (self.tickets.items) |ticket| result = @min(result, ticket.sequence -| 1);
-        return result;
+        return if (self.oldestUnresolvedSequence()) |oldest| @min(scanned, oldest -| 1) else scanned;
     }
     pub fn due(self: State, a: A, now_ms: u64) !Due {
         return self.selectDue(a, now_ms, false, null, 0);
@@ -838,6 +962,35 @@ pub const State = struct {
         }
         return .{ .delayed = try delayed.toOwnedSlice(a), .changed = changed };
     }
+    pub fn hasActiveDocumentBudget(self: State, document: []const u8, source_digest: ?[32]u8, logical: u64) bool {
+        for (self.tickets.items) |ticket| {
+            if (!std.mem.eql(u8, ticket.document, document) or !std.meta.eql(ticket.source_digest, source_digest)) continue;
+            for (ticket.budgets.items) |budget| {
+                if (budget.logical_fingerprint == logical) return true;
+            }
+        }
+        return false;
+    }
+
+    /// Keep a ready token outstanding when a cold sibling owns a later
+    /// provider clock for the same input. This advances no attempt budget.
+    pub fn extendDocumentDeadline(self: *State, document: []const u8, source_digest: ?[32]u8, logical: u64, deadline_ms: u64) !bool {
+        var changed = false;
+        for (self.tickets.items) |*ticket| {
+            if (!std.mem.eql(u8, ticket.document, document) or !std.meta.eql(ticket.source_digest, source_digest)) continue;
+            for (ticket.budgets.items) |*budget| {
+                if (budget.logical_fingerprint != logical or budget.deadline_ms >= deadline_ms) continue;
+                ticket.revision = try std.math.add(u64, ticket.revision, 1);
+                ticket.dirty = true;
+                budget.revision = ticket.revision;
+                budget.deadline_ms = deadline_ms;
+                ticket.refreshDeadline();
+                changed = true;
+            }
+        }
+        return changed;
+    }
+
     pub fn retireSuperseded(self: *State, a: A, group: Group, encoded: []const u8, source_digest: ?[32]u8) void {
         var i: usize = 0;
         while (i < self.tickets.items.len) {
@@ -1128,4 +1281,43 @@ test "privacy retry workset preserves empty document tickets and exclusive curso
     var roundtrip = try State.decode(a, legacy);
     defer roundtrip.deinit(a);
     try std.testing.expect(!roundtrip.hasScanDocument());
+}
+
+test "explicit retry keeps the scheduling deadline and starts fresh attempt accounting" {
+    const a = std.testing.allocator;
+    var state: State = .{};
+    defer state.deinit(a);
+    const digest: [32]u8 = @splat(7);
+    try state.park(a, .{ .doc_key = "doc", .sequence = 3 }, 200, .{ .fingerprint = 10, .logical_fingerprint = 42, .failures = 5, .waits = 2 }, digest);
+    const key = try a.alloc(u8, std.base64.standard_no_pad.Encoder.calcSize("doc".len));
+    defer a.free(key);
+    const encoded = std.base64.standard_no_pad.Encoder.encode(key, "doc");
+    const delayed = try state.prepareDocument(a, encoded, digest, &.{42}, 100);
+    defer a.free(delayed.delayed);
+    try std.testing.expectEqualSlices(u64, &.{42}, delayed.delayed);
+    try std.testing.expectEqual(@as(u32, 0), state.priorAttempt(encoded, 42, 11, digest).failures);
+    try std.testing.expectEqual(@as(u32, 5), state.priorAttempt(encoded, 42, 10, digest).failures);
+}
+
+test "scoped retry workset inherited cold clock fences ready retirement without spending an attempt" {
+    const a = std.testing.allocator;
+    const digest: [32]u8 = @splat(1);
+    var state: State = .{};
+    defer state.deinit(a);
+    try state.park(a, .{ .doc_key = "doc", .sequence = 2 }, 100, .{
+        .fingerprint = 7,
+        .logical_fingerprint = 6,
+        .failures = 3,
+        .waits = 2,
+    }, digest);
+    const token = try state.due(a, 100);
+    defer token.deinit(a);
+    const key = try documentIdentityAlloc(a, "doc");
+    defer a.free(key);
+    try std.testing.expect(try state.extendDocumentDeadline(key, digest, 6, 1_000));
+    state.retire(a, token.tokens);
+    try std.testing.expectEqual(@as(u64, 1), state.appliedThrough(2));
+    try std.testing.expectEqual(@as(u64, 1_000), state.deadline());
+    try std.testing.expectEqual(@as(u32, 3), state.prior(7).failures);
+    try std.testing.expectEqual(@as(u32, 2), state.prior(7).waits);
 }

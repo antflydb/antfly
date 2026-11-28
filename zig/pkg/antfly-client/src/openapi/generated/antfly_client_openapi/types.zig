@@ -12984,6 +12984,7 @@ pub const DocumentArtifactManifest = struct {
     last_error_code: OpenApiOptionalNullable([]const u8) = .absent,
     /// Human-readable last extraction or materialization error summary, when available.
     last_error_message: OpenApiOptionalNullable([]const u8) = .absent,
+    reprocess: ?DocumentArtifactReprocessStatus = null,
     /// Opaque JSON manifest for the artifact units and provenance. Present only for raw detail responses. Newly produced document-extraction generations include the declared execution policy under execution, including on failed generations; it is not a measured provider budget. Older manifests may omit it.
     manifest_json: ?[]const u8 = null,
     /// Optional opaque JSON state for incremental processing. Present only for raw detail responses.
@@ -13018,6 +13019,7 @@ pub const DocumentArtifactManifest = struct {
         .{ "merge_operation_count", "merge_operation_count", false },
         .{ "last_error_code", "last_error_code", false },
         .{ "last_error_message", "last_error_message", false },
+        .{ "reprocess", "reprocess", true },
         .{ "manifest_json", "manifest_json", true },
         .{ "state_json", "state_json", false },
     };
@@ -13124,6 +13126,10 @@ pub const DocumentArtifactManifest = struct {
                 try jw.objectField("last_error_message");
                 try jw.write(value);
             },
+        }
+        if (self.reprocess) |value| {
+            try jw.objectField("reprocess");
+            try jw.write(value);
         }
         if (self.manifest_json) |value| {
             try jw.objectField("manifest_json");
@@ -13380,6 +13386,77 @@ pub const DocumentArtifactReprocessJobStartRequest = struct {
 pub const DocumentArtifactReprocessResponse = struct {
     /// Indicates that reprocessing was accepted.
     reprocess: []const u8,
+    /// Committed replay sequence for a deferred native extraction request. Scope to the accepting shard and the artifact identified by this route.
+    accepted_sequence: ?u64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "reprocess", "reprocess", false },
+        .{ "accepted_sequence", "accepted_sequence", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("reprocess");
+        try jw.write(self.reprocess);
+        if (self.accepted_sequence) |value| {
+            try jw.objectField("accepted_sequence");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Most recent durable deferral for this accepted extraction attempt, retained independently of publication status. This is a historical observation and does not imply the attempt is still waiting.
+pub const DocumentArtifactReprocessRetry = struct {
+    reason: []const u8,
+    /// Unix timestamp in milliseconds before which this attempt is deferred.
+    retry_at_ms: u64,
+    /// Enrichment stage identified by the retry outcome, when available. Enrichment is used when the failure does not identify a narrower stage.
+    stage: ?[]const u8 = null,
+    /// Stable error identifier associated with the deferral, when available.
+    error_code: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "reason", "reason", false },
+        .{ "retry_at_ms", "retry_at_ms", false },
+        .{ "stage", "stage", true },
+        .{ "error_code", "error_code", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("reason");
+        try jw.write(self.reason);
+        try jw.objectField("retry_at_ms");
+        try jw.write(self.retry_at_ms);
+        if (self.stage) |value| {
+            try jw.objectField("stage");
+            try jw.write(value);
+        }
+        if (self.error_code) |value| {
+            try jw.objectField("error_code");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const DocumentArtifactReprocessShardCursor = struct {
@@ -13423,6 +13500,181 @@ pub const DocumentArtifactReprocessShardCursor = struct {
         try jw.write(self.failed);
         try jw.objectField("limit");
         try jw.write(self.limit);
+        try jw.endObject();
+    }
+};
+
+/// Latest explicit native document-extraction reprocess intent for this artifact. Present on single-artifact inspection when an intent exists. When the first publication is pending, the summary has generation zero and no raw manifest.
+pub const DocumentArtifactReprocessStatus = struct {
+    /// Target generation recorded by the accepted request.
+    requested_generation: u64,
+    /// Replay sequence committed with the request in the accepting shard, when available.
+    accepted_sequence: ?u64 = null,
+    /// Published has a manifest receipt for the accepted request and can include extraction failures. Pending has no matching publication. Superseded no longer matches the configured producer. Unverified is a legacy intent whose target generation was reached without a publication receipt.
+    status: []const u8,
+    worker: ?DocumentArtifactReprocessWorker = null,
+    last_retry: ?DocumentArtifactReprocessRetry = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "requested_generation", "requested_generation", false },
+        .{ "accepted_sequence", "accepted_sequence", true },
+        .{ "status", "status", false },
+        .{ "worker", "worker", true },
+        .{ "last_retry", "last_retry", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("requested_generation");
+        try jw.write(self.requested_generation);
+        if (self.accepted_sequence) |value| {
+            try jw.objectField("accepted_sequence");
+            try jw.write(value);
+        }
+        try jw.objectField("status");
+        try jw.write(self.status);
+        if (self.worker) |value| {
+            try jw.objectField("worker");
+            try jw.write(value);
+        }
+        if (self.last_retry) |value| {
+            try jw.objectField("last_retry");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Sample of the owning shard's enrichment worker, when present. The worker services multiple documents and producers. Sequence values use the shard's enrichment replay sequence space.
+pub const DocumentArtifactReprocessWorker = struct {
+    /// Replay scan watermark, which can run ahead of the contiguous applied watermark while requests wait.
+    scanned_sequence: u64,
+    /// Contiguous applied enrichment watermark.
+    applied_sequence: u64,
+    /// Latest enrichment replay watermark requested of the worker.
+    target_sequence: u64,
+    /// Whether retry debt is preventing the worker from admitting new source groups.
+    retry_queue_full: bool,
+    backlog: ?DocumentArtifactRetryBacklog = null,
+    /// Whether the worker has retry work.
+    retrying: bool,
+    /// Unix timestamp in milliseconds for the worker's next scheduled retry, when available. This is shard-wide.
+    next_retry_at_ms: ?u64 = null,
+    /// Whether the shard's worker has failed.
+    failed: bool,
+    /// Latest known worker error such as a publication wait. This is shard-wide.
+    last_error_code: ?[]const u8 = null,
+    /// Unix timestamp of the last observed worker activity, when available. This is shard-wide.
+    last_progress_at_ms: ?u64 = null,
+    /// Whether a background worker has started. Embedded callers can also drive replay inline.
+    background_running: bool,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "scanned_sequence", "scanned_sequence", false },
+        .{ "applied_sequence", "applied_sequence", false },
+        .{ "target_sequence", "target_sequence", false },
+        .{ "retry_queue_full", "retry_queue_full", false },
+        .{ "backlog", "backlog", true },
+        .{ "retrying", "retrying", false },
+        .{ "next_retry_at_ms", "next_retry_at_ms", true },
+        .{ "failed", "failed", false },
+        .{ "last_error_code", "last_error_code", true },
+        .{ "last_progress_at_ms", "last_progress_at_ms", true },
+        .{ "background_running", "background_running", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("scanned_sequence");
+        try jw.write(self.scanned_sequence);
+        try jw.objectField("applied_sequence");
+        try jw.write(self.applied_sequence);
+        try jw.objectField("target_sequence");
+        try jw.write(self.target_sequence);
+        try jw.objectField("retry_queue_full");
+        try jw.write(self.retry_queue_full);
+        if (self.backlog) |value| {
+            try jw.objectField("backlog");
+            try jw.write(value);
+        }
+        try jw.objectField("retrying");
+        try jw.write(self.retrying);
+        if (self.next_retry_at_ms) |value| {
+            try jw.objectField("next_retry_at_ms");
+            try jw.write(value);
+        }
+        try jw.objectField("failed");
+        try jw.write(self.failed);
+        if (self.last_error_code) |value| {
+            try jw.objectField("last_error_code");
+            try jw.write(value);
+        }
+        if (self.last_progress_at_ms) |value| {
+            try jw.objectField("last_progress_at_ms");
+            try jw.write(value);
+        }
+        try jw.objectField("background_running");
+        try jw.write(self.background_running);
+        try jw.endObject();
+    }
+};
+
+/// Shard-wide retry debt sampled from the replay worker.
+pub const DocumentArtifactRetryBacklog = struct {
+    active_tickets: u32,
+    sleeping_tickets: u32,
+    oldest_unresolved_sequence: ?u64 = null,
+    /// Admission constraint preventing replay from admitting fresh work, when blocked.
+    admission_blocked_by: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "active_tickets", "active_tickets", false },
+        .{ "sleeping_tickets", "sleeping_tickets", false },
+        .{ "oldest_unresolved_sequence", "oldest_unresolved_sequence", true },
+        .{ "admission_blocked_by", "admission_blocked_by", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("active_tickets");
+        try jw.write(self.active_tickets);
+        try jw.objectField("sleeping_tickets");
+        try jw.write(self.sleeping_tickets);
+        if (self.oldest_unresolved_sequence) |value| {
+            try jw.objectField("oldest_unresolved_sequence");
+            try jw.write(value);
+        }
+        if (self.admission_blocked_by) |value| {
+            try jw.objectField("admission_blocked_by");
+            try jw.write(value);
+        }
         try jw.endObject();
     }
 };

@@ -1091,6 +1091,44 @@ pub const DocumentArtifactChildRangePlacementUpdate = struct {
     split_eligible: ?bool = null,
 };
 
+/// Durable intent read alongside the currently published artifact. Worker
+/// progress is scoped to the owning shard and is sampled independently.
+pub const DocumentArtifactReprocessAcceptance = struct {
+    handled: bool,
+    accepted_sequence: ?u64 = null,
+};
+
+pub const DocumentArtifactReprocessStatus = struct {
+    pub const AdmissionBlock = enum { document_workset, backlog_ticket_limit, backlog_byte_limit };
+
+    pub const Backlog = struct {
+        active_tickets: u32 = 0,
+        sleeping_tickets: u32 = 0,
+        oldest_unresolved_sequence: ?u64 = null,
+        admission_blocked_by: ?AdmissionBlock = null,
+    };
+
+    pub const Worker = struct {
+        scanned_sequence: u64,
+        applied_sequence: u64,
+        target_sequence: u64,
+        retry_queue_full: bool,
+        backlog: ?Backlog = null,
+        retrying: bool,
+        next_retry_at_ms: ?u64 = null,
+        failed: bool,
+        last_error_code: ?RuntimeErrorName = null,
+        last_progress_at_ms: ?u64 = null,
+        background_running: bool,
+    };
+
+    requested_generation: u64,
+    accepted_sequence: ?u64 = null,
+    status: enum { pending, published, superseded, unverified },
+    worker: ?Worker = null,
+    last_retry: ?@import("artifact_reprocess_intent.zig").RetryObservation = null,
+};
+
 pub const DocumentArtifactManifest = struct {
     document_id: []u8,
     artifact_name: []u8,
@@ -1121,6 +1159,8 @@ pub const DocumentArtifactManifest = struct {
     merge_operation_count: usize = 0,
     last_error_code: ?[]u8 = null,
     last_error_message: ?[]u8 = null,
+
+    reprocess: ?DocumentArtifactReprocessStatus = null,
 
     pub fn deinit(self: *DocumentArtifactManifest, alloc: Allocator) void {
         alloc.free(self.document_id);

@@ -3202,6 +3202,7 @@ pub const RemoteDocumentArtifactManifest = struct {
     merge_operation_count: usize = 0,
     last_error_code: ?[]const u8 = null,
     last_error_message: ?[]const u8 = null,
+    reprocess: ?db_mod.types.DocumentArtifactReprocessStatus = null,
     manifest_json: []const u8,
     state_json: ?[]const u8 = null,
 };
@@ -3311,6 +3312,7 @@ pub fn remoteDocumentArtifactManifestAlloc(alloc: std.mem.Allocator, remote: Rem
         .merge_operation_count = remote.merge_operation_count,
         .last_error_code = last_error_code,
         .last_error_message = last_error_message,
+        .reprocess = remote.reprocess,
     };
 }
 

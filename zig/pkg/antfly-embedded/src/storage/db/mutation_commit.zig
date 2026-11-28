@@ -2923,6 +2923,14 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 S.ownerField(self, "core").*.nextDerivedSequence()
             else
                 S.ownerField(self, "core").*.reserveDerivedAppendSequence();
+            var staged_reprocess_sequence: u64 = 0;
+            if (opts.force_generated_artifact_names.len != 0) {
+                for (precomputed_generated.artifact_writes) |write| {
+                    if (!internal_keys.isAssetReprocessReceiptKey(write.key)) continue;
+                    try @import("artifact_reprocess_intent.zig").stampReceipt(@constCast(write.value), sequence);
+                    staged_reprocess_sequence = sequence;
+                }
+            }
             if (group_plan) |plan| {
                 const overlay = &group_overlay;
                 const table = try group_mutations.tableIdentity(overlay, S.ownerField(self, "core").*.identity_namespace.table_id, S.ownerField(self, "root_incarnation").*);
@@ -4852,6 +4860,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     return err;
                 };
             }
+            if (opts.reprocess_sequence_out) |out| out.* = staged_reprocess_sequence;
             // WS4 phase 2: the primary commit is durable now, and every
             // inline text publication's mutations rode in that SAME
             // native transaction (commit_participant.List.stage ran

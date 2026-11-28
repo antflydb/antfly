@@ -3259,13 +3259,17 @@ pub const HealthSource = struct {
         try antfly.db.enrichment_utf8_text.writePrometheus(writer);
         const pipeline_metrics = @import("antfly_platform").document_pipeline_metrics;
         var pipeline_snapshot = pipeline_metrics.snapshot();
-        if (comptime linked_storage) if (self.data_server.kernel_owner_source) |owner| {
-            var response = try owner.context.pipelineMetricsJson();
-            defer response.deinit();
-            const parsed = try std.json.parseFromSlice(pipeline_metrics.Snapshot, self.data_server.alloc, response.bytes(), .{});
-            defer parsed.deinit();
-            try pipeline_snapshot.merge(parsed.value);
-        };
+        if (comptime linked_storage) {
+            if (self.data_server.kernel_owner_source) |owner| {
+                var response = try owner.context.pipelineMetricsJson();
+                defer response.deinit();
+                const parsed = try std.json.parseFromSlice(pipeline_metrics.Snapshot, self.data_server.alloc, response.bytes(), .{});
+                defer parsed.deinit();
+                try pipeline_snapshot.merge(parsed.value);
+            }
+        } else {
+            try antfly.db.DB.mergePhysicalPipelineMetrics(&pipeline_snapshot);
+        }
         try pipeline_snapshot.writePrometheus(writer);
     }
 
