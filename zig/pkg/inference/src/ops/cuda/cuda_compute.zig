@@ -3853,6 +3853,7 @@ pub const CudaCompute = struct {
         return count;
     }
     pub const BoundedDecodeClaim = struct {
+        inputs_rebound: bool = false,
         compute: *CudaCompute,
         head_destination: ?buffer_mod.DeviceBuffer,
         capture_scope: ?@import("../../execution/stream_workspace.zig").Scope = null,
@@ -4132,6 +4133,10 @@ pub const CudaCompute = struct {
             burst_value.drained = true;
             try layout.publishReadback(readback_words, owner.next_positions[0 .. owner.rows * 3], &owner.progress, first, second);
             const readback_host_ns = if (self.profile) platform.time.monotonicNs() -| readback_start else 0;
+            const rebound = self.inputs_rebound and self.launch_route == .replayed;
+            if (rebound and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
+                std.debug.print("LIGHTONOCR3 cuda_model_graph_rebound_replay_rows={d}\n", .{owner.rows});
+
             if (self.log_profile) if (self.launch_route) |route| {
                 if (route == .learned) if (owner.plan) |plan| logLearnedWorkspace(plan, owner.rows);
                 std.log.info("CUDA decoder burst rows={d} route={s} submit_host_ns={d} capture_instantiate_host_ns={d} readback_host_ns={d} epoch={d}", .{
@@ -4146,6 +4151,7 @@ pub const CudaCompute = struct {
                 const planned = if (route == .learned) owner.arenaLayout() catch null else arena;
                 observation.cudaDecoderWorkspace(.{
                     .route = route,
+                    .rebound_bursts = @intFromBool(rebound),
                     .submit_host_ns = self.submit_host_ns,
                     .capture_instantiate_host_ns = self.capture_instantiate_host_ns,
                     .readback_host_ns = readback_host_ns,
@@ -4581,11 +4587,7 @@ pub const CudaCompute = struct {
         try self.lighton_attention.init(&self.ctx);
         if (owner.phase == .warm and owner.storage_layout.?.fused_head_workspace != null)
             try self.lighton_head.init(&self.ctx);
-        if (rebind) {
-            try self.rebindBoundedGraphInputs(graph_phase);
-            if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
-                std.debug.print("LIGHTONOCR3 cuda_model_graph_rebound_rows={d}\n", .{rows});
-        } else if (owner.phase != .replay) try self.resetBoundedGraphInputs(descriptor);
+        if (rebind) try self.rebindBoundedGraphInputs(graph_phase) else if (owner.phase != .replay) try self.resetBoundedGraphInputs(descriptor);
 
         // Ensure the owned cohort can retain its warmed plans. Prefill shape
         // diversity may exhaust the cache between otherwise valid epochs.
@@ -4597,6 +4599,7 @@ pub const CudaCompute = struct {
             .compute = self,
             .head_destination = head_destination,
             .capture_scope = capture_scope,
+            .inputs_rebound = rebind,
         };
     }
 

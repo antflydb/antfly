@@ -83,6 +83,15 @@ def graph_first_replays(text):
     return [int(rows) for rows, *_ in replays], banks
 
 
+def graph_rebound_replays(text):
+    return [
+        int(rows)
+        for rows in re.findall(
+            r"LIGHTONOCR3 cuda_model_graph_rebound_replay_rows=(\d+)", text
+        )
+    ]
+
+
 def retirement_capacity_retries(text):
     return [
         int(count)
@@ -767,6 +776,16 @@ def run(args, model, label, mode, concurrency, output):
                         default=0,
                     )
                     sample["model_graph_max_declared_replay_rows"] = max_declared_rows
+                    rebound_rows = graph_rebound_replays(section)
+                    sample["model_graph_rebound_replays"] = len(rebound_rows)
+                    max_rebound_rows = max(rebound_rows, default=0)
+                    sample["model_graph_max_rebound_replay_rows"] = max_rebound_rows
+                    if (
+                        args.require_rebound_model_graph_replay_rows is not None
+                        and max_rebound_rows < args.require_rebound_model_graph_replay_rows
+                    ):
+                        result["status"] = "missing_required_rebound_model_graph_replay_rows"
+
                     if recordings := graph_recording_terminals(section):
                         sample["model_graph_recording_terminals"] = recordings
                     if retirements := graph_retirements(section):
@@ -2187,6 +2206,13 @@ def main():
         metavar="MIN_ROWS",
         help="Require a timed replay using a declared workspace at or above this width",
     )
+    parser.add_argument(
+        "--require-rebound-model-graph-replay-rows",
+        type=int,
+        choices=range(2, 129),
+        metavar="MIN_ROWS",
+        help="Require a completed replay after rebinding at or above this width",
+    )
     parser.add_argument("--require-wide-packed-prefill", action="store_true")
     parser.add_argument("--require-lighton-norm-weight-cache", action="store_true")
     parser.add_argument("--require-florence-bart-ffn", action="store_true")
@@ -2537,6 +2563,20 @@ def main():
         if args.require_declared_model_graph_replay_rows > args.batch_rows:
             parser.error(
                 "--require-declared-model-graph-replay-rows must fit --batch-rows"
+            )
+    if args.require_rebound_model_graph_replay_rows is not None:
+        if not (
+            args.backend == "cuda"
+            and args.cuda_batch
+            and args.policy_rounds
+            and "batch" in args.modes
+        ):
+            parser.error(
+                "--require-rebound-model-graph-replay-rows requires timed CUDA batch --policy-rounds"
+            )
+        if args.require_rebound_model_graph_replay_rows > args.batch_rows:
+            parser.error(
+                "--require-rebound-model-graph-replay-rows must fit --batch-rows"
             )
     if args.require_physical128 and not args.policy_rounds:
         parser.error("--require-physical128 requires timed --policy-rounds")

@@ -535,6 +535,7 @@ pub const CudaDecoderWorkspace = struct {
     eager_bursts: u64 = 0,
     recorded_bursts: u64 = 0,
     replayed_bursts: u64 = 0,
+    rebound_bursts: u64 = 0,
     /// Host wall time through kernel submission or graph launch. Capture
     /// instantiation is a subset, and readback includes device completion.
     submit_host_ns: u64 = 0,
@@ -600,6 +601,7 @@ pub inline fn cudaDecoderWorkspace(workspace: CudaDecoderWorkspace) void {
         scope.cuda_decoder_workspace.?.recorded_bursts = (if (prior) |previous| previous.recorded_bursts else 0) +| @as(u64, @intFromBool(workspace.route == .recorded_and_launched));
         scope.cuda_decoder_workspace.?.replayed_bursts = (if (prior) |previous| previous.replayed_bursts else 0) +| @as(u64, @intFromBool(workspace.route == .replayed));
         if (prior) |previous| {
+            scope.cuda_decoder_workspace.?.rebound_bursts +|= previous.rebound_bursts;
             scope.cuda_decoder_workspace.?.submit_host_ns +|= previous.submit_host_ns;
             scope.cuda_decoder_workspace.?.capture_instantiate_host_ns +|= previous.capture_instantiate_host_ns;
             scope.cuda_decoder_workspace.?.readback_host_ns +|= previous.readback_host_ns;
@@ -1532,6 +1534,7 @@ test "CUDA decoder burst timings accumulate across nested observations" {
         defer _ = inner.finish();
         var replayed = captured;
         replayed.route = .replayed;
+        replayed.rebound_bursts = 1;
         replayed.submit_host_ns = 20;
         replayed.capture_instantiate_host_ns = 0;
         replayed.readback_host_ns = 250;
@@ -1542,6 +1545,7 @@ test "CUDA decoder burst timings accumulate across nested observations" {
     const total = outer.cuda_decoder_workspace.?;
     try testing.expectEqual(CudaDecoderWorkspace.Route.replayed, total.route);
     try testing.expectEqual(@as(u64, 2), total.completed_bursts);
+    try testing.expectEqual(@as(u64, 1), total.rebound_bursts);
     try testing.expectEqual(@as(u64, 1), total.recorded_bursts);
     try testing.expectEqual(@as(u64, 1), total.replayed_bursts);
     try testing.expectEqual(@as(u64, 820), total.submit_host_ns);

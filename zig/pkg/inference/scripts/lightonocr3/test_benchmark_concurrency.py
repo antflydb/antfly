@@ -22,6 +22,7 @@ from benchmark_concurrency import (
     graph_first_replays,
     graph_funding_denials,
     graph_recording_terminals,
+    graph_rebound_replays,
     graph_retirements,
     recurrent_placement_observation,
     retirement_capacity_retries,
@@ -95,6 +96,17 @@ class GraphReplayTests(unittest.TestCase):
         self.assertEqual(banks[2]["workspace_plan_origin"], "declared")
         self.assertEqual(banks[2]["workspace_events"], 0)
         self.assertEqual(banks[2]["workspace_bytes"], 0)
+
+
+class GraphReboundReplayTests(unittest.TestCase):
+    def test_counts_only_replays_with_completed_readback(self):
+        text = (
+            "LIGHTONOCR3 cuda_model_graph_rebound_rows=113\n"
+            "LIGHTONOCR3 cuda_model_graph_first_replay_rows=113\n"
+            "LIGHTONOCR3 cuda_model_graph_rebound_replay_rows=98\n"
+            "LIGHTONOCR3 cuda_model_graph_rebound_replay_rows=30\n"
+        )
+        self.assertEqual(graph_rebound_replays(text), [98, 30])
 
 
 class GraphRetirementTests(unittest.TestCase):

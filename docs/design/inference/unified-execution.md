@@ -3455,6 +3455,16 @@ positions. All four CUDA checks passed, including the released 0.8B
 model. The fixture qualifies device binding and failure handling.
 Changing-cohort model inference and throughput remain unqualified.
 
+The benchmark now requires a completed rebound replay independently of
+ordinary replay. The runtime records the event only after validating the
+replay readback. Spark completed the three focused CUDA checks, and the
+12 benchmark parser tests passed locally. The first varied-page runs
+hit the serial reference's 128-token limit. At 384 tokens, the 8- and
+16-row LightOnOCR-3-0.8B runs each completed 64 pages with exact serial
+output. Both missed the rebound gate despite ordinary replays at their
+target widths. Their logs showed foreground vision, mixed prefill and
+changed bindings repeatedly retiring the active owner.
+
 The M4 Max focused cohort at `061f213135` passed all seven checks
 with zero skips. It exercised the shared installed Whisper Small
 checkpoint with the Metal backend required, verified assigned packed
