@@ -288,13 +288,15 @@ pub fn nativeGenerationMediaAdmissionWithInspection(
         };
     }
     if (config.family == .qwen3_5) {
-        const image_count = nativeGenerationImageCount(messages);
-        if (image_count == 0) return .{};
-        const prep_config = try qwen2vl_mm.loadPreprocessorConfig(allocator, model_dir);
-        const max_image_tokens = try qwen2vl_mm.maxImageTokenCount(prep_config);
+        if (nativeGenerationImageCount(messages) == 0) return .{};
         const images = try collectImagesInPromptOrder(allocator, messages);
         defer allocator.free(images);
-        return .{ .token_allowance = image_count *| (max_image_tokens +| 1), .host_scratch_bytes = try qwen2vl_mm.imageWorkingBytes(images, prep_config) };
+        const prep_config = try qwen2vl_mm.loadPreprocessorConfig(allocator, model_dir);
+        const image_admission = try qwen2vl_mm.imageAdmission(images, prep_config);
+        return .{
+            .token_allowance = std.math.add(usize, image_admission.visual_tokens, images.len) catch return error.PromptTooLong,
+            .host_scratch_bytes = image_admission.host_working_bytes,
+        };
     }
     var admission: NativeGenerationMediaAdmission = .{ .token_allowance = nativeGenerationImageTokenAllowance(messages, config) };
     if (projector_file) |file| if (messagesHaveAudio(messages)) {
@@ -8865,6 +8867,32 @@ test "Qwen3-VL media admission uses exact image geometry before scheduling" {
         @as(usize, 0),
         nativeGenerationPreliminaryMediaTokenAllowance(&messages, config),
     );
+}
+
+test "Qwen fallback admission budgets actual ordered visual rows" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "preprocessor_config.json", .data = "{}" });
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(path);
+
+    var header: [24]u8 = @splat(0);
+    @memcpy(header[0..8], "\x89PNG\r\n\x1a\n");
+    std.mem.writeInt(u32, header[8..12], 13, .big);
+    @memcpy(header[12..16], "IHDR");
+    std.mem.writeInt(u32, header[16..20], 56, .big);
+    std.mem.writeInt(u32, header[20..24], 56, .big);
+
+    const messages = [_]Message{.{
+        .role = "user",
+        .content = "compare",
+        .image_bytes = &.{&header},
+        .content_parts = &.{ .{ .image = 0 }, .{ .text = "compare" }, .{ .image = 0 } },
+    }};
+    const admission = try nativeGenerationMediaAdmission(a, path, &messages, .{ .family = .qwen3_5 });
+    try std.testing.expectEqual(@as(usize, 10), admission.token_allowance);
+    try std.testing.expect(admission.host_scratch_bytes > 0);
 }
 
 test "encodePromptForGeneration does not duplicate literal bos prefix" {

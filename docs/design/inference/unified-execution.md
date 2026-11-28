@@ -432,6 +432,12 @@ preparation API do not by themselves complete these remaining requirements:
   publisher's unused batched planning branch was removed. Seven local
   checks verified processor parsing, header geometry, admission and exact
   pinned upload sizing, including text-only requests without allocation.
+  The Qwen2-VL fallback also forecasts visual rows and host working
+  bytes from the same encoded-image header pass. Generation sums
+  those actual visual rows in prompt order and keeps the existing
+  per-image allowance. Nine local checks passed, including repeated
+  image references, agreement with prepared pixels, and rejection
+  of out-of-range processor integers.
 
 - Imported ONNX and architecture graphs share the bounded specialization owner
   in `execution/specialization_cache.zig`, with stable executable handles,

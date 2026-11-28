@@ -201,21 +201,31 @@ pub fn imageGeometryForEncoded(bytes: []const u8, config: PreprocessorConfig) !I
     return imageGeometry(info.width, info.height, config);
 }
 
+pub const ImageAdmission = struct {
+    visual_tokens: usize = 0,
+    host_working_bytes: usize = 0,
+};
+
 /// Initial preparation forecast. Earlier normalized images remain live during
 /// the current decode/resize. Executors must use admitted allocation ownership:
 /// codec scratch and allocator bookkeeping may exceed this geometry forecast.
-pub fn imageWorkingBytes(images: []const []const u8, config: PreprocessorConfig) !usize {
+pub fn imageAdmission(images: []const []const u8, config: PreprocessorConfig) !ImageAdmission {
     var retained: usize = 0;
-    var peak: usize = 0;
+    var admission: ImageAdmission = .{};
     for (images) |bytes| {
         const info = try image.inspectEncodedForInference(bytes, null);
         const geometry = try imageGeometry(info.width, info.height, config);
         const preprocess = try @import("antfly_image").processing.preprocessingWorkingBytes(info.width, info.height, geometry.resized_width, geometry.resized_height, imageResample(config));
         const decode = try image.sourceDecodeWorkingBytes(info.width, info.height);
-        peak = @max(peak, try std.math.add(usize, retained, try std.math.add(usize, decode, preprocess)));
+        admission.visual_tokens = try std.math.add(usize, admission.visual_tokens, geometry.image_token_count);
+        admission.host_working_bytes = @max(admission.host_working_bytes, try std.math.add(usize, retained, try std.math.add(usize, decode, preprocess)));
         retained = try std.math.add(usize, retained, try std.math.mul(usize, try std.math.mul(usize, geometry.resized_width, geometry.resized_height), 12));
     }
-    return peak;
+    return admission;
+}
+
+pub fn imageWorkingBytes(images: []const []const u8, config: PreprocessorConfig) !usize {
+    return (try imageAdmission(images, config)).host_working_bytes;
 }
 
 pub fn prepareImage(allocator: std.mem.Allocator, image_bytes: []const u8, config: PreprocessorConfig) !PreparedImage {
@@ -406,8 +416,6 @@ pub fn smartResize(width: u32, height: u32, config: PreprocessorConfig) !ResizeD
 
     return .{ .width = target_w, .height = target_h };
 }
-
-pub const maxImageTokenCount = qwen2vl_types.maxImageTokenCount;
 
 fn alignNearest(value: u32, factor: u32) u32 {
     const rounded = ((@as(u64, value) + factor / 2) / factor) * factor;
@@ -649,7 +657,7 @@ test "qwen admission image-token bound covers aligned preprocessing" {
         .patch_size = 14,
         .merge_size = 2,
     };
-    const bound = try maxImageTokenCount(cfg);
+    const bound = try qwen2vl_types.maxImageTokenCount(cfg);
     try std.testing.expectEqual(@as(usize, 1280), bound);
     for ([_][2]u32{ .{ 224, 448 }, .{ 4096, 4096 }, .{ 1, std.math.maxInt(u32) }, .{ std.math.maxInt(u32), 1 } }) |shape| {
         const dims = try smartResize(shape[0], shape[1], cfg);
@@ -659,7 +667,7 @@ test "qwen admission image-token bound covers aligned preprocessing" {
     }
     try std.testing.expectError(
         error.InvalidPreprocessorConfig,
-        maxImageTokenCount(.{ .min_pixels = 2, .max_pixels = 1 }),
+        qwen2vl_types.maxImageTokenCount(.{ .min_pixels = 2, .max_pixels = 1 }),
     );
 }
 
@@ -760,8 +768,10 @@ test "model processor resampling header-only geometry matches execution for ever
         try std.testing.expectEqual(geometry.resized_height, actual.resized_height);
         try std.testing.expectEqual(geometry.image_grid_thw, actual.image_grid_thw);
         try std.testing.expectEqual(geometry.image_token_count, actual.image_token_count);
-        const single = try imageWorkingBytes(&.{png}, config);
-        const pair = try imageWorkingBytes(&.{ png, png }, config);
-        try std.testing.expectEqual(single + actual.pixel_values.len * @sizeOf(f32), pair);
+        const single = try imageAdmission(&.{png[0..24]}, config);
+        const pair = try imageAdmission(&.{ png, png }, config);
+        try std.testing.expectEqual(actual.image_token_count, single.visual_tokens);
+        try std.testing.expectEqual(actual.image_token_count * 2, pair.visual_tokens);
+        try std.testing.expectEqual(single.host_working_bytes + actual.pixel_values.len * @sizeOf(f32), pair.host_working_bytes);
     }
 }

@@ -106,29 +106,29 @@ pub fn parsePreprocessorConfig(allocator: std.mem.Allocator, json_bytes: []const
         if (jsonF32(v)) |value| config.rescale_factor = value;
     }
     if (obj.get("min_pixels")) |v| {
-        if (jsonU32(v)) |value| config.min_pixels = value;
+        if (try jsonU32(v)) |value| config.min_pixels = value;
     }
     if (obj.get("max_pixels")) |v| {
-        if (jsonU32(v)) |value| config.max_pixels = value;
+        if (try jsonU32(v)) |value| config.max_pixels = value;
     }
     if (obj.get("size")) |v| {
         if (v == .object) {
             if (v.object.get("shortest_edge")) |edge| {
-                if (jsonU32(edge)) |value| config.min_pixels = value;
+                if (try jsonU32(edge)) |value| config.min_pixels = value;
             }
             if (v.object.get("longest_edge")) |edge| {
-                if (jsonU32(edge)) |value| config.max_pixels = value;
+                if (try jsonU32(edge)) |value| config.max_pixels = value;
             }
         }
     }
     if (obj.get("patch_size")) |v| {
-        if (jsonU32(v)) |value| config.patch_size = value;
+        if (try jsonU32(v)) |value| config.patch_size = value;
     }
     if (obj.get("temporal_patch_size")) |v| {
-        if (jsonU32(v)) |value| config.temporal_patch_size = value;
+        if (try jsonU32(v)) |value| config.temporal_patch_size = value;
     }
     if (obj.get("merge_size")) |v| {
-        if (jsonU32(v)) |value| config.merge_size = value;
+        if (try jsonU32(v)) |value| config.merge_size = value;
     }
     if (obj.get("image_mean")) |v| {
         if (parseRgbTriple(v)) |value| config.image_mean = value;
@@ -174,9 +174,10 @@ fn jsonBool(v: std.json.Value) ?bool {
         else => null,
     };
 }
-fn jsonU32(v: std.json.Value) ?u32 {
+fn jsonU32(v: std.json.Value) !?u32 {
     return switch (v) {
-        .integer => |i| @intCast(i),
+        .integer => |i| std.math.cast(u32, i) orelse return error.InvalidPreprocessorConfig,
+        .number_string => return error.InvalidPreprocessorConfig,
         else => null,
     };
 }
@@ -195,4 +196,13 @@ test "model processor resampling execution identity versions preprocessing seman
     try std.testing.expectEqual(revision, preprocessingRevision(artifacts));
     const other = preprocessingRevision(@splat(2));
     try std.testing.expect(!std.mem.eql(u8, &revision, &other));
+}
+
+test "Qwen processor rejects out-of-range image dimensions" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        "{\"patch_size\":-1}",
+        "{\"size\":{\"longest_edge\":4294967296}}",
+        "{\"merge_size\":18446744073709551616}",
+    }) |json| try std.testing.expectError(error.InvalidPreprocessorConfig, parsePreprocessorConfig(a, json));
 }
