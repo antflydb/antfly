@@ -47854,7 +47854,9 @@ test "LightOnOCR3 CUDA graph warm input and wide head write their assigned buffe
     layout.head_bytes = backing.len;
     const head_offset = layout.metadata_bytes;
     const packet_bytes = 4 * @sizeOf(f32);
-    var metadata = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, head_offset + packet_bytes);
+    const mirror_offset = std.mem.alignForward(usize, head_offset + packet_bytes, 256);
+    const mirror_bytes = 6 * @sizeOf(u16);
+    var metadata = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, mirror_offset + mirror_bytes);
     defer metadata.free(&compute.ctx);
     owner.storage_layout = layout;
     owner.metadata = metadata;
@@ -47915,10 +47917,25 @@ test "LightOnOCR3 CUDA graph warm input and wide head write their assigned buffe
         defer cb.free(gamma);
         const ordinary_norm = try cb.rmsNorm(input, gamma, 2, 1e-6);
         defer cb.free(ordinary_norm);
+        const test_mirror = cudaRmsNormBf16MirrorEnabled() and cudaCublasLtEnabled() and compute.ctx.info.compute_major >= 8 and compute.cublaslt != null;
+        if (test_mirror) {
+            owner.storage_layout.?.metadata_bytes = metadata.len;
+            owner.storage_layout.?.final_norm_mirror = .{ .offset = mirror_offset, .bytes = mirror_bytes };
+        }
+        defer {
+            owner.storage_layout.?.metadata_bytes = layout.metadata_bytes;
+            owner.storage_layout.?.final_norm_mirror = null;
+        }
+        const before_allocations = compute.stats.device_alloc_calls;
         const assigned_norm = (try tryCapturedFinalNorm(&cb, input, gamma, 2, 1e-6)) orelse return error.TestUnexpectedResult;
         defer cb.free(assigned_norm);
         try std.testing.expectEqual(owner.input().ptr, tensorFromCt(assigned_norm).buffer.ptr);
         try std.testing.expect(!tensorFromCt(assigned_norm).owns_buffer);
+        if (test_mirror) {
+            try std.testing.expectEqual(before_allocations, compute.stats.device_alloc_calls);
+            try std.testing.expectEqual(metadata.ptr + mirror_offset, tensorFromCt(assigned_norm).bf16_mirror.ptr);
+            try std.testing.expect(!tensorFromCt(assigned_norm).owns_bf16_mirror);
+        }
         try std.testing.expect((try tryCapturedFinalNorm(&cb, assigned_norm, gamma, 2, 1e-6)) == null);
         const ordinary_values = try cb.toFloat32(ordinary_norm, a);
         defer a.free(ordinary_values);
