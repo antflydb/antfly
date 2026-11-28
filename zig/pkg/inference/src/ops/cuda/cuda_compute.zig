@@ -21173,7 +21173,10 @@ fn supportsLinearPackedNamedOp(ctx: *anyopaque) bool {
     return self.capability_profile == .embedding_gemma2 and self.embedding_gemma2_policy.packed_projections;
 }
 fn audioOutputMatches(input: *const CudaTensor, output: *const CudaTensor, bytes: usize) bool {
-    return output.dtype == .f32 and output.elem_count == input.elem_count and
+    return output.owned_by_tensor and output.owns_buffer and output.resident_parent == null and
+        !output.immutable_cache_backing and !output.immutable_graph_input and !output.model_constant and
+        output.buffer.ptr != 0 and output.dtype == .f32 and output.quant_type == null and
+        output.elem_count == input.elem_count and
         std.mem.eql(i64, output.shape, input.shape) and output.buffer.len >= bytes;
 }
 
@@ -21207,6 +21210,11 @@ test "CUDA audio replay output contract rejects changed logical geometry" {
     const reshaped: CudaTensor = .{ .buffer = padded.buffer, .shape = @constCast(&[_]i64{ 1, 4 }), .elem_count = 4, .dtype = .f32 };
     try std.testing.expect(audioOutputMatches(&input, &padded, 16));
     try std.testing.expect(!audioOutputMatches(&input, &reshaped, 16));
+    var view: CudaTensor = .{ .buffer = padded.buffer, .shape = input.shape, .elem_count = 4, .dtype = .f32, .resident_parent = @constCast(&padded) };
+    try std.testing.expect(!audioOutputMatches(&input, &view, 16));
+    view.resident_parent = null;
+    view.owns_buffer = false;
+    try std.testing.expect(!audioOutputMatches(&input, &view, 16));
 }
 
 /// Callers bind disjoint destination spans before submitting unordered copies.
