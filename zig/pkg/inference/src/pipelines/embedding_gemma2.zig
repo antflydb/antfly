@@ -6687,6 +6687,7 @@ test "embeddinggemma2 CUDA original grouped Stage output escrow preserves instru
         }
     };
     const audio_optin = platform.env.getenvBool("ANTFLY_INFERENCE_CUDA_EMBEDDING_GEMMA2_AUDIO_GRAPH");
+    const observed_workspace = platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_AUDIO_OBSERVE_WORKSPACE");
     const audio_before = try AudioWitness.read(session, control);
     stage = "prepare first audio cohort";
     const first_audio = try embedAudios(a, session, hf.tokenizer(), &clips, options, session.execution_gate, control, null);
@@ -6696,7 +6697,7 @@ test "embeddinggemma2 CUDA original grouped Stage output escrow preserves instru
         a.free(first_audio.input_tokens);
     }
     try std.testing.expectEqual(@as(usize, 2), first_audio.vectors.len);
-    if (audio_optin and !platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_AUDIO_OBSERVE_WORKSPACE")) {
+    if (audio_optin and !observed_workspace) {
         stage = "verify cold declared audio ownership";
         const cold = try AudioWitness.read(session, control);
         try std.testing.expect(cold.declared_owners > audio_before.declared_owners);
@@ -6722,6 +6723,11 @@ test "embeddinggemma2 CUDA original grouped Stage output escrow preserves instru
         stage = "verify captured audio ownership and replay";
         std.debug.print("embeddinggemma2 CUDA grouped audio before={any} after={any}\n", .{ audio_before, audio_after });
         try std.testing.expect(audio_after.owners > audio_before.owners);
+        if (observed_workspace) {
+            try std.testing.expectEqual(audio_before.declared_owners, audio_after.declared_owners);
+        } else {
+            try std.testing.expect(audio_after.declared_owners > audio_before.declared_owners);
+        }
         try std.testing.expect(audio_after.graphs > audio_before.graphs);
         try std.testing.expect(audio_after.executions >= audio_before.executions + 2);
         try std.testing.expect(audio_after.replays > audio_before.replays);

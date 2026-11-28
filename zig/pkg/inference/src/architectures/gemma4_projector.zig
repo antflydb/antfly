@@ -4961,6 +4961,7 @@ const GroupedAudioDeclaration = struct {
     pub const Value = struct { slot: ?u15 = null, width: usize };
 
     cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
     query: *const fn (*anyopaque, grouped_audio_block.Physical) anyerror!?usize,
     recipe: AudioCacheRecipe,
     segments: []const usize,
@@ -4971,6 +4972,8 @@ const GroupedAudioDeclaration = struct {
 
     fn addSlot(self: *GroupedAudioDeclaration, event: Event) !u15 {
         if (self.next == Scope.Plan.slot_capacity) return error.UnsupportedGroupedAudioWorkspace;
+        // Reserve both events now so releasing a live value cannot fail.
+        try self.events.ensureTotalCapacity(self.allocator, 2 * (self.next + 1));
         const slot: u15 = @intCast(self.next);
         self.next += 1;
         self.events.appendAssumeCapacity(event);
@@ -5066,9 +5069,8 @@ const GroupedAudioDeclaration = struct {
         var spans: [audio_schedule.GroupedRows.max_clips]usize = undefined;
         const segments = spans[0..recipe.count];
         const rows = try recipe.rowsAndSegments(segments);
-        var self: GroupedAudioDeclaration = .{ .cb = cb, .query = query, .recipe = recipe, .rows = rows, .segments = segments };
+        var self: GroupedAudioDeclaration = .{ .cb = cb, .allocator = a, .query = query, .recipe = recipe, .rows = rows, .segments = segments };
         defer self.events.deinit(a);
-        try self.events.ensureTotalCapacityPrecise(a, Scope.Plan.slot_capacity * 2);
         var state: Value = .{ .width = recipe.hidden };
         for (0..recipe.blocks) |layer| {
             try cb.checkExecutionControl();
@@ -5200,9 +5202,12 @@ fn tryAudioExecutionRange(cb: *const ComputeBackend, a: std.mem.Allocator, store
     var relative_keys: [audio_schedule.ExecutionInputs.scale_count]CT = undefined;
     var relative_count: usize = 0;
     defer for (relative_keys[0..relative_count]) |ct| cb.free(ct);
-    if (recipe.workspace != null) {
-        // A declared block must borrow its admitted weights throughout
-        // dispatch. A missing key can still decline before entering it.
+    if (cb.kind() == .cuda and cfg.source_scalar_storage == .bf16) {
+        const query = cb.vtable.regions.audio_execution.workspaceBytes orelse return null;
+        if (try query(cb.ptr, .admit) == null) return null;
+        // Both allocation policies execute the same block using prepared
+        // constants. An unfunded constant may still leave the eager path in
+        // charge before any arena dispatch.
         for (start..end) |layer| {
             try cb.checkExecutionControl();
             relative_keys[relative_count] = (try audioRelativeKey(cb, a, store, cfg, inputs.rel_in, layer, true)) orelse return null;
