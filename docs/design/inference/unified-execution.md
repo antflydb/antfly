@@ -3396,6 +3396,32 @@ The grouped-audio candidate-only p95 controls spread from 242.89 to
 variation. Native Gemma 4 has complete controls in the mixed run,
 so the subsequent isolated comparison targets the missing Metal cases.
 
+### Current tier-one CUDA HTTP comparison on Spark at `4b17a05de6`
+
+The production CUDA server ran against frozen issue baseline `9e4af7f847`
+with 16 measured requests per side in AA, ABBA and BB. All ten shared
+workloads matched across all controls, with no failures. An unrelated
+GPU context held 184 MiB before and after the run.
+
+| Workload | Baseline p50 / p95 (ms) | Candidate p50 / p95 (ms) |
+| --- | ---: | ---: |
+| Whisper Small | 383.75 / 385.09 | 384.56 / 385.24 |
+| EmbeddingGemma 2 text | 8.78 / 9.39 | 8.74 / 9.47 |
+| EmbeddingGemma 2 grouped audio | 51.05 / 52.40 | 48.51 / 49.45 |
+| LightOnOCR-3-0.8B | 321.26 / 323.54 | 319.35 / 321.42 |
+| GLiNER 2.5 | 12.99 / 14.22 | 10.45 / 11.24 |
+| Qwen3 | 86.40 / 87.75 | 85.92 / 87.95 |
+| Gemma 4 E4B text | 223.06 / 224.95 | 222.01 / 223.95 |
+| Gemma 4 E4B image | 279.78 / 280.90 | 279.77 / 281.60 |
+| Gemma 4 E4B audio | 216.55 / 219.93 | 215.23 / 220.69 |
+| Gemma 4 E4B video | 255.27 / 257.92 | 252.37 / 255.76 |
+
+The separate candidate-only DECIDE CUDA controls also matched outputs
+with no failures. Their p50/p95 were 40.03/41.54 and 40.30/40.78 ms.
+The frozen baseline lacks that route. The LightOnOCR HTTP case uses
+the 0.8B model and a single page. The chunked 4B replay and throughput
+gates remain separate.
+
 ### Released Inkling Metal checkpoint at `7f0ff56ff8`
 
 Five focused checks passed on M4 Max with zero skips. The released
