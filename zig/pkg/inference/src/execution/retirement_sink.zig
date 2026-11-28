@@ -23,7 +23,9 @@ const platform = @import("antfly_platform");
 const metadata_allocator = platform.allocator.processAllocator(platform.allocator.concurrentFallback());
 
 const Owner = struct {
-    const capacity = 64;
+    // A model may retain one cleanup record for each registered reader
+    // page. Leave room for the resident epoch and its reserved successor.
+    const capacity = @import("reader_pool.zig").Pool.max_capacity + 2;
     allocator: std.mem.Allocator,
     identity: u64,
     references: std.atomic.Value(usize) = .init(1),

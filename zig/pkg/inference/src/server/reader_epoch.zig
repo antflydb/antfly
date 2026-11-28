@@ -153,6 +153,7 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
         vision_seal_mutex: std.Io.Mutex = .init,
         prefill_seal_mutex: std.Io.Mutex = .init,
         prefill_await_groups: usize = 0,
+        retirement_capacity_retries: std.atomic.Value(usize) = .init(0),
         prefill_await_events: bool = false,
         prefill_host_scratch_acquisitions: usize = 0,
         prefill_host_scratch_releases: usize = 0,
@@ -468,6 +469,7 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
             defer cleanup.finishAfterUnlock();
             if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) {
                 std.debug.print("LIGHTONOCR3 device_recurrent_state={d} recurrent_cache_pages={d} host_recurrent_bytes_total={d}\n", .{ @intFromBool(ctx.cfg.qwen35_device_only_state), ctx.recurrent_cache_pages, ctx.host_recurrent_bytes_total });
+                std.debug.print("LIGHTONOCR3 retirement_capacity_retries={d}\n", .{ctx.retirement_capacity_retries.load(.monotonic)});
                 std.debug.print("LIGHTONOCR3 prefill_await_groups={d} prefill_await_events={d} prefill_decode_streak={d}\n", .{ ctx.prefill_await_groups, @intFromBool(ctx.prefill_await_events), ctx.features.prefill_decode_streak });
                 std.debug.print("LIGHTONOCR3 cpu_preprocess={d} cpu_preprocess_items={d} cpu_preprocess_ns={d} vision_batch_limit={d}\n", .{ @intFromBool(ctx.features.cpu_preprocess), ctx.cpu_preprocess_items, ctx.cpu_preprocess_ns, ctx.features.vision_batch_items });
                 std.debug.print("LIGHTONOCR3 shared_pool_event_waits={d} shared_pool_poll_waits={d}\n", .{ ctx.model.native_reader_stream.event_waits.load(.monotonic), ctx.model.native_reader_stream.poll_waits.load(.monotonic) });
@@ -931,7 +933,10 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
                 // Optional graph preparation can decline, and required
                 // admission can retry when retained retirement records drain.
                 return switch (err) {
-                    error.RetirementEpochCapacityExceeded => error.ResourceTemporarilyUnavailable,
+                    error.RetirementEpochCapacityExceeded => retry: {
+                        _ = ctx.retirement_capacity_retries.fetchAdd(1, .monotonic);
+                        break :retry error.ResourceTemporarilyUnavailable;
+                    },
                     else => err,
                 };
             };
