@@ -482,6 +482,30 @@
    }
   },
   {
+   "name": "antfly_bidirectional_attention_d64_bf16",
+   "family": "attention",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
+   "name": "antfly_causal_depthwise4_head_norm_d128_bf16",
+   "family": "norm_rope",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
+   "name": "antfly_causal_depthwise4_paged_d128_bf16",
+   "family": "attention",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
    "name": "antfly_causal_depthwise_segmented_f32",
    "family": "other",
    "generated": true,
@@ -514,6 +538,46 @@
    }
   },
   {
+   "name": "antfly_dense_bf16_projection_reuse4",
+   "family": "other",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
+   "name": "antfly_dense_bf16_projection_reuse4_full",
+   "family": "other",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
+   "name": "antfly_dense_bf16_projection_simd4",
+   "family": "other",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
+   "name": "antfly_erf_gelu_bf16",
+   "family": "other",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
+   "name": "antfly_gated_residual_rms_f32_to_bf16",
+   "family": "norm_rope",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
    "name": "antfly_gdn_causal_conv_f32",
    "family": "other",
    "generated": true,
@@ -530,7 +594,47 @@
    }
   },
   {
+   "name": "antfly_head_norm_bf16_simd32",
+   "family": "norm_rope",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
+   "name": "antfly_indexed_row_rms_to_bf16",
+   "family": "norm_rope",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
+   "name": "antfly_layer_norm_bf16",
+   "family": "norm_rope",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
+   "name": "antfly_layer_scale_residual_bf16",
+   "family": "other",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
    "name": "antfly_masked_mean_batch",
+   "family": "other",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
+   "name": "antfly_merge_patch_rows_bf16",
    "family": "other",
    "generated": true,
    "source": {
@@ -594,6 +698,14 @@
    }
   },
   {
+   "name": "antfly_normalize_pair_f32_to_bf16",
+   "family": "fusion",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
    "name": "antfly_paged_attention_1x_generated_msl_v1",
    "family": "attention",
    "generated": true,
@@ -615,6 +727,86 @@
    "generated": true,
    "source": {
     "path": "zig/pkg/inference/src/ops/metal/generated/attention_prefill_flash_hd512.metal"
+   }
+  },
+  {
+   "name": "antfly_paged_relative_gqa_d128_bf16_partial",
+   "family": "attention",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
+   "name": "antfly_paged_relative_gqa_d128_bf16_partial_reuse3",
+   "family": "attention",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
+   "name": "antfly_paged_relative_gqa_d128_bf16_partial_reuse3_rows2",
+   "family": "attention",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
+   "name": "antfly_paged_relative_gqa_d128_bf16_reduce",
+   "family": "attention",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
+   "name": "antfly_paged_relative_gqa_d128_direct",
+   "family": "attention",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
+   "name": "antfly_paged_relative_gqa_d128_q4_partial",
+   "family": "attention",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
+   "name": "antfly_paged_relative_gqa_d128_q4_partial_reuse3",
+   "family": "attention",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
+   "name": "antfly_paged_relative_gqa_d128_q4_partial_reuse3_rows2",
+   "family": "attention",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
+   "name": "antfly_patch_position_bf16",
+   "family": "other",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
+   "name": "antfly_patch_rotary_bf16",
+   "family": "other",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
    }
   },
   {
@@ -818,6 +1010,30 @@
    }
   },
   {
+   "name": "antfly_residual_mix_bf16",
+   "family": "other",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
+   "name": "antfly_residual_sum3_bf16_pointwise",
+   "family": "other",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
+   "name": "antfly_rgb_patch_rows_bf16",
+   "family": "other",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
    "name": "antfly_rms_norm_generated_msl_v1",
    "family": "norm_rope",
    "generated": true,
@@ -828,6 +1044,70 @@
   {
    "name": "antfly_rotary_table",
    "family": "other",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
+   "name": "antfly_routed_biased_sigmoid_topk",
+   "family": "sampling",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
+   "name": "antfly_routed_block_scaled_bf16",
+   "family": "other",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
+   "name": "antfly_routed_block_scaled_bf16_grouped",
+   "family": "other",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
+   "name": "antfly_routed_block_scaled_bf16_grouped_wide",
+   "family": "other",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
+   "name": "antfly_routed_build_groups",
+   "family": "other",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
+   "name": "antfly_routed_capped_gate_bf16",
+   "family": "other",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
+   "name": "antfly_routed_reduce_bf16",
+   "family": "other",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
+   "name": "antfly_row_rms_to_bf16",
+   "family": "norm_rope",
    "generated": true,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m"
@@ -1108,6 +1388,14 @@
   {
    "name": "termite_apply_add_layer_norm_sum_rows",
    "family": "norm_rope",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
+   "name": "termite_apply_add_mul_scalar_1x",
+   "family": "other",
    "generated": true,
    "source": {
     "path": "zig/pkg/inference/src/backends/metal_kernels.m"
