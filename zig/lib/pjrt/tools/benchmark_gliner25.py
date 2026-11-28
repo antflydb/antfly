@@ -253,7 +253,11 @@ def compare_to_cpu(vector, fixture, max_error):
     expected_size = int(np.prod(fixture["outputs"][0]["shape"]))
     for values in (vector, fixture["cpu_logits"]):
         array = np.asarray(values)
-        if array.ndim != 1 or array.size != expected_size or not np.isfinite(array).all():
+        if (
+            array.ndim != 1
+            or array.size != expected_size
+            or not np.isfinite(array).all()
+        ):
             raise ValueError("Invalid qualification output")
     candidate = canonical_output(vector, fixture)
     reference = canonical_output(fixture["cpu_logits"], fixture)
@@ -263,7 +267,11 @@ def compare_to_cpu(vector, fixture, max_error):
     else:
         start = fixture["candidate_indices_offset"]
         match = bool(np.array_equal(candidate[start:], reference[start:]))
-    return {"max_abs_output_error": error, "decisions_or_candidate_routing_match": match, "passed": error <= max_error and match}
+    return {
+        "max_abs_output_error": error,
+        "decisions_or_candidate_routing_match": match,
+        "passed": error <= max_error and match,
+    }
 
 
 def main():

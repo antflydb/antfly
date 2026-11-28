@@ -15,6 +15,7 @@
 # limitations under the License.
 
 """Generate the pinned Inkling 2 Mini reference and compare native CUDA logits."""
+
 import argparse
 import hashlib
 import json
@@ -41,7 +42,23 @@ PROMPT_IDS = {
     "holdout-product": [68237, 196987, 220, 68429, 196977],
     "holdout-root": [371, 152397, 151798, 149879, 220, 72916, 149884],
     "holdout-french": [2658, 184184, 149877, 149902, 6, 127341, 149987],
-    "holdout-code": [1719, 150935, 888, 7, 77, 8, 25, 198, 149862, 150003, 149934, 196982, 220, 17, 25],
+    "holdout-code": [
+        1719,
+        150935,
+        888,
+        7,
+        77,
+        8,
+        25,
+        198,
+        149862,
+        150003,
+        149934,
+        196982,
+        220,
+        17,
+        25,
+    ],
 }
 
 # The GB10 path expands expert weights to BF16 inside the projection.
@@ -123,31 +140,47 @@ def reference(model_dir, output, device):
             ).logits[0, 0]
             save(name, output_logits)
 
-        image = Image.frombytes("RGB", (57, 62), bytes((i * 17) % 256 for i in range(57 * 62 * 3)))
-        inputs = processor.image_processor([image], return_tensors="pt").to(model.device)
+        image = Image.frombytes(
+            "RGB", (57, 62), bytes((i * 17) % 256 for i in range(57 * 62 * 3))
+        )
+        inputs = processor.image_processor([image], return_tensors="pt").to(
+            model.device
+        )
         image_rows = int(inputs["image_grid_thw"][0].prod())
         assert image_rows == 4
         image_ids = [model.config.image_token_id] * image_rows + [TEXT_IDS[0]]
         receipt["image_ids"] = image_ids
         receipt["image_size"] = list(image.size)
-        result = model(input_ids=torch.tensor([image_ids], device=model.device), **inputs,
-                       use_cache=False, logits_to_keep=1).logits[0, 0]
+        result = model(
+            input_ids=torch.tensor([image_ids], device=model.device),
+            **inputs,
+            use_cache=False,
+            logits_to_keep=1,
+        ).logits[0, 0]
         save("image", result)
 
     print("finished", time.perf_counter() - start, flush=True)
-    (output / "reference-manifest.json").write_text(json.dumps(receipt, indent=2) + "\n")
+    (output / "reference-manifest.json").write_text(
+        json.dumps(receipt, indent=2) + "\n"
+    )
 
 
 def compare(output):
     manifest = json.loads((output / "reference-manifest.json").read_text())
-    if (manifest["text_ids"] != TEXT_IDS or manifest["text_positions"] != TEXT_POSITIONS
-            or manifest["prompt_ids"] != PROMPT_IDS):
+    if (
+        manifest["text_ids"] != TEXT_IDS
+        or manifest["text_positions"] != TEXT_POSITIONS
+        or manifest["prompt_ids"] != PROMPT_IDS
+    ):
         raise ValueError("The reference does not describe the CUDA test sequence")
     vocab = manifest["vocabulary_size"]
     rows = []
     text_cases = [str(position) for position in TEXT_POSITIONS] + list(PROMPTS)
-    cases = [(name, f"cuda-{mode}-{name}") for mode in ("default", "fast")
-             for name in text_cases] + [("image", "cuda-image"), ("image", "cuda-fast-image")]
+    cases = [
+        (name, f"cuda-{mode}-{name}")
+        for mode in ("default", "fast")
+        for name in text_cases
+    ] + [("image", "cuda-image"), ("image", "cuda-fast-image")]
     for ref_name, cuda_name in cases:
         reference_data = (output / f"reference-{ref_name}.f32").read_bytes()
         ref_hash = hashlib.sha256(reference_data).hexdigest()
@@ -156,8 +189,12 @@ def compare(output):
         expected = np.frombuffer(reference_data, dtype="<f4").astype(np.float64)
         cuda_data = (output / f"{cuda_name}.f32").read_bytes()
         actual = np.frombuffer(cuda_data, dtype="<f4").astype(np.float64)
-        if (len(actual) != vocab or len(expected) != vocab
-                or not np.isfinite(actual).all() or not np.isfinite(expected).all()):
+        if (
+            len(actual) != vocab
+            or len(expected) != vocab
+            or not np.isfinite(actual).all()
+            or not np.isfinite(expected).all()
+        ):
             raise ValueError(f"Invalid vocabulary logits in {cuda_name}")
         expected_argmax, actual_argmax = int(expected.argmax()), int(actual.argmax())
         expected_top = np.argsort(-expected, kind="stable")[:10]
@@ -168,7 +205,9 @@ def compare(output):
         reference_log_probs = expected - np.logaddexp.reduce(expected)
         cuda_log_probs = actual - np.logaddexp.reduce(actual)
         kl = float(np.exp(reference_log_probs) @ (reference_log_probs - cuda_log_probs))
-        cosine = float(expected @ actual / (np.linalg.norm(expected) * np.linalg.norm(actual)))
+        cosine = float(
+            expected @ actual / (np.linalg.norm(expected) * np.linalg.norm(actual))
+        )
         row = {
             "case": cuda_name,
             "reference_sha256": ref_hash,
@@ -177,12 +216,16 @@ def compare(output):
             "max_absolute": float(np.abs(differences).max()),
             "p99_absolute": float(np.percentile(np.abs(differences), 99)),
             "mean_offset": offset,
-            "p99_centered_absolute": float(np.percentile(np.abs(differences - offset), 99)),
+            "p99_centered_absolute": float(
+                np.percentile(np.abs(differences - offset), 99)
+            ),
             "kl_nats_reference_to_cuda": kl,
             "top10_overlap": len(set(expected_top) & set(actual_top)),
             "reference_argmax": expected_argmax,
             "cuda_argmax": actual_argmax,
-            "reference_argmax_gap": float(expected[expected_argmax] - expected[actual_argmax]),
+            "reference_argmax_gap": float(
+                expected[expected_argmax] - expected[actual_argmax]
+            ),
         }
         row["passed"] = bool(
             cosine >= GATES["min_cosine"]
@@ -198,19 +241,29 @@ def compare(output):
         json.dumps({"passed": passed, "gates": GATES, "cases": rows}, indent=2) + "\n",
     )
     for row in rows:
-        print(f"{row['case']:<19} cosine={row['cosine']:.6f} max={row['max_absolute']:.4f}"
-              f" p99={row['p99_absolute']:.4f} centered_p99={row['p99_centered_absolute']:.4f}"
-              f" KL={row['kl_nats_reference_to_cuda']:.5f} top10={row['top10_overlap']}"
-              f" argmax={row['reference_argmax']}/{row['cuda_argmax']}"
-              f" reference_gap={row['reference_argmax_gap']:.4f} pass={row['passed']}")
+        print(
+            f"{row['case']:<19} cosine={row['cosine']:.6f} max={row['max_absolute']:.4f}"
+            f" p99={row['p99_absolute']:.4f} centered_p99={row['p99_centered_absolute']:.4f}"
+            f" KL={row['kl_nats_reference_to_cuda']:.5f} top10={row['top10_overlap']}"
+            f" argmax={row['reference_argmax']}/{row['cuda_argmax']}"
+            f" reference_gap={row['reference_argmax_gap']:.4f} pass={row['passed']}"
+        )
     return passed
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("output", type=Path)
-    parser.add_argument("--reference-model", type=Path, help="Generate reference logits from this local checkpoint")
-    parser.add_argument("--device", default="cpu", help="Torch device used for the independent reference")
+    parser.add_argument(
+        "--reference-model",
+        type=Path,
+        help="Generate reference logits from this local checkpoint",
+    )
+    parser.add_argument(
+        "--device",
+        default="cpu",
+        help="Torch device used for the independent reference",
+    )
     args = parser.parse_args()
     if args.reference_model:
         args.output.mkdir(parents=True, exist_ok=True)
