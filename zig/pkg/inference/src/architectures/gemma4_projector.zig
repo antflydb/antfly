@@ -1541,14 +1541,17 @@ fn audioCacheRecipe(cb: *const ComputeBackend, cfg: AudioConfig, prepared: []con
     return recipe;
 }
 
-fn beginAudioCache(cb: *const ComputeBackend, cfg: AudioConfig, prepared: []const *const PreparedAudio) !ops.EmbeddingCacheScope {
+fn beginAudioCache(cb: *const ComputeBackend, cfg: AudioConfig, prepared: []const *const PreparedAudio, admitted_recipe: ?*?AudioCacheRecipe) !ops.EmbeddingCacheScope {
     if (cb.kind() != .cuda) return .{};
     const stage = cb.embedding_stage orelse return .{}; // explicit legacy/nonStage route
     if (stage.audio_cache_fn == null) return .{};
     // Invalid/empty input keeps its original numerical validation result and
     // creates no cache payload. Supported actual prepared inputs have rows.
     for (prepared) |value| if (value.frames == 0) return .{};
-    return stage.audioCache(cb, try audioCacheRecipe(cb, cfg, prepared), &.{});
+    const recipe = try audioCacheRecipe(cb, cfg, prepared);
+    const scope = try stage.audioCache(cb, recipe, &.{});
+    if (admitted_recipe) |out| out.* = recipe;
+    return scope;
 }
 
 fn audioConfigForBackend(cb: *const ComputeBackend, declared: AudioConfig) !AudioConfig {
@@ -1749,7 +1752,8 @@ pub fn encodeEmbeddingGemma2AudioBounded(cb: *const ComputeBackend, allocator: s
 pub const ResidentEncodedAudio = struct { embeddings: CT, tokens: usize };
 pub fn encodePreparedEmbeddingGemma2AudioBatchResident(cb: *const ComputeBackend, a: std.mem.Allocator, prepared: []const *const PreparedAudio) !ResidentProjectedImages {
     if (prepared.len == 0 or prepared.len > audio_schedule.GroupedRows.max_clips) return error.InvalidInputShape;
-    var cache_scope = try beginAudioCache(cb, embeddingGemma2AudioConfig(), prepared);
+    var admitted_recipe: ?AudioCacheRecipe = null;
+    var cache_scope = try beginAudioCache(cb, embeddingGemma2AudioConfig(), prepared, &admitted_recipe);
     defer cache_scope.close();
     var storage = try ops.AudioStorageScope.begin(cb);
     errdefer storage.close();
@@ -1765,7 +1769,7 @@ pub fn encodePreparedEmbeddingGemma2AudioBatchResident(cb: *const ComputeBackend
         count = try audioFeatureCohort(cb, a, prepared, &features);
         for (pointers[0..count], 0..) |*pointer, i| pointer.* = &features[i];
         // The outer storage lease also covers feature preparation; the cohort borrows it.
-        break :encode try encodeAudioFeatureCohortResidentWithinStorage(cb, a, &weights, try audioConfigForBackend(cb, embeddingGemma2AudioConfig()), pointers[0..count], lengths, &storage);
+        break :encode try encodeAudioFeatureCohortResidentWithinStorage(cb, a, &weights, try audioConfigForBackend(cb, embeddingGemma2AudioConfig()), pointers[0..count], lengths, &storage, if (admitted_recipe) |*recipe| recipe else null);
     };
     errdefer cb.free(result.embeddings);
     try storage.finish();
@@ -1787,7 +1791,7 @@ fn audioFeatureCohort(cb: *const ComputeBackend, a: std.mem.Allocator, prepared:
 }
 
 pub fn encodePreparedEmbeddingGemma2AudioResident(cb: *const ComputeBackend, allocator: std.mem.Allocator, prepared: *const PreparedAudio) !ResidentEncodedAudio {
-    var cache_scope = try beginAudioCache(cb, embeddingGemma2AudioConfig(), &.{prepared});
+    var cache_scope = try beginAudioCache(cb, embeddingGemma2AudioConfig(), &.{prepared}, null);
     defer cache_scope.close();
     var weights = ProjectorWeights.initHuggingFace(cb, allocator);
     defer weights.deinit();
@@ -2205,7 +2209,7 @@ fn encodeSingleAudioResident(cb: *const ComputeBackend, allocator: std.mem.Alloc
     var features = if (store.huggingface and cb.kind() == .cuda) bounded: {
         var prepared = try prepareAudioCpuBounded(allocator, audio_bytes, cfg.audio_decode_options, cfg.mel_bins, cfg.reject_audio_truncation, !audioHostOps().features and supportsGemma4LogMel(cb), cfg.max_audio_samples, cfg.max_audio_decode_working_bytes, true);
         defer prepared.deinit();
-        cache_scope = try beginAudioCache(cb, cfg, &.{&prepared});
+        cache_scope = try beginAudioCache(cb, cfg, &.{&prepared}, null);
         break :bounded try audioFeaturesFromPrepared(cb, allocator, &prepared);
     } else try prepareGemma4AudioFeatures(cb, allocator, audio_bytes, cfg);
     defer features.deinit();
@@ -2223,7 +2227,7 @@ fn encodeAudioFeatureCohortResident(cb: *const ComputeBackend, allocator: std.me
     if (features_list.len == 0 or features_list.len > 4 or (lengths != null and lengths.?.len != features_list.len)) return error.InvalidInputShape;
     var storage = try ops.AudioStorageScope.begin(cb);
     errdefer storage.close();
-    const resident = try encodeAudioFeatureCohortResidentWithinStorage(cb, allocator, store, cfg, features_list, lengths, &storage);
+    const resident = try encodeAudioFeatureCohortResidentWithinStorage(cb, allocator, store, cfg, features_list, lengths, &storage, null);
     errdefer cb.free(resident.embeddings);
     try storage.finish();
     return resident;
@@ -2231,7 +2235,7 @@ fn encodeAudioFeatureCohortResident(cb: *const ComputeBackend, allocator: std.me
 
 // Only the owning wrapper above and the prepared-batch lexical storage owner
 // call this helper. It borrows their bank and never begins or retires storage.
-fn encodeAudioFeatureCohortResidentWithinStorage(cb: *const ComputeBackend, allocator: std.mem.Allocator, store: *ProjectorWeights, cfg: AudioConfig, features_list: []const *AudioFeatures, lengths: ?[]usize, storage: *ops.AudioStorageScope) !ResidentEncodedAudio {
+fn encodeAudioFeatureCohortResidentWithinStorage(cb: *const ComputeBackend, allocator: std.mem.Allocator, store: *ProjectorWeights, cfg: AudioConfig, features_list: []const *AudioFeatures, lengths: ?[]usize, storage: *ops.AudioStorageScope, admitted_recipe: ?*const AudioCacheRecipe) !ResidentEncodedAudio {
     if (features_list.len == 0 or features_list.len > 4 or (lengths != null and lengths.?.len != features_list.len)) return error.InvalidInputShape;
     const features = features_list[0];
     const cohort = features_list.len > 1;
@@ -2340,7 +2344,7 @@ fn encodeAudioFeatureCohortResidentWithinStorage(cb: *const ComputeBackend, allo
         if (pipelined) _ = cb.decoderRuntimeSetPipelinedFrames(false);
     }
 
-    const planned = if (cb.kind() == .metal and cohort) null else try tryAudioExecutionRange(cb, allocator, store, cfg, hidden, &layer_inputs, 0, cfg.block_count, defer_audio_arena);
+    const planned = if (cb.kind() == .metal and cohort) null else try tryAudioExecutionRange(cb, allocator, store, cfg, hidden, &layer_inputs, 0, cfg.block_count, defer_audio_arena, admitted_recipe);
     if (planned) |next| {
         cb.free(hidden);
         hidden = next;
@@ -2350,7 +2354,7 @@ fn encodeAudioFeatureCohortResidentWithinStorage(cb: *const ComputeBackend, allo
         try cb.checkExecutionControl();
         const end = @min(cfg.block_count, layer + cohort_layer_span);
         if (cohort and cb.kind() == .metal and !cb.decoderRuntimeHasActiveFrame()) frame = if (pipelined) try Submission.beginPipelined(cb) else try Submission.begin(cb);
-        const grouped = if (cohort and cb.kind() == .metal and fits_retained_schedules) try tryAudioExecutionRange(cb, allocator, store, cfg, hidden, &layer_inputs, layer, end, defer_audio_arena) else null;
+        const grouped = if (cohort and cb.kind() == .metal and fits_retained_schedules) try tryAudioExecutionRange(cb, allocator, store, cfg, hidden, &layer_inputs, layer, end, defer_audio_arena, null) else null;
         const next = grouped orelse try runAudioLayers(cb, allocator, store, cfg, hidden, &layer_inputs, layer, end);
         cb.free(hidden);
         hidden = next;
@@ -4948,9 +4952,20 @@ fn runAudioLayers(cb: *const ComputeBackend, a: std.mem.Allocator, store: *Proje
     }
     return state;
 }
-fn tryAudioExecutionRange(cb: *const ComputeBackend, a: std.mem.Allocator, store: *ProjectorWeights, cfg: AudioConfig, hidden: CT, inputs: *AudioLayerInputs, start: usize, end: usize, defer_arena: bool) !?CT {
+fn tryAudioExecutionRange(cb: *const ComputeBackend, a: std.mem.Allocator, store: *ProjectorWeights, cfg: AudioConfig, hidden: CT, inputs: *AudioLayerInputs, start: usize, end: usize, defer_arena: bool, admitted_recipe: ?*const AudioCacheRecipe) !?CT {
     if (!audioExecutionEligible(cb, store, cfg, inputs)) return null;
-    const recipe = audioCacheConfig(cfg);
+    const local_recipe = audioCacheConfig(cfg);
+    const key = local_recipe.key(inputs.segments, start, end);
+    const recipe = if (admitted_recipe) |candidate| recipe: {
+        if (candidate.key(inputs.segments, start, end) != key) break :recipe &local_recipe;
+        if (candidate.workspace != null) {
+            var admitted_segments: [audio_schedule.GroupedRows.max_clips]usize = undefined;
+            const spans = admitted_segments[0..candidate.count];
+            const rows = try candidate.rowsAndSegments(spans);
+            if (rows != inputs.valid_mask.len or !std.mem.eql(usize, spans, inputs.segments)) break :recipe &local_recipe;
+        }
+        break :recipe candidate;
+    } else &local_recipe;
     const Run = struct {
         cb: *const ComputeBackend,
         a: std.mem.Allocator,
@@ -4974,7 +4989,7 @@ fn tryAudioExecutionRange(cb: *const ComputeBackend, a: std.mem.Allocator, store
     };
     var run = Run{ .cb = cb, .a = a, .store = store, .cfg = cfg, .inputs = inputs, .start = start, .end = end };
     const values = audioExecutionInputs(hidden, inputs);
-    return cb.audioExecutionWithArenaFunding(recipe.key(inputs.segments, start, end), values[0..audio_schedule.ExecutionInputs.activeCount(cb.kind() != .cuda or inputs.segment_valid != null)], &run, Run.call, defer_arena, .{ .recipe = &recipe, .segments = inputs.segments, .rows = inputs.valid_mask.len });
+    return cb.audioExecutionWithArenaFunding(key, values[0..audio_schedule.ExecutionInputs.activeCount(cb.kind() != .cuda or inputs.segment_valid != null)], &run, Run.call, defer_arena, .{ .recipe = recipe, .segments = inputs.segments, .rows = inputs.valid_mask.len });
 }
 
 fn audioExecutionEligible(cb: *const ComputeBackend, store: *const ProjectorWeights, cfg: AudioConfig, inputs: *const AudioLayerInputs) bool {
