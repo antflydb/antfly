@@ -48319,6 +48319,9 @@ test "LightOnOCR3 CUDA graph warm input and wide head write their assigned buffe
 
     {
         // The preceding attention layer released its projections before this layer.
+        const original_profile = compute.capability_profile;
+        compute.capability_profile = .lightonocr3;
+        defer compute.capability_profile = original_profile;
         owner.storage_layout.?.metadata_bytes = metadata.len;
         owner.storage_layout.?.input_projections = .{ .offset = projection_offset, .bytes = 4 * norm_bytes };
         owner.storage_layout.?.recurrent_projection_bytes = @splat(norm_bytes);

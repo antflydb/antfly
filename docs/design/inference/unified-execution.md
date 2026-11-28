@@ -2971,6 +2971,15 @@ interval includes vision, prefill, singleton decode, and request
 overhead. The control does not identify their individual contributions
 or assign the earlier paired p95 difference to a decoder revision.
 
+At `3580d58685`, two-page released LightOnOCR HTTP again matched the
+serial output and replayed on Spark. The 2,004,992-byte layer bank
+held the 65,792-byte fused recurrent GEMM result, and the recorded
+two-token burst applied 12 attention gates in place. The observed
+workspace had zero allocations, events and bytes. The focused cohort
+passed 35 of 36 checks, with no skips. The separate assigned-projection
+fixture restored the generic test profile before invoking the recurrent
+projection helper and failed its eligibility check.
+
 ### Metal validation of the grouped audio follow-up
 
 The M4 Max production HTTP server built from `78a42df545` served the
