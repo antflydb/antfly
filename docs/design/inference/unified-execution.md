@@ -3010,6 +3010,22 @@ prefill and 46.46/92.65 ms to the sum of prepared vision spans in
 ABBA. The vision spans can overlap; they cannot be added to a request's
 critical path or compared against unavailable baseline phase timings.
 
+The uninstrumented repeat used the same binaries, requests and
+fixtures with 64 measured requests per side. All 384 outputs had
+the same hash and no request failed.
+
+| Control or comparison | First side median / p95 (ms) | Second side median / p95 (ms) |
+| --- | ---: | ---: |
+| AA | 469.17 / 480.15 | 469.33 / 481.81 |
+| ABBA | 468.07 / 477.63 | 464.26 / 474.90 |
+| BB | 463.65 / 484.28 | 465.47 / 478.98 |
+
+The paired median and p95 improved by 3.81 and 2.73 ms. Candidate-only
+p95 differed by 5.30 ms between controls. One unrelated GPU context
+held 184 MiB before and after the run. The uninstrumented repeat
+shows no HTTP tail increase on this workload. The controls limit
+attribution of the small gain to the declaration change alone.
+
 The same binary passed exact two-page output and observed graph replay
 with declared warmup disabled. With the opt-in enabled and recurrent
 fusion disabled, serial output parity passed and the graph correctly
