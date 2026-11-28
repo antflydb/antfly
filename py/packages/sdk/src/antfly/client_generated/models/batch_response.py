@@ -33,8 +33,12 @@ class BatchResponse:
             open string code is forward-compatible with older SDKs; clients should
             treat unknown codes as non-retryable when `retryable` is false.
         seeds (list[SeedOutcome] | Unset): Per-item outcomes of the artifact seeds the batch carried, when any
-            did. Serverless tables and embedded databases report them; a
-            distributed table does not yet (plan with `validate_only`).
+            did. Serverless tables and embedded databases report them. A
+            distributed table reports them for a single-shard write whose
+            seeds the Raft leader prepared (all replicas decode seed
+            preparation); multi-shard transactions, enrichment-level sync
+            levels and other writes accept seeds at apply and omit `seeds`
+            (plan those with `validate_only`).
     """
 
     status: BatchResponseStatus | Unset = UNSET

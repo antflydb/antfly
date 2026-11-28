@@ -1824,8 +1824,64 @@ pub fn handleNativeTableBatch(alloc: std.mem.Allocator, table_name: []const u8, 
     return executeOwnedTableBatch(alloc, table_name, .{ .req = req, .writes = @constCast(req.writes), .deletes = @constCast(req.deletes) }, api);
 }
 
+/// Receives a write's per-item seed outcomes from the proposing Raft leader
+/// (`SeedReportSink`, #1791): the JSON array of the leader's preparation
+/// packet, kept as the response's `seeds`.
+pub const SeedCollector = struct {
+    alloc: std.mem.Allocator,
+    json: ?[]u8 = null,
+
+    pub fn sink(self: *SeedCollector) @import("antfly_local_sources").storage_db_types.SeedReportSink {
+        return .{ .ptr = self, .report = report };
+    }
+
+    fn report(ptr: *anyopaque, seeds_json: []const u8) void {
+        const self: *SeedCollector = @ptrCast(@alignCast(ptr));
+        if (self.json != null) return;
+        self.json = self.alloc.dupe(u8, seeds_json) catch null;
+    }
+
+    pub fn deinit(self: *SeedCollector) void {
+        if (self.json) |bytes| self.alloc.free(bytes);
+        self.json = null;
+    }
+
+    /// `body` (a JSON object) with `"seeds": <collected>` appended; takes
+    /// ownership of `body`.
+    pub fn spliceAlloc(self: *const SeedCollector, alloc: std.mem.Allocator, body: []u8) ![]u8 {
+        const seeds = self.json orelse return body;
+        defer alloc.free(body);
+        const end = std.mem.lastIndexOfScalar(u8, body, '}') orelse return error.InvalidResponse;
+        const separator: []const u8 = if (std.mem.trim(u8, body[0..end], " \t\r\n").len > 1) "," else "";
+        return std.mem.concat(alloc, u8, &.{ body[0..end], separator, "\"seeds\":", seeds, body[end..] });
+    }
+};
+
+test "seed collector splices leader outcomes into a batch response" {
+    const alloc = std.testing.allocator;
+    var collector = SeedCollector{ .alloc = alloc };
+    defer collector.deinit();
+    const sink = collector.sink();
+    sink.report(sink.ptr, "[{\"key\":\"a\",\"name\":\"s\",\"outcome\":\"accepted\"}]");
+    // Only the first report counts.
+    sink.report(sink.ptr, "[]");
+    const body = try collector.spliceAlloc(alloc, try alloc.dupe(u8, "{\"status\":\"committed\",\"inserted\":1}"));
+    defer alloc.free(body);
+    try std.testing.expectEqualStrings("{\"status\":\"committed\",\"inserted\":1,\"seeds\":[{\"key\":\"a\",\"name\":\"s\",\"outcome\":\"accepted\"}]}", body);
+    var empty = SeedCollector{ .alloc = alloc };
+    const unchanged = try empty.spliceAlloc(alloc, try alloc.dupe(u8, "{}"));
+    defer alloc.free(unchanged);
+    try std.testing.expectEqualStrings("{}", unchanged);
+}
+
 fn executeOwnedTableBatch(alloc: std.mem.Allocator, table_name: []const u8, batch_req: batch_api.OwnedBatchRequest, api: TableApi) !OwnedResponse {
-    api.executeTableBatch(alloc, table_name, batch_req.req) catch |err| switch (err) {
+    // The proposing leader reports per-item seed outcomes through this
+    // process-local sink; writes without a seed packet report none.
+    var seed_collector = SeedCollector{ .alloc = alloc };
+    defer seed_collector.deinit();
+    var execute_req = batch_req.req;
+    execute_req.seed_report = seed_collector.sink();
+    api.executeTableBatch(alloc, table_name, execute_req) catch |err| switch (err) {
         error.RelationalIndexKeyTooLarge => return .{ .status = 413, .json = true, .body = try alloc.dupe(u8, "{\"error\":\"RelationalIndexKeyTooLarge\",\"message\":\"encoded relational index keys, including the document ID, must not exceed 1048576 bytes\"}") },
         error.Forbidden => return .{ .status = 403, .body = try alloc.dupe(u8, "write permission required for every table affected by this mutation") },
         error.InvalidBatchRequest => return .{ .status = 400, .body = try alloc.dupe(u8, "invalid batch request") },
@@ -1967,7 +2023,7 @@ fn executeOwnedTableBatch(alloc: std.mem.Allocator, table_name: []const u8, batc
 
     return .{
         .status = 201,
-        .body = try batch_api.encodeBatchResponse(alloc, batch_req.result()),
+        .body = try seed_collector.spliceAlloc(alloc, try batch_api.encodeBatchResponse(alloc, batch_req.result())),
         .json = true,
     };
 }

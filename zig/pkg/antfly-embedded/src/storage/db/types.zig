@@ -297,7 +297,30 @@ pub const TransactionMutation = union(enum) {
 /// decode as legacy. The admission timestamp is separate from the revision.
 pub const DocumentVersionScheme = enum { legacy, revision_v1, admit_current };
 
+/// Process-local receiver of a write's per-item seed outcomes (#1791). The
+/// proposing Raft leader reports the outcomes of its seed preparation packet
+/// (`{"seeds":[...]}` items, as JSON) through it, and a forwarding receiver
+/// relays them. Borrowed for the synchronous call: never serialized (it
+/// encodes as null and refuses a non-null decode).
+pub const SeedReportSink = struct {
+    ptr: *anyopaque,
+    report: *const fn (ptr: *anyopaque, seeds_json: []const u8) void,
+
+    pub fn jsonStringify(_: @This(), jw: anytype) !void {
+        try jw.write(null);
+    }
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        try source.skipValue();
+        return error.UnexpectedToken;
+    }
+    pub fn jsonParseFromValue(_: std.mem.Allocator, _: std.json.Value, _: std.json.ParseOptions) !@This() {
+        return error.UnexpectedToken;
+    }
+};
+
 pub const BatchRequest = struct {
+    /// See `SeedReportSink`; set only on a single-group public write.
+    seed_report: ?SeedReportSink = null,
     graph_preparation: ?@import("prepared_graph_effects.zig").Admission = null,
     /// Private owner-leader checked lock control; never public batch JSON.
     sql_lock: ?@import("../pessimistic_lock/control.zig").Command = null,
@@ -533,6 +556,8 @@ pub const BatchRequest = struct {
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
         inline for (comptime std.meta.fieldNames(@This())) |reflected_name| {
+            // Process-local; the wire carries no field for it.
+            if (comptime std.mem.eql(u8, reflected_name, "seed_report")) continue;
             try jw.objectField(reflected_name);
             if (comptime std.mem.eql(u8, reflected_name, "relational_integrity_generation_set") or std.mem.eql(u8, reflected_name, "restore_staging_scope") or std.mem.eql(u8, reflected_name, "restore_staging_plan_id")) {
                 if (@field(self, reflected_name)) |digest| {

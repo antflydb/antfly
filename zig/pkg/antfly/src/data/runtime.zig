@@ -390,6 +390,34 @@ const DataRaftMutationDiscovery = enum {
     }
 };
 
+/// Reports the `seeds` outcomes of an applied seed preparation packet to the
+/// write's process-local sink (#1791). Best effort: a malformed packet or an
+/// allocation failure only omits the report, never the committed write.
+fn reportPreparedSeedOutcomes(alloc: std.mem.Allocator, sink: ?antfly.db.types.SeedReportSink, packet_json: ?[]const u8) void {
+    const receiver = sink orelse return;
+    const packet = packet_json orelse return;
+    reportSeedsMember(alloc, receiver, packet);
+}
+
+/// Relays the `seeds` member of a forwarded leader's batch response.
+fn reportForwardedSeedOutcomes(alloc: std.mem.Allocator, sink: ?antfly.db.types.SeedReportSink, body: []const u8) void {
+    const receiver = sink orelse return;
+    if (std.mem.indexOf(u8, body, "\"seeds\"") == null) return;
+    reportSeedsMember(alloc, receiver, body);
+}
+
+fn reportSeedsMember(alloc: std.mem.Allocator, receiver: antfly.db.types.SeedReportSink, json: []const u8) void {
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const Seeds = struct { seeds: ?std.json.Value = null };
+    const parsed = std.json.parseFromSliceLeaky(Seeds, a, json, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch return;
+    const seeds = parsed.seeds orelse return;
+    if (seeds != .array) return;
+    const encoded = std.json.Stringify.valueAlloc(a, seeds, .{}) catch return;
+    receiver.report(receiver.ptr, encoded);
+}
+
 const DataRaftBatchRoute = struct {
     admission_deadline_ns: ?u64 = null,
     /// Local structural commands must not be forwarded into a successor term.
@@ -18827,6 +18855,9 @@ pub const DataServer = struct {
                     .log_index = index,
                     .table_name = table_name,
                 }) catch return error.RaftBatchWriteOutcomeUnknown;
+                // The applied packet's outcomes are this write's (guards fail
+                // the entry on any change since preparation).
+                reportPreparedSeedOutcomes(alloc, incoming_req.seed_report, proposal_req.prepared_enrichments_json);
                 return;
             }
 
@@ -18952,6 +18983,7 @@ pub const DataServer = struct {
                                         .terminal => return err,
                                     }
                                 };
+                                reportForwardedSeedOutcomes(alloc, incoming_req.seed_report, response.body);
                                 response.deinit(alloc);
                                 self.reachDataRequestLifecycle(.{
                                     .phase = .remote_forward_completed,
@@ -19169,6 +19201,7 @@ pub const DataServer = struct {
                 .terminal => return err,
             }
         };
+        reportForwardedSeedOutcomes(alloc, req.seed_report, response.body);
         response.deinit(alloc);
         self.reachDataRequestLifecycle(.{
             .phase = .remote_forward_completed,

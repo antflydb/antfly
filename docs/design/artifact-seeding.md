@@ -463,6 +463,23 @@ levels and seeds supplied only through field mappings keep apply-time
 acceptance; mapped text and JSON assets depend on no replica-local state, while
 mapped vectors bind the replica's embedder identity.
 
+### Server batch outcomes
+
+A distributed table's batch response carries `seeds` for writes whose seeds
+the Raft leader prepared. The public handler hands the write a process-local
+`SeedReportSink` (`storage/db/types.zig`) on the batch request; it travels by
+value with the request across the API and data runtime module roots (thread
+state cannot), is copied onto the single-shard commit request, and is never
+serialized (it is skipped in both request encoders). After the leader applies
+its proposal with the packet, it reports the packet's `seeds` through the
+sink (`reportPreparedSeedOutcomes` in `data/runtime.zig`); the packet's guards
+make them exact for a committed write. A follower forwarding the write relays
+the `seeds` member of the leader's forwarding response, whose receiver
+collects them the same way. The handler splices them into the 201 body
+(`public_table_http.SeedCollector`). Multi-shard transactions never carry the
+sink, and writes without a packet report nothing, so `seeds` is then absent
+rather than empty.
+
 ### Serverless named enrichments
 
 A serverless table declares named enrichments exactly like a distributed
@@ -508,10 +525,12 @@ chunker, vectors from the consuming embeddings index's embedder (one per
 chunk for an upstream chunk collection), field copies, and producer-backed
 assets (generator, extractor, reader, document_extraction, ...) through the
 host's asset producer; JSON content types store JSON values. Outputs are
-written with `origin: generated` records. The native runtime wires an asset
-producer runtime; a host without one, and outputs whose embedder is missing,
-stay pending rather than failing. A producer error skips the document until
-the next cycle.
+written with `origin: generated` records. A native host passes its asset
+producer as `BootstrapConfig.asset_producer`; the standalone serverless binary
+does not construct one yet (the asset producer runtime's inference modules are
+outside its compilation unit), so there producer-backed assets stay pending
+while chunks, vectors and copies generate. Outputs whose producer or embedder
+is missing stay pending rather than failing.
 
 A producer error is recorded on the output's acceptance record
 (`{"failed": n, "input": ..., "error": ...}`) instead of failing the
@@ -594,16 +613,21 @@ These need work this repository cannot verify on a 16.8 GB machine (the data
 runtime, storage kernel and server API test builds declare 19-21 GB), or are
 subsystem features of their own:
 
-- Per-item outcomes in server batch responses. The proposing leader holds
-  them in its seed preparation packet, but the table write source returns no
-  value to the HTTP handler (the data runtime and the HTTP handler reach the
-  API through different module roots, so thread state cannot carry them), and
-  forwarded writes would need the internal forwarding response to carry them.
-  Until then, plan with `validate_only`.
-- Leader seed preparation for transactions and multi-shard 2PC batches, for
-  enrichment-level sync levels, and for seeds that come only from field
-  mappings (the leader would need the table's mapping catalog before
-  proposing). A cross-shard 2PC seed transform test.
+- Running the server tests of per-item outcomes and enrichment counts: the
+  data runtime and public table HTTP test builds declare 15-22 GB. The
+  distributed and serverless runtime libraries compile; the storage kernel
+  library (the data runtime) exceeds this machine's memory to rebuild.
+- An asset producer in the standalone serverless binary.
+- Leader seed preparation for transactions and multi-shard 2PC batches
+  (persist the seeds packet with the prepared transaction, accept
+  `mode: seeds` in the transaction write path and resolution, and relax the
+  `transaction` exclusions in `seedPreparationEligible`, `prepareSeedEnrichments`
+  and the commit's packet check); for enrichment-level sync levels (merge the
+  packet's seeded output with inline generation of the unseeded outputs); and
+  for seeds that come only from field mappings (the leader needs a cached
+  per-table "has seed mappings" flag from its shard owner before proposing).
+  A cross-shard 2PC seed transform test. These writes accept seeds at apply
+  and report no `seeds`.
 - Partial extraction seeds: an end-to-end test with a real PDF (PDF reading
   is compiled out of the DB unit tests; the overlay and the write path are
   tested separately).

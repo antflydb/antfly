@@ -77,6 +77,8 @@ pub const TxnResolveRequest = struct {
 };
 
 pub const TableCommitRequest = struct {
+    /// Process-local per-item seed outcome receiver (`db_types.SeedReportSink`).
+    seed_report: ?db_types.SeedReportSink = null,
     document_revision_handoffs: []const @import("../storage/document_revision_reservation.zig").Handoff = &.{},
     graph_preparation: ?@import("../storage/db/prepared_graph_effects.zig").Admission = null,
     /// Immutable processed rows, retained by protected SQL/session staging.
@@ -131,7 +133,7 @@ pub const TableCommitRequest = struct {
         try stream.endObject();
     }
     pub fn nativeJsonSkipFieldComptime(comptime field: []const u8) bool {
-        return std.mem.eql(u8, field, "relation_owner_minter") or std.mem.eql(u8, field, "trigger_minter");
+        return std.mem.eql(u8, field, "relation_owner_minter") or std.mem.eql(u8, field, "trigger_minter") or std.mem.eql(u8, field, "seed_report");
     }
     pub fn nativeJsonSkipField(self: @This(), comptime field: []const u8) bool {
         return (std.mem.eql(u8, field, "bound_catalog_incarnation") and self.bound_catalog_incarnation == null) or ((comptime std.mem.eql(u8, field, "document_revision_handoffs")) and self.document_revision_handoffs.len == 0) or ((comptime std.mem.eql(u8, field, "graph_preparation")) and self.graph_preparation == null) or (comptime nativeJsonSkipFieldComptime(field)) or ((comptime std.mem.eql(u8, field, "sql_persistence")) and self.sql_persistence == null) or ((comptime std.mem.eql(u8, field, "graph_writes")) and self.graph_writes.len == 0) or ((comptime std.mem.eql(u8, field, "graph_deletes")) and self.graph_deletes.len == 0) or

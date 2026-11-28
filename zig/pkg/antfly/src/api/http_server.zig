@@ -16665,6 +16665,7 @@ pub const ApiHttpServer = struct {
         const tables = [_]distributed_txn.TableCommitRequest{.{
             .table_name = table_name,
             .source_producer = .ordinary,
+            .seed_report = req.seed_report,
             .bound_catalog_incarnation = request.bound_catalog_incarnation,
             .commit_requires = req.commit_requires,
             .writes = txn_writes,

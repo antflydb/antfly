@@ -5511,12 +5511,18 @@ pub const AntflyApiHandler = struct {
         }
         if (input.req.relational_topology) |command| if (command.action == .activate_parent_retirement or command.action == .acknowledge_parent_retirement)
             return textResponse(ctx, 403, "parent activation requires owner-local metadata proof");
+        // A forwarded write relays the leader's per-item seed outcomes to the
+        // follower that received the public request (#1791).
+        var seed_collector = public_table_http.SeedCollector{ .alloc = ctx.allocator };
+        defer seed_collector.deinit();
+        var routed_req = input.req;
+        if (routed_req.transaction == null) routed_req.seed_report = seed_collector.sink();
         const result = self.internalGroupOperations().routedBatch(
             ctx.allocator,
             operationContext(ctx, null),
             params.group_id,
             params.table_name,
-            input.req,
+            routed_req,
             forwarding_context,
         ) catch |err| return switch (err) {
             error.RetainedEffectsFull => retainedPressureResponse(ctx, true),
@@ -5566,6 +5572,13 @@ pub const AntflyApiHandler = struct {
             else => internalBatchFailureResponse(ctx, err),
         };
         _ = ctx.status(201);
+        if (seed_collector.json != null) {
+            const counts = try std.json.Stringify.valueAlloc(ctx.allocator, .{ .inserted = result.inserted, .deleted = result.deleted, .transformed = result.transformed }, .{});
+            const relayed = try seed_collector.spliceAlloc(ctx.allocator, counts);
+            try ctx.setHeader("content-type", "application/json");
+            _ = ctx.response.bodyOwned(ctx.allocator, relayed);
+            return ctx.response.build();
+        }
         return ctx.json(.{ .inserted = result.inserted, .deleted = result.deleted, .transformed = result.transformed });
     }
 

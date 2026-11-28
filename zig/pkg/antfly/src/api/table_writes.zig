@@ -23118,6 +23118,7 @@ pub const ProvisionedTableWriteSource = struct {
         const batcher = self.raft_batcher orelse return null;
         const req: db_mod.types.BatchRequest = .{
             .source_producer = table_req.source_producer,
+            .seed_report = table_req.seed_report,
             .commit_requires = table_req.commit_requires,
             .writes = transactionWritesAsBatchWrites(table_req.writes),
             .deletes = table_req.deletes,
