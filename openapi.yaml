@@ -29575,17 +29575,43 @@ components:
           type: integer
           format: uint64
           description: Target generation recorded by the accepted request.
+        accepted_sequence:
+          type: integer
+          format: uint64
+          description: Replay sequence committed with the request in the accepting shard, when available.
         status:
           type: string
           enum:
             - pending
             - published
             - superseded
-          description: Pending is an unfulfilled intent. Published means the target generation is visible
-            and can itself contain extraction failures. Superseded means the intent no longer matches
-            the configured producer.
+            - unverified
+          description: Published has a manifest receipt for the accepted request and can include extraction
+            failures. Pending has no matching publication. Superseded no longer matches the configured
+            producer. Unverified is a legacy intent whose target generation was reached without a publication
+            receipt.
         worker:
           $ref: '#/components/schemas/DocumentArtifactReprocessWorker'
+        last_retry:
+          $ref: '#/components/schemas/DocumentArtifactReprocessRetry'
+    DocumentArtifactReprocessRetry:
+      type: object
+      description: Most recent durable deferral for this accepted extraction attempt. The deadline can
+        be in the past if replay has since resumed.
+      required:
+        - reason
+        - retry_at_ms
+      properties:
+        reason:
+          type: string
+          enum:
+            - provider_capacity
+            - provider_retry_after
+            - transient
+        retry_at_ms:
+          type: integer
+          format: uint64
+          description: Unix timestamp in milliseconds before which this attempt is deferred.
     DocumentArtifactReprocessWorker:
       type: object
       description: Sample of the owning shard's enrichment worker, when present. The worker services multiple
@@ -30238,6 +30264,11 @@ components:
           enum:
             - triggered
           description: Indicates that reprocessing was accepted.
+        accepted_sequence:
+          type: integer
+          format: uint64
+          description: Committed replay sequence for a deferred native extraction request. Scope to the
+            accepting shard and the artifact identified by this route.
     DocumentArtifactTableReprocessRequest:
       type: object
       description: Bounded request for reprocessing a derived artifact across source rows in key order.

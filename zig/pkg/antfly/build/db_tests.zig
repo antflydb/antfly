@@ -219,6 +219,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "#1210",
         "relational prepared writes validate orphan vector receipts",
         "db public artifact reprocess accepts durable work despite unrelated provider retries",
+        "extraction receipt requires its own publication witness",
+        "explicit retry keeps the scheduling deadline and starts fresh attempt accounting",
         "db public extraction budget rejection publishes a failure manifest",
         "db document extraction manifest inspection and reprocess API",
         "db execution policy retains legacy local asset publications",

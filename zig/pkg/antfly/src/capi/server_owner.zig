@@ -9449,12 +9449,12 @@ pub fn storageOwnerArtifactOperationJson(
                 .{},
             ) catch return .invalid_argument;
             defer parsed.deinit();
-            const handled = handle.db.reprocessDocumentArtifact(
+            const accepted = handle.db.reprocessDocumentArtifactAcceptance(
                 handle.alloc,
                 parsed.value.doc_key,
                 parsed.value.artifact_name,
             ) catch |err| return storageOwnerStatusFromError(err);
-            return storageOwnerArtifactJsonResponse(handle.alloc, out_response, .{ .handled = handled });
+            return storageOwnerArtifactJsonResponse(handle.alloc, out_response, accepted);
         },
         .reprocess_document_range => {
             var parsed = std.json.parseFromSlice(

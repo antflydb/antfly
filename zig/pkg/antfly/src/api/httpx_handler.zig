@@ -4365,7 +4365,7 @@ pub const AntflyApiHandler = struct {
     fn internalDocumentArtifactReprocess(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         var params = (try internalDocumentArtifactParams(ctx)) orelse return textResponse(ctx, 400, "invalid path parameter");
         defer params.deinit(ctx.allocator);
-        self.internalGroupOperations().reprocessDocumentArtifact(
+        const accepted = self.internalGroupOperations().reprocessDocumentArtifact(
             ctx.allocator,
             operationContext(ctx, null),
             params.group_id,
@@ -4373,7 +4373,7 @@ pub const AntflyApiHandler = struct {
             params.key,
             params.artifact_name,
         ) catch |err| return internalArtifactWriteErrorResponse(ctx, err, "invalid document artifact reprocess request");
-        return ctx.json(.{ .reprocess = "triggered" });
+        return ctx.openApiJson(.{ .reprocess = "triggered", .accepted_sequence = accepted.accepted_sequence });
     }
 
     fn internalTableArtifactReprocess(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {

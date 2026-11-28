@@ -637,6 +637,20 @@ pub const State = struct {
         };
         return result;
     }
+    pub fn priorAttempt(self: State, document: []const u8, logical: u64, fingerprint: u64, source_digest: ?[32]u8) Budget {
+        var result = Budget{ .fingerprint = fingerprint, .logical_fingerprint = logical };
+        for (self.tickets.items) |ticket| {
+            if (!std.mem.eql(u8, ticket.document, document) or !std.meta.eql(ticket.source_digest, source_digest)) continue;
+            for (ticket.budgets.items) |budget| {
+                if (budget.logical_fingerprint != logical or budget.fingerprint != fingerprint) continue;
+                result.failures = @max(result.failures, budget.failures);
+                result.waits = @max(result.waits, budget.waits);
+                result.deadline_ms = @max(result.deadline_ms, budget.deadline_ms);
+            }
+        }
+        return result;
+    }
+
     /// All members of a failed provider invocation receive the same episode.
     /// Each producer retains its own clock even when one document owns several
     /// tickets. Compatible batch rebucketing cannot reset logical budgets.
@@ -1128,4 +1142,20 @@ test "privacy retry workset preserves empty document tickets and exclusive curso
     var roundtrip = try State.decode(a, legacy);
     defer roundtrip.deinit(a);
     try std.testing.expect(!roundtrip.hasScanDocument());
+}
+
+test "explicit retry keeps the scheduling deadline and starts fresh attempt accounting" {
+    const a = std.testing.allocator;
+    var state: State = .{};
+    defer state.deinit(a);
+    const digest: [32]u8 = @splat(7);
+    try state.park(a, .{ .doc_key = "doc", .sequence = 3 }, 200, .{ .fingerprint = 10, .logical_fingerprint = 42, .failures = 5, .waits = 2 }, digest);
+    const key = try a.alloc(u8, std.base64.standard_no_pad.Encoder.calcSize("doc".len));
+    defer a.free(key);
+    const encoded = std.base64.standard_no_pad.Encoder.encode(key, "doc");
+    const delayed = try state.prepareDocument(a, encoded, digest, &.{42}, 100);
+    defer a.free(delayed.delayed);
+    try std.testing.expectEqualSlices(u64, &.{42}, delayed.delayed);
+    try std.testing.expectEqual(@as(u32, 0), state.priorAttempt(encoded, 42, 11, digest).failures);
+    try std.testing.expectEqual(@as(u32, 5), state.priorAttempt(encoded, 42, 10, digest).failures);
 }

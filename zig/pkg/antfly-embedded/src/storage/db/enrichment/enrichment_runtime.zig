@@ -3148,7 +3148,9 @@ fn updateFailureFingerprintForRequest(hasher: *std.hash.Wyhash, request: enrichm
     const embedding_input: u8 = @backingInt(request.embedding_input);
     const input_kind: u8 = @backingInt(request.input_kind);
     var sequence_bytes: [8]u8 = undefined;
-    std.mem.writeInt(u64, &sequence_bytes, request.sequence, .little);
+    const extraction_attempt = request.kind == .asset and request.reprocess_generation != 0;
+    if (extraction_attempt) hasher.update("extraction-reprocess");
+    std.mem.writeInt(u64, &sequence_bytes, if (extraction_attempt) request.reprocess_generation else request.sequence, .little);
     hasher.update(&.{kind});
     hasher.update(&.{embedding_input});
     hasher.update(&.{input_kind});
@@ -3417,6 +3419,9 @@ fn logicalRequestFingerprint(supplied: enrichment_types.GeneratedEnrichmentReque
     // Generated replay can re-notify an unchanged primary at a new journal
     // sequence. Producer/source identity, not that notification, owns retries.
     request.sequence = 0;
+    // The existing provider clock remains attached to the same source and
+    // producer across an explicit retry. Attempt counts use the epoch below.
+    if (request.kind == .asset) request.reprocess_generation = 0;
     var hash = std.hash.Wyhash.init(requestFailureFingerprint(request));
     // These are the catalog's normalized producer definitions. Execution batch
     // sizes and consumer routing do not change the semantic unit of retry.
@@ -3576,6 +3581,16 @@ const ScopedReplay = struct {
             return error.EnrichmentSourceChanged;
     }
 
+    fn priorForRequest(self: *@This(), a: Allocator, request: enrichment_types.GeneratedEnrichmentRequest, digest: ?[32]u8) !scoped_retries.Budget {
+        const logical = logicalRequestFingerprint(request);
+        if (request.kind == .asset and request.reprocess_generation != 0) {
+            const document = try documentKey(a, request.doc_key);
+            defer a.free(document);
+            return self.state.priorAttempt(document, logical, requestFailureFingerprint(request), digest);
+        }
+        return self.state.priorLogical(a, logical, digest);
+    }
+
     fn inputBudget(self: *@This(), runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest, observed: ?[32]u8, raw: ?[]const u8) !scoped_retries.Budget {
         const logical = logicalRequestFingerprint(request);
         const io = concurrencyIo(runtime);
@@ -3590,7 +3605,7 @@ const ScopedReplay = struct {
         const digest = observed orelse if (raw) |bytes| sourceRecordDigest(bytes) else try sourceDigest(runtime, request.doc_key);
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
-        return try self.state.priorLogical(runtime.alloc, logical, digest);
+        return try self.priorForRequest(runtime.alloc, request, digest);
     }
     /// Publication fences hash physical rows; retry tickets hash logical input.
     /// Resolve the latter only on failure/history, and reject a source that has
@@ -3633,7 +3648,7 @@ const ScopedReplay = struct {
             const digest = try self.ownerSource(runtime, owner, request);
             const io = concurrencyIo(runtime);
             self.mutex.lockUncancelable(io);
-            const prior_budget = self.state.priorLogical(runtime.alloc, logicalRequestFingerprint(request), digest) catch |err| {
+            const prior_budget = self.priorForRequest(runtime.alloc, request, digest) catch |err| {
                 self.mutex.unlock(io);
                 return err;
             };
@@ -3849,9 +3864,24 @@ const ScopedReplay = struct {
         _ = try self.parkPreparedMembers(runtime, prepared, err, false);
     }
 
+    const ReprocessRetryEvent = struct {
+        doc_key: []const u8,
+        artifact: []const u8,
+        sequence: u64,
+        observation: @import("../artifact_reprocess_intent.zig").RetryObservation,
+    };
+
     /// Queue eligible owners under one writer fence. Each member retains its
     /// own budget and retry hint, even when one physical provider call fails.
     fn parkPreparedMembers(self: *@This(), runtime: *EnrichmentRuntime, prepared: []const ParkMember, err: anyerror, skip_recorded: bool) !usize {
+        var events: std.ArrayListUnmanaged(ReprocessRetryEvent) = .empty;
+        defer events.deinit(runtime.alloc);
+        var committed = false;
+        defer if (committed) {
+            for (events.items) |event| std.log.info("extraction reprocess deferred doc_key={s} artifact={s} accepted_sequence={d} retry_at_ms={d} reason={s}", .{
+                event.doc_key[0..@min(event.doc_key.len, 256)], event.artifact, event.sequence, event.observation.retry_at_ms, @errorName(err),
+            });
+        };
         const prior_io = lockRuntime(runtime);
         const legacy = scoped_retries.Budget{ .fingerprint = runtime.retry_failure_fingerprint, .failures = runtime.retry_failure_count, .waits = runtime.transient_retry_count };
         unlockRuntime(runtime, prior_io);
@@ -3869,21 +3899,35 @@ const ScopedReplay = struct {
             const request = member.request.*;
             const request_fp = requestFailureFingerprint(request);
             if (skip_recorded and self.recorded_requests.contains(request_fp)) continue;
-            const logical = logicalRequestFingerprint(request);
-            var budget = try self.state.priorLogical(runtime.alloc, logical, member.digest);
-            budget.fingerprint = member.fingerprint;
-            if (member.fingerprint == legacy.fingerprint) {
+            var budget = try self.priorForRequest(runtime.alloc, request, member.digest);
+            budget.fingerprint = if (request.kind == .asset and request.reprocess_generation != 0) request_fp else member.fingerprint;
+            if (budget.fingerprint == legacy.fingerprint) {
                 budget.failures = @max(budget.failures, legacy.failures);
                 budget.waits = @max(budget.waits, legacy.waits);
             }
             if (enrichmentFailureSparesAttemptBudget(err)) budget.waits +|= 1 else budget.failures +|= 1;
             const hint_ms = @max(self.hints.get(member.fingerprint) orelse 0, self.ownerHint(request));
-            const deadline = now_ms +| workerRetryDelayJitterMs(budget.failures +| budget.waits, hint_ms, jitter);
+            const deadline = @max(budget.deadline_ms, now_ms +| workerRetryDelayJitterMs(budget.failures +| budget.waits, hint_ms, jitter));
             try self.parkTicket(runtime, .{ .doc_key = request.doc_key, .sequence = request.sequence }, deadline, budget, member.digest, member.stamp, &publication);
+            if (request.kind == .asset and request.reprocess_generation != 0) {
+                const reason: @import("../artifact_reprocess_intent.zig").RetryReason = if (hint_ms != 0)
+                    .provider_retry_after
+                else if (err == error.QueueFull or err == error.InferenceCapacityUnavailable)
+                    .provider_capacity
+                else
+                    .transient;
+                events.append(runtime.alloc, .{
+                    .doc_key = request.doc_key,
+                    .artifact = requestArtifactName(request),
+                    .sequence = request.reprocess_generation,
+                    .observation = .{ .retry_at_ms = deadline, .reason = reason },
+                }) catch {};
+            }
             self.recorded_requests.putAssumeCapacity(request_fp, {});
             parked += 1;
         }
-        if (parked != 0) try self.saveAssumeLocked(runtime, publication.store(runtime).*, publication.retry_fence);
+        if (parked != 0) try self.saveWithReceiptsAssumeLocked(runtime, publication.store(runtime).*, publication.retry_fence, events.items);
+        committed = true;
         return parked;
     }
     fn deferUnattempted(self: *@This(), runtime: *EnrichmentRuntime, fingerprint: u64, requests: []const enrichment_types.GeneratedEnrichmentRequest, seed: enrichment_types.GeneratedEnrichmentRequest, comptime same_key: anytype) !void {
@@ -3920,7 +3964,7 @@ const ScopedReplay = struct {
             if (digest == null or !same_key(seed, request)) continue;
             const request_fp = requestFailureFingerprint(request);
             if (self.recorded_requests.contains(request_fp)) continue;
-            var budget = try self.state.priorLogical(runtime.alloc, logicalRequestFingerprint(request), digest);
+            var budget = try self.priorForRequest(runtime.alloc, request, digest);
             budget.fingerprint = request_fp;
             self.unsaved = true;
             try self.parkTicket(runtime, .{ .doc_key = request.doc_key, .sequence = request.sequence }, deadline, budget, digest, stamp, &publication);
@@ -3929,6 +3973,10 @@ const ScopedReplay = struct {
         if (self.unsaved) try self.saveAssumeLocked(runtime, publication.store(runtime).*, publication.retry_fence);
     }
     fn saveAssumeLocked(self: *@This(), runtime: *EnrichmentRuntime, store: backend_erased.Store, fence: ?GeneratedWriteFence) !void {
+        return self.saveWithReceiptsAssumeLocked(runtime, store, fence, &.{});
+    }
+
+    fn saveWithReceiptsAssumeLocked(self: *@This(), runtime: *EnrichmentRuntime, store: backend_erased.Store, fence: ?GeneratedWriteFence, events: []const ReprocessRetryEvent) !void {
         self.unsaved = true;
         // A fresh fence cannot authorize a snapshot from an older tenure.
         // The transaction-local check below still protects takeover/expiry
@@ -3938,14 +3986,26 @@ const ScopedReplay = struct {
             runtime: *EnrichmentRuntime,
             fence: ?GeneratedWriteFence,
             generation: u64,
+            events: []const ReprocessRetryEvent,
             pub fn validate(guard: @This(), txn: anytype) !void {
                 try enrichment_state.validateReplayGenerationTxn(guard.runtime.alloc, txn, scope_name, guard.generation);
                 try validateRuntimeStoreWriteFenceTxn(guard.runtime, txn, guard.fence);
+                const intent = @import("../artifact_reprocess_intent.zig");
+                for (guard.events) |event| {
+                    const key = try intent.receiptKeyAlloc(guard.runtime.alloc, event.doc_key, event.artifact);
+                    defer guard.runtime.alloc.free(key);
+                    const raw = txn.get(key) catch |err| switch (err) {
+                        error.NotFound => continue,
+                        else => return err,
+                    };
+                    const updated = intent.withRetry(raw, event.sequence, event.observation) orelse continue;
+                    try txn.put(key, &updated);
+                }
             }
         };
         var attempt: usize = 0;
         while (true) : (attempt += 1) {
-            enrichment_state.saveScopedRetryState(runtime.alloc, store, &self.state, Guard{ .runtime = runtime, .fence = fence, .generation = self.generation }) catch |err| {
+            enrichment_state.saveScopedRetryState(runtime.alloc, store, &self.state, Guard{ .runtime = runtime, .fence = fence, .generation = self.generation, .events = events }) catch |err| {
                 if (err == error.WriterLocked and attempt < writer_locked_retry_count) {
                     backoffWriterLockRetry();
                     continue;
@@ -9359,6 +9419,10 @@ const UnsupportedEnrichmentRuntime = struct {
         return self.applied_sequence;
     }
 
+    pub fn tryReprocessWorkerProgress(_: *@This(), _: bool) ?types.DocumentArtifactReprocessStatus.Worker {
+        return null;
+    }
+
     pub fn stats(self: *@This()) types.EnrichmentStats {
         const projection_status = runtimeProjectionStatus(self.retrying, self.worker_failed);
         const config_hash = enrichmentCatalogConfigHash(self.alloc, self.index_manager) catch 0;
@@ -10229,9 +10293,9 @@ const PlatformEnrichmentRuntime = struct {
         return self.applied_sequence;
     }
 
-    pub fn reprocessWorkerProgress(self: *EnrichmentRuntime) types.DocumentArtifactReprocessStatus.Worker {
+    pub fn tryReprocessWorkerProgress(self: *EnrichmentRuntime, background_running: bool) ?types.DocumentArtifactReprocessStatus.Worker {
         const maybe_io = if (self.io_impl) |io_impl| io_impl.io() else null;
-        if (maybe_io) |io| self.mutex.lockUncancelable(io);
+        if (maybe_io != null and !self.mutex.tryLock()) return null;
         defer if (maybe_io) |io| self.mutex.unlock(io);
         return .{
             .scanned_sequence = self.scoped_retry_scan_sequence,
@@ -10241,7 +10305,7 @@ const PlatformEnrichmentRuntime = struct {
             .retrying = self.retrying,
             .next_retry_at_ms = if (self.retrying and self.next_retry_at_ms != 0) self.next_retry_at_ms else null,
             .failed = self.worker_failed,
-            .background_running = self.future != null,
+            .background_running = background_running,
         };
     }
 
@@ -13760,7 +13824,9 @@ const SharedPdfWindowScheduler = struct {
             break :blk try document_extraction_mod.downloadedMetadataFingerprintAlloc(alloc, source_url, config_json, config, downloaded.content_type) orelse try documentExtractionFingerprintFromDigestAlloc(alloc, &borrowed.entry().source_identity, config_json, config, config.content_type, config.filename, downloaded.content_type, &borrowed.entry().content_sha256);
         };
         defer alloc.free(fingerprint);
-        return skipRuntimeDocumentExtractionByFingerprint(self.runtime, request.doc_key, artifact, fingerprint, state, manifest, try documentExtractionManifestGeneration(alloc, manifest), request.producer_json);
+        const published = try @import("document_extraction_completion.zig").snapshot(alloc, manifest);
+        if ((try runtimeDocumentExtractionReprocess(self.runtime, request.doc_key, artifact, request.producer_json, published)).pending) return false;
+        return skipRuntimeDocumentExtractionByFingerprint(self.runtime, request.doc_key, artifact, fingerprint, state, manifest, published.generation);
     }
 
     fn ensureSpool(self: *@This()) !void {
@@ -18079,8 +18145,11 @@ fn prepareDocumentRequests(runtime: *EnrichmentRuntime, pending: enrichment_work
     errdefer runtime.alloc.free(planned);
     for (planned) |*request| {
         request.sequence = pending.sequence;
-        if (request.kind != .dense_embedding and request.kind != .sparse_embedding) continue;
-        request.reprocess_generation = try embeddingReprocessGeneration(runtime, request.doc_key, requestEmbeddingName(request.*));
+        switch (request.kind) {
+            .dense_embedding, .sparse_embedding => request.reprocess_generation = try embeddingReprocessGeneration(runtime, request.doc_key, requestEmbeddingName(request.*)),
+            .asset => request.reprocess_generation = (try extractionReceiptSequence(runtime, request.doc_key, requestArtifactName(request.*), request.producer_json)) orelse 0,
+            else => {},
+        }
     }
     return planned;
 }
@@ -18808,6 +18877,7 @@ fn primePrivacyRoots(runtime: *EnrichmentRuntime, pending: []const enrichment_wo
             if (!assetHasConsumer(root_template, requests[request_index + 1 ..])) continue;
             var request = root_template;
             request.sequence = group.sequence;
+            request.reprocess_generation = (try extractionReceiptSequence(runtime, request.doc_key, requestArtifactName(request), request.producer_json)) orelse 0;
             if (runtime.retry_scheduler) |scheduler| if (try scheduler.rootDelayed(runtime, group, requests, request)) continue;
             if (try skipPersistedRequestFailure(runtime, &window, request)) continue;
             try roots.append(runtime.alloc, request);
@@ -21683,25 +21753,50 @@ fn applyAssetProducerBatchOutput(
     retireIndexDocumentCheckpoint(runtime, item.request, null) catch |err| return FailureScope.assetPublicationFailure(scope, err);
 }
 
-/// Use the same completed-state gate for metadata fingerprints known before a
-/// download and byte fingerprints known immediately afterwards. Keeping this
-/// check independent of source transport prevents an idempotent replay from
-/// entering document preparation merely because its origin lacks ETag-style
-/// metadata.
-fn runtimeDocumentExtractionReprocessPending(
+const ExtractionReprocess = struct {
+    pending: bool = false,
+    sequence: u64 = 0,
+};
+
+fn extractionReceiptSequence(runtime: *EnrichmentRuntime, doc_key: []const u8, artifact_name: []const u8, producer_json: []const u8) !?u64 {
+    const intent = @import("../artifact_reprocess_intent.zig");
+    const key = try intent.receiptKeyAlloc(runtime.alloc, doc_key, artifact_name);
+    defer runtime.alloc.free(key);
+    const raw = (try storeGetOptionalAllocWithRetry(runtime, key)) orelse return null;
+    defer runtime.alloc.free(raw);
+    const intent_key = try intent.keyAlloc(runtime.alloc, doc_key, artifact_name);
+    defer runtime.alloc.free(intent_key);
+    const requested = (try storeGetOptionalAllocWithRetry(runtime, intent_key)) orelse return null;
+    defer runtime.alloc.free(requested);
+    if (try intent.generationForConfig(requested, producer_json) == 0) return null;
+    return intent.receiptSequence(raw, requested);
+}
+
+fn runtimeDocumentExtractionReprocess(
     runtime: *EnrichmentRuntime,
     doc_key: []const u8,
     artifact_name: []const u8,
     producer_json: []const u8,
-    generation: u64,
-) !bool {
+    published: @import("document_extraction_completion.zig").Snapshot,
+) !ExtractionReprocess {
     const intent = @import("../artifact_reprocess_intent.zig");
     const intent_key = try intent.keyAlloc(runtime.alloc, doc_key, artifact_name);
     defer runtime.alloc.free(intent_key);
-    const requested = try storeGetOptionalAllocWithRetry(runtime, intent_key);
-    defer if (requested) |raw| runtime.alloc.free(raw);
-    if (requested) |raw| return intent.pending(raw, producer_json, generation);
-    return false;
+    const requested = (try storeGetOptionalAllocWithRetry(runtime, intent_key)) orelse return .{};
+    defer runtime.alloc.free(requested);
+    const target = try intent.generationForConfig(requested, producer_json);
+    if (target == 0) return .{};
+
+    const receipt_key = try intent.receiptKeyAlloc(runtime.alloc, doc_key, artifact_name);
+    defer runtime.alloc.free(receipt_key);
+    const receipt = try storeGetOptionalAllocWithRetry(runtime, receipt_key);
+    defer if (receipt) |raw| runtime.alloc.free(raw);
+    if (receipt) |raw| if (intent.receiptSequence(raw, requested)) |sequence| {
+        if (!intent.isPublished(sequence, target, published.reprocess_sequence, published.generation))
+            return .{ .pending = true, .sequence = sequence };
+        return .{};
+    };
+    return .{ .pending = target > published.generation };
 }
 
 pub fn embeddingReprocessGeneration(runtime: *EnrichmentRuntime, doc_key: []const u8, embedding_name: []const u8) !u64 {
@@ -21725,9 +21820,7 @@ fn skipRuntimeDocumentExtractionByFingerprint(
     existing_state: ?[]const u8,
     existing_manifest: ?[]const u8,
     generation: u64,
-    producer_json: []const u8,
 ) !bool {
-    if (try runtimeDocumentExtractionReprocessPending(runtime, doc_key, artifact_name, producer_json, generation)) return false;
     const state = existing_state orelse return false;
     if (!documentExtractionStateFingerprintMatches(runtime.alloc, state, fingerprint) or
         !documentExtractionStateHasChunkUnitFingerprints(runtime.alloc, state)) return false;
@@ -21784,9 +21877,16 @@ fn processDocumentExtractionAsset(
     if (existing_manifest) |value| {
         previous_child_ranges = try documentArtifactChildRangesFromManifestJsonAlloc(runtime.alloc, value);
     }
-    const from_generation = if (existing_manifest) |value| try documentExtractionManifestGeneration(runtime.alloc, value) else 0;
+    const published = if (existing_manifest) |value|
+        try @import("document_extraction_completion.zig").snapshot(runtime.alloc, value)
+    else
+        @import("document_extraction_completion.zig").Snapshot{};
+    const from_generation = published.generation;
     const to_generation = from_generation + 1;
-    const force_reprocess = try runtimeDocumentExtractionReprocessPending(runtime, request.doc_key, artifact_name, request.producer_json, from_generation);
+    const reprocess = try runtimeDocumentExtractionReprocess(runtime, request.doc_key, artifact_name, request.producer_json, published);
+    if (reprocess.sequence != 0 and request.reprocess_generation != 0 and reprocess.sequence != request.reprocess_generation)
+        return error.EnrichmentSourceChanged;
+    const force_reprocess = reprocess.pending;
 
     // A prior owner may have crashed after spilling finalized units. Scavenge
     // under the current lease epoch before either fingerprint fast path so an
@@ -21798,7 +21898,7 @@ fn processDocumentExtractionAsset(
     // Checksum opt-in must establish verified provenance once. Never accept
     // legacy metadata-only evidence as a digest-verified extraction.
     if (metadata_fingerprint) |fingerprint| {
-        if (try skipRuntimeDocumentExtractionByFingerprint(
+        if (!force_reprocess and try skipRuntimeDocumentExtractionByFingerprint(
             runtime,
             request.doc_key,
             artifact_name,
@@ -21806,7 +21906,6 @@ fn processDocumentExtractionAsset(
             existing_state,
             existing_manifest,
             from_generation,
-            request.producer_json,
         )) return;
     }
 
@@ -21816,8 +21915,8 @@ fn processDocumentExtractionAsset(
     // change triggered zero of these, the same way skip_by_hash_count
     // confirms the skip path did fire, without adding a new stats field to
     // the table status aggregation pipeline for a one-off verification.
-    std.log.info("document extraction fetching source: doc_key={s} artifact={s} replay_sequence={d} generation={d} reprocess={}", .{
-        request.doc_key[0..@min(request.doc_key.len, 256)], artifact_name, request.sequence, to_generation, force_reprocess,
+    std.log.info("document extraction fetching source: doc_key={s} artifact={s} replay_sequence={d} generation={d} reprocess={} accepted_sequence={d}", .{
+        request.doc_key[0..@min(request.doc_key.len, 256)], artifact_name, request.sequence, to_generation, force_reprocess, reprocess.sequence,
     });
     var resource_tracker = RuntimeDocumentExtractionResourceTracker.init(runtime);
     defer resource_tracker.deinit();
@@ -21846,6 +21945,7 @@ fn processDocumentExtractionAsset(
             previous_child_ranges,
             existing_state,
             from_generation,
+            if (reprocess.sequence != 0) reprocess.sequence else published.reprocess_sequence,
             request.execution_json,
             window,
             scope,
@@ -21880,6 +21980,7 @@ fn processDocumentExtractionAsset(
                 previous_child_ranges,
                 existing_state,
                 from_generation,
+                if (reprocess.sequence != 0) reprocess.sequence else published.reprocess_sequence,
                 request.execution_json,
                 window,
                 scope,
@@ -21915,6 +22016,7 @@ fn processDocumentExtractionAsset(
             previous_child_ranges,
             existing_state,
             from_generation,
+            if (reprocess.sequence != 0) reprocess.sequence else published.reprocess_sequence,
             request.execution_json,
             window,
             scope,
@@ -21931,7 +22033,7 @@ fn processDocumentExtractionAsset(
     // Metadata-less sources can only be identified after download, but that is
     // still early enough to avoid all parsing, rendering, inference, and PDF
     // working-set admission on idempotent replay.
-    if (metadata_fingerprint == null and try skipRuntimeDocumentExtractionByFingerprint(
+    if (metadata_fingerprint == null and !force_reprocess and try skipRuntimeDocumentExtractionByFingerprint(
         runtime,
         request.doc_key,
         artifact_name,
@@ -21939,7 +22041,6 @@ fn processDocumentExtractionAsset(
         existing_state,
         existing_manifest,
         from_generation,
-        request.producer_json,
     )) return;
     // Retained collection state grows independently from the fixed PDF
     // invocation peak. Keeping separate ledgers prevents completed OCR text
@@ -22008,6 +22109,7 @@ fn processDocumentExtractionAsset(
                 previous_child_ranges,
                 existing_state,
                 from_generation,
+                if (reprocess.sequence != 0) reprocess.sequence else published.reprocess_sequence,
                 request.execution_json,
                 window,
                 scope,
@@ -22182,6 +22284,7 @@ fn processDocumentExtractionAsset(
             previous_child_ranges,
             existing_state,
             from_generation,
+            if (reprocess.sequence != 0) reprocess.sequence else published.reprocess_sequence,
             request.execution_json,
             window,
             scope,
@@ -22341,6 +22444,7 @@ fn processDocumentExtractionAsset(
         ocr_failure_details[index] = summary.borrowed();
     }
     const streamed_extraction = document_extraction_mod.Result{
+        .reprocess_sequence = if (reprocess.sequence != 0) reprocess.sequence else published.reprocess_sequence,
         .execution_json = request.execution_json,
         .content_type = collect_ctx.info.content_type,
         .route_type = collect_ctx.info.route_type,
@@ -22414,6 +22518,7 @@ fn processDocumentExtractionAsset(
             previous_child_ranges,
             existing_state,
             from_generation,
+            if (reprocess.sequence != 0) reprocess.sequence else published.reprocess_sequence,
             request.execution_json,
             window,
             scope,
@@ -22489,9 +22594,19 @@ fn processDocumentExtractionAsset(
     // matching derived/outbox records. Private record reads are closed before
     // the generated writer begins, preserving LMDB's one-transaction-per-
     // thread constraint.
-    try extraction_lease_guard.check();
-    publication_spool.replay(runtime, window, max_window_items, &resource_tracker) catch |err| return scope.publicationFailure(err);
-    try scope.publish(runtime, window, false);
+    const publication_result: anyerror!void = blk: {
+        extraction_lease_guard.check() catch |err| break :blk err;
+        publication_spool.replay(runtime, window, max_window_items, &resource_tracker) catch |err|
+            break :blk scope.publicationFailure(err);
+        break :blk scope.publish(runtime, window, false);
+    };
+    publication_result catch |err| {
+        if (reprocess.sequence != 0)
+            std.log.warn("extraction reprocess publication interrupted doc_key={s} artifact={s} accepted_sequence={d} replay_sequence={d} error={s}", .{
+                request.doc_key[0..@min(request.doc_key.len, 256)], artifact_name, reprocess.sequence, request.sequence, @errorName(err),
+            });
+        return err;
+    };
     recordArtifactBytes(runtime, .asset, manifest.len);
     // A successful extraction can legitimately produce no chunk artifacts (for
     // example, an image-only PDF whose OCR output is rejected as trivial). No
@@ -22580,6 +22695,7 @@ fn writeDocumentExtractionFailureManifest(
     previous_child_ranges: []const types.DocumentArtifactChildRange,
     existing_state: ?[]const u8,
     from_generation: u64,
+    reprocess_sequence: u64,
     execution_json: []const u8,
     window: *GeneratedReplayWindow,
     scope: *FailureScope,
@@ -22592,6 +22708,7 @@ fn writeDocumentExtractionFailureManifest(
 
     const empty_units: [0]document_extraction_mod.Unit = .{};
     const failed_extraction = document_extraction_mod.Result{
+        .reprocess_sequence = reprocess_sequence,
         .execution_json = execution_json,
         .content_type = @constCast(content_type),
         .route_type = @constCast("error"),
@@ -40881,6 +40998,7 @@ fn documentExtractionManifestPayloadAlloc(
     try appendJsonFieldString(alloc, &out, &first, "artifact_type", "document_units");
     try appendJsonFieldU64(alloc, &out, &first, "manifest_version", 2);
     try appendJsonFieldU64(alloc, &out, &first, "generation", manifest_generation);
+    if (extraction.reprocess_sequence != 0) try appendJsonFieldU64(alloc, &out, &first, "reprocess_sequence", extraction.reprocess_sequence);
     try appendJsonFieldString(alloc, &out, &first, "source_url", source_url);
     try appendJsonFieldString(alloc, &out, &first, "source_fingerprint", fingerprint);
     try appendJsonFieldString(alloc, &out, &first, "content_type", extraction.content_type);
@@ -56568,7 +56686,7 @@ test "OCR sampling reuse gate requires current state before skipping extraction"
     for (0..2) |_| {
         const state = try storeGetAllocWithRetry(&runtime, state_key);
         defer a.free(state);
-        if (try skipRuntimeDocumentExtractionByFingerprint(&runtime, "doc", "units", "source-version", state, "{}", 1, "{}")) continue;
+        if (try skipRuntimeDocumentExtractionByFingerprint(&runtime, "doc", "units", "source-version", state, "{}", 1)) continue;
         extractions += 1;
         var extracted = try document_extraction_mod.extractDownloadedAlloc(a, .{ .data = source, .content_type = "text/plain" }, "source.txt", .{});
         defer extracted.deinit(a);

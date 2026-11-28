@@ -22,6 +22,58 @@ const std = @import("std");
 const keys = @import("../internal_keys.zig");
 const kind = keys.asset_reprocess_intent_kind;
 pub const encoded_len = 76;
+const receipt_len = 53;
+
+pub const RetryReason = enum(u8) { provider_capacity = 1, provider_retry_after = 2, transient = 3 };
+pub const RetryObservation = struct {
+    retry_at_ms: u64,
+    reason: RetryReason,
+};
+
+/// The companion preserves the existing ARP1 reader during a rolling upgrade.
+/// It describes a replay sequence in the accepting store's journal.
+pub fn receiptKeyAlloc(alloc: std.mem.Allocator, document: []const u8, producer: []const u8) ![]u8 {
+    return keyForKindAlloc(alloc, document, producer, keys.asset_reprocess_receipt_kind);
+}
+
+pub fn newReceipt(intent: *const [encoded_len]u8) [receipt_len]u8 {
+    return "ARR1".* ++ intent[44..76].* ++ @as([17]u8, @splat(0));
+}
+
+pub fn stampReceipt(raw: []u8, sequence: u64) !void {
+    if (raw.len != receipt_len or !std.mem.eql(u8, raw[0..4], "ARR1") or sequence == 0)
+        return error.InvalidArtifactPayload;
+    std.mem.writeInt(u64, raw[36..44], sequence, .little);
+}
+
+pub fn receiptSequence(raw: []const u8, checked_intent: []const u8) ?u64 {
+    if (raw.len != receipt_len or checked_intent.len != encoded_len or
+        !std.mem.eql(u8, raw[0..4], "ARR1") or
+        !std.mem.eql(u8, raw[4..36], checked_intent[44..76])) return null;
+    const sequence = std.mem.readInt(u64, raw[36..44], .little);
+    return if (sequence == 0) null else sequence;
+}
+
+pub fn observeRetry(raw: []const u8) ?RetryObservation {
+    if (raw.len != receipt_len or !std.mem.eql(u8, raw[0..4], "ARR1")) return null;
+    const reason = std.enums.fromInt(RetryReason, raw[52]) orelse return null;
+    const retry_at_ms = std.mem.readInt(u64, raw[44..52], .little);
+    if (retry_at_ms == 0) return null;
+    return .{ .reason = reason, .retry_at_ms = retry_at_ms };
+}
+
+pub fn withRetry(raw: []const u8, accepted_sequence: u64, retry: RetryObservation) ?[receipt_len]u8 {
+    if (raw.len != receipt_len or !std.mem.eql(u8, raw[0..4], "ARR1") or
+        std.mem.readInt(u64, raw[36..44], .little) != accepted_sequence) return null;
+    var revised = raw[0..receipt_len].*;
+    std.mem.writeInt(u64, revised[44..52], retry.retry_at_ms, .little);
+    revised[52] = @backingInt(retry.reason);
+    return revised;
+}
+
+pub fn isPublished(accepted: u64, target: u64, published: u64, published_generation: u64) bool {
+    return published == accepted and published_generation >= target;
+}
 
 pub fn keyAlloc(alloc: std.mem.Allocator, document: []const u8, producer: []const u8) ![]u8 {
     return keyForKindAlloc(alloc, document, producer, kind);
@@ -134,4 +186,20 @@ test "embedding epochs fence zero and repeated model incarnations without resett
     corrupt[36] ^= 1;
     read.raw = &corrupt;
     try std.testing.expectError(error.InvalidArtifactPayload, requireEmbeddingGeneration(a, &read, "doc", "vectors", 3));
+}
+
+test "extraction receipt requires its own publication witness even when another recipe reached its target" {
+    const target = encode("recipe A", 3);
+    var receipt = newReceipt(&target);
+    try stampReceipt(&receipt, 90);
+    try std.testing.expectEqual(@as(?u64, 90), receiptSequence(&receipt, &target));
+    try std.testing.expectEqual(@as(?u64, null), receiptSequence(&receipt, &encode("recipe B", 3)));
+    try std.testing.expect(!isPublished(90, 3, 0, 3));
+    try std.testing.expect(!isPublished(90, 3, 91, 4));
+    try std.testing.expect(isPublished(90, 3, 90, 3));
+    const retry = RetryObservation{ .retry_at_ms = 200, .reason = .provider_retry_after };
+    try std.testing.expect(withRetry(&receipt, 89, retry) == null);
+    const deferred = withRetry(&receipt, 90, retry).?;
+    try std.testing.expectEqual(@as(?u64, 90), receiptSequence(&deferred, &target));
+    try std.testing.expectEqual(retry, observeRetry(&deferred).?);
 }

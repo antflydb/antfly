@@ -259,6 +259,7 @@ pub const DocumentArtifactReprocessFailure = types.DocumentArtifactReprocessFail
 pub const DocumentArtifactReprocessJob = types.DocumentArtifactReprocessJob;
 pub const DocumentArtifactReprocessJobStartRequest = types.DocumentArtifactReprocessJobStartRequest;
 pub const DocumentArtifactReprocessResponse = types.DocumentArtifactReprocessResponse;
+pub const DocumentArtifactReprocessRetry = types.DocumentArtifactReprocessRetry;
 pub const DocumentArtifactReprocessShardCursor = types.DocumentArtifactReprocessShardCursor;
 pub const DocumentArtifactReprocessStatus = types.DocumentArtifactReprocessStatus;
 pub const DocumentArtifactReprocessWorker = types.DocumentArtifactReprocessWorker;

@@ -2002,6 +2002,10 @@ fn recoverReplicatedRestoreFinish(self: *DB, finish: @FieldType(@import("db/rest
     return .{ .value = self.recoverReplicatedRestoreFinish(finish) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
+fn reprocessDocumentArtifactAcceptance(self: *DB, alloc: Allocator, doc_key: []const u8, artifact_name: []const u8) engine.Outcome(types.DocumentArtifactReprocessAcceptance) {
+    return .{ .value = self.reprocessDocumentArtifactAcceptance(alloc, doc_key, artifact_name) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
 fn reprocessDocumentArtifact(self: *DB, alloc: std.mem.Allocator, doc_key: []const u8, artifact_name: []const u8) engine.Outcome(bool) {
     return .{ .value = self.reprocessDocumentArtifact(alloc, doc_key, artifact_name) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }

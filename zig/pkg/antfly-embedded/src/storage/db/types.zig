@@ -1093,6 +1093,11 @@ pub const DocumentArtifactChildRangePlacementUpdate = struct {
 
 /// Durable intent read alongside the currently published artifact. Worker
 /// progress is scoped to the owning shard and is sampled independently.
+pub const DocumentArtifactReprocessAcceptance = struct {
+    handled: bool,
+    accepted_sequence: ?u64 = null,
+};
+
 pub const DocumentArtifactReprocessStatus = struct {
     pub const Worker = struct {
         scanned_sequence: u64,
@@ -1106,8 +1111,10 @@ pub const DocumentArtifactReprocessStatus = struct {
     };
 
     requested_generation: u64,
-    status: enum { pending, published, superseded },
+    accepted_sequence: ?u64 = null,
+    status: enum { pending, published, superseded, unverified },
     worker: ?Worker = null,
+    last_retry: ?@import("artifact_reprocess_intent.zig").RetryObservation = null,
 };
 
 pub const DocumentArtifactManifest = struct {

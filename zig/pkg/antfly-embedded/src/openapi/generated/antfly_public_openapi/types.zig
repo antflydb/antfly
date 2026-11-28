@@ -4741,6 +4741,40 @@ pub const DocumentArtifactReprocessJobStartRequest = struct {
 pub const DocumentArtifactReprocessResponse = struct {
     /// Indicates that reprocessing was accepted.
     reprocess: []const u8,
+    /// Committed replay sequence for a deferred native extraction request. Scope to the accepting shard and the artifact identified by this route.
+    accepted_sequence: ?u64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "reprocess", "reprocess", false },
+        .{ "accepted_sequence", "accepted_sequence", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("reprocess");
+        try jw.write(self.reprocess);
+        if (self.accepted_sequence) |value| {
+            try jw.objectField("accepted_sequence");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Most recent durable deferral for this accepted extraction attempt. The deadline can be in the past if replay has since resumed.
+pub const DocumentArtifactReprocessRetry = struct {
+    reason: []const u8,
+    /// Unix timestamp in milliseconds before which this attempt is deferred.
+    retry_at_ms: u64,
 };
 
 pub const DocumentArtifactReprocessShardCursor = struct {
@@ -4792,15 +4826,20 @@ pub const DocumentArtifactReprocessShardCursor = struct {
 pub const DocumentArtifactReprocessStatus = struct {
     /// Target generation recorded by the accepted request.
     requested_generation: u64,
-    /// Pending is an unfulfilled intent. Published means the target generation is visible and can itself contain extraction failures. Superseded means the intent no longer matches the configured producer.
+    /// Replay sequence committed with the request in the accepting shard, when available.
+    accepted_sequence: ?u64 = null,
+    /// Published has a manifest receipt for the accepted request and can include extraction failures. Pending has no matching publication. Superseded no longer matches the configured producer. Unverified is a legacy intent whose target generation was reached without a publication receipt.
     status: []const u8,
     worker: ?DocumentArtifactReprocessWorker = null,
+    last_retry: ?DocumentArtifactReprocessRetry = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "requested_generation", "requested_generation", false },
+        .{ "accepted_sequence", "accepted_sequence", true },
         .{ "status", "status", false },
         .{ "worker", "worker", true },
+        .{ "last_retry", "last_retry", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -4815,10 +4854,18 @@ pub const DocumentArtifactReprocessStatus = struct {
         try jw.beginObject();
         try jw.objectField("requested_generation");
         try jw.write(self.requested_generation);
+        if (self.accepted_sequence) |value| {
+            try jw.objectField("accepted_sequence");
+            try jw.write(value);
+        }
         try jw.objectField("status");
         try jw.write(self.status);
         if (self.worker) |value| {
             try jw.objectField("worker");
+            try jw.write(value);
+        }
+        if (self.last_retry) |value| {
+            try jw.objectField("last_retry");
             try jw.write(value);
         }
         try jw.endObject();

@@ -9822,11 +9822,27 @@ export interface components {
              */
             requested_generation: number;
             /**
-             * @description Pending is an unfulfilled intent. Published means the target generation is visible and can itself contain extraction failures. Superseded means the intent no longer matches the configured producer.
+             * Format: uint64
+             * @description Replay sequence committed with the request in the accepting shard, when available.
+             */
+            accepted_sequence?: number;
+            /**
+             * @description Published has a manifest receipt for the accepted request and can include extraction failures. Pending has no matching publication. Superseded no longer matches the configured producer. Unverified is a legacy intent whose target generation was reached without a publication receipt.
              * @enum {string}
              */
-            status: "pending" | "published" | "superseded";
+            status: "pending" | "published" | "superseded" | "unverified";
             worker?: components["schemas"]["DocumentArtifactReprocessWorker"];
+            last_retry?: components["schemas"]["DocumentArtifactReprocessRetry"];
+        };
+        /** @description Most recent durable deferral for this accepted extraction attempt. The deadline can be in the past if replay has since resumed. */
+        DocumentArtifactReprocessRetry: {
+            /** @enum {string} */
+            reason: "provider_capacity" | "provider_retry_after" | "transient";
+            /**
+             * Format: uint64
+             * @description Unix timestamp in milliseconds before which this attempt is deferred.
+             */
+            retry_at_ms: number;
         };
         /** @description Sample of the owning shard's enrichment worker, when present. The worker services multiple documents and producers. Sequence values use the shard's enrichment replay sequence space. */
         DocumentArtifactReprocessWorker: {
@@ -10270,6 +10286,11 @@ export interface components {
              * @enum {string}
              */
             reprocess: "triggered";
+            /**
+             * Format: uint64
+             * @description Committed replay sequence for a deferred native extraction request. Scope to the accepting shard and the artifact identified by this route.
+             */
+            accepted_sequence?: number;
         };
         /** @description Bounded request for reprocessing a derived artifact across source rows in key order. */
         DocumentArtifactTableReprocessRequest: {

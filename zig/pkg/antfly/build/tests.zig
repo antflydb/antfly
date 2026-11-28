@@ -3167,6 +3167,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "api http server preserves public query availability errors",
         "public table query handler preserves retryable failure status",
         "public document artifact manifest handler returns summary and raw state",
+        "public document artifact reprocess handler returns accepted",
         "storage artifact inspection carries the reprocess intent across the owner boundary",
         "api http unsupported unsorted query response is machine readable",
         "api http unsupported hierarchy grouping response uses the public contract",

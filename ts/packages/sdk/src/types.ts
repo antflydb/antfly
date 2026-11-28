@@ -268,6 +268,8 @@ export type DocumentArtifactTableReprocessResponse =
   components["schemas"]["DocumentArtifactTableReprocessResponse"];
 export type DocumentArtifactReprocessFailure =
   components["schemas"]["DocumentArtifactReprocessFailure"];
+export type DocumentArtifactReprocessRetry =
+  components["schemas"]["DocumentArtifactReprocessRetry"];
 export type DocumentArtifactReprocessStatus =
   components["schemas"]["DocumentArtifactReprocessStatus"];
 export type DocumentArtifactReprocessWorker =

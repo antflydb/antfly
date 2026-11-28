@@ -609,7 +609,7 @@ pub const TableApi = struct {
             doc_key: []const u8,
             artifact_name: []const u8,
             request: operation.RequestContext,
-        ) ExecuteReprocessDocumentArtifactError!void = null,
+        ) ExecuteReprocessDocumentArtifactError!db_mod.types.DocumentArtifactReprocessAcceptance = null,
         execute_reprocess_document_artifact_range: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -795,7 +795,7 @@ pub const TableApi = struct {
         table_name: []const u8,
         doc_key: []const u8,
         artifact_name: []const u8,
-    ) ExecuteReprocessDocumentArtifactError!void {
+    ) ExecuteReprocessDocumentArtifactError!db_mod.types.DocumentArtifactReprocessAcceptance {
         const fn_ptr = self.vtable.execute_reprocess_document_artifact orelse return error.MethodNotAllowed;
         try self.ensureActive();
         return try fn_ptr(self.ptr, alloc, table_name, doc_key, artifact_name, self.request);
@@ -3064,7 +3064,7 @@ pub fn handleReprocessDocumentArtifact(
     artifact_name: []const u8,
     api: TableApi,
 ) !OwnedResponse {
-    api.executeReprocessDocumentArtifact(alloc, table_name, doc_key, artifact_name) catch |err| switch (err) {
+    const accepted = api.executeReprocessDocumentArtifact(alloc, table_name, doc_key, artifact_name) catch |err| switch (err) {
         error.Canceled, error.DeadlineExceeded => return err,
         error.NotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "not found") },
         error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "method not allowed") },
@@ -3074,7 +3074,10 @@ pub fn handleReprocessDocumentArtifact(
     };
     return .{
         .status = 202,
-        .body = try alloc.dupe(u8, "{\"reprocess\":\"triggered\"}"),
+        .body = try std.json.Stringify.valueAlloc(alloc, .{
+            .reprocess = "triggered",
+            .accepted_sequence = accepted.accepted_sequence,
+        }, .{ .emit_null_optional_fields = false }),
     };
 }
 
@@ -6782,11 +6785,12 @@ test "public document artifact reprocess handler returns accepted" {
             doc_key: []const u8,
             artifact_name: []const u8,
             _: operation.RequestContext,
-        ) TableApi.ExecuteReprocessDocumentArtifactError!void {
+        ) TableApi.ExecuteReprocessDocumentArtifactError!db_mod.types.DocumentArtifactReprocessAcceptance {
             if (!std.mem.eql(u8, table_name, "docs")) return error.InternalFailure;
             if (std.mem.eql(u8, doc_key, "doc:retry")) return error.InferenceUnavailable;
             if (!std.mem.eql(u8, doc_key, "doc:a")) return error.InternalFailure;
             if (!std.mem.eql(u8, artifact_name, "document_units_v1")) return error.InternalFailure;
+            return .{ .handled = true, .accepted_sequence = 41 };
         }
     };
 
@@ -6800,7 +6804,7 @@ test "public document artifact reprocess handler returns accepted" {
     defer resp.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(u16, 202), resp.status);
-    try std.testing.expectEqualStrings("{\"reprocess\":\"triggered\"}", resp.body);
+    try std.testing.expectEqualStrings("{\"reprocess\":\"triggered\",\"accepted_sequence\":41}", resp.body);
     var retry = try handleReprocessDocumentArtifact(std.testing.allocator, "docs", "doc:retry", "document_units_v1", Backend.iface());
     defer retry.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 503), retry.status);

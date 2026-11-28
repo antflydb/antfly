@@ -1424,13 +1424,21 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                                 const intent = @import("artifact_reprocess_intent.zig");
                                 const generation = reprocess_snapshot.generation;
                                 const encoded = intent.encode(request.producer_json, std.math.add(u64, generation, 1) catch return error.ResourceLimitExceeded);
-                                const key = try intent.keyAlloc(alloc, request.doc_key, requestArtifactName(request));
-                                errdefer alloc.free(key);
-                                const value = try alloc.dupe(u8, &encoded);
-                                errdefer alloc.free(value);
-                                // Commit the target with its source mutation. It
-                                // survives request coalescing and owner restart.
-                                try artifact_writes.append(alloc, .{ .key = key, .value = value });
+                                {
+                                    const key = try intent.keyAlloc(alloc, request.doc_key, requestArtifactName(request));
+                                    errdefer alloc.free(key);
+                                    const value = try alloc.dupe(u8, &encoded);
+                                    errdefer alloc.free(value);
+                                    try artifact_writes.append(alloc, .{ .key = key, .value = value });
+                                }
+                                {
+                                    const key = try intent.receiptKeyAlloc(alloc, request.doc_key, requestArtifactName(request));
+                                    errdefer alloc.free(key);
+                                    const receipt = intent.newReceipt(&encoded);
+                                    const value = try alloc.dupe(u8, &receipt);
+                                    errdefer alloc.free(value);
+                                    try artifact_writes.append(alloc, .{ .key = key, .value = value });
+                                }
                             }
                         }
                         try appendGeneratedEnrichmentRef(alloc, &planned, request);

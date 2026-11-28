@@ -15017,7 +15017,7 @@ pub const DB = struct {
         }
 
         if (stored_manifest == null) {
-            if (try self.documentArtifactReprocessStatus(alloc, doc_key, artifact_name, 0)) |reprocess| {
+            if (try self.documentArtifactReprocessStatus(alloc, doc_key, artifact_name, 0, 0)) |reprocess| {
                 if (reprocess.status == .pending) {
                     self.core.unlockApplyShared();
                     apply_locked = false;
@@ -15063,9 +15063,10 @@ pub const DB = struct {
 
         manifest_owned = false;
         state_owned = false;
-        var result = try self.documentArtifactInspectionAlloc(alloc, doc_key, artifact_name, manifest, state);
+        var published_receipt: u64 = 0;
+        var result = try self.documentArtifactInspectionAlloc(alloc, doc_key, artifact_name, manifest, state, &published_receipt);
         errdefer result.deinit(alloc);
-        result.reprocess = try self.documentArtifactReprocessStatus(alloc, doc_key, artifact_name, result.generation);
+        result.reprocess = try self.documentArtifactReprocessStatus(alloc, doc_key, artifact_name, result.generation, published_receipt);
         self.core.unlockApplyShared();
         apply_locked = false;
         if (result.reprocess) |*reprocess| {
@@ -15081,6 +15082,7 @@ pub const DB = struct {
         doc_key: []const u8,
         artifact_name: []const u8,
         published_generation: u64,
+        published_receipt: u64,
     ) !?types.DocumentArtifactReprocessStatus {
         const intent = @import("artifact_reprocess_intent.zig");
         const key = try intent.keyAlloc(alloc, doc_key, artifact_name);
@@ -15094,26 +15096,35 @@ pub const DB = struct {
             const cfg = self.core.index_manager.getEnrichment(.asset, artifact_name) orelse break :blk false;
             break :blk try intent.generationForConfig(raw, cfg.producer_json) != 0;
         };
-        if (!matches_config) return .{
+        const receipt_key = try intent.receiptKeyAlloc(alloc, doc_key, artifact_name);
+        defer alloc.free(receipt_key);
+        const receipt = try self.core.getStoreValue(alloc, receipt_key);
+        defer if (receipt) |value| alloc.free(value);
+        const accepted_sequence = if (receipt) |value| intent.receiptSequence(value, raw) else null;
+        const status: @FieldType(types.DocumentArtifactReprocessStatus, "status") = if (accepted_sequence != null and intent.isPublished(accepted_sequence.?, target, published_receipt, published_generation))
+            .published
+        else if (!matches_config)
+            .superseded
+        else if (accepted_sequence == null and published_generation >= target)
+            .unverified
+        else
+            .pending;
+        return .{
             .requested_generation = target,
-            .status = .superseded,
+            .accepted_sequence = accepted_sequence,
+            .status = status,
+            .last_retry = if (status == .pending and accepted_sequence != null) intent.observeRetry(receipt.?) else null,
         };
-        if (published_generation >= target) return .{ .requested_generation = target, .status = .published };
-        return .{ .requested_generation = target, .status = .pending };
     }
 
     fn documentArtifactReprocessWorker(self: *DB) ?types.DocumentArtifactReprocessStatus.Worker {
-        // Retain the owner across concurrent provider reconfiguration, and
-        // sample it outside the apply lock. This is shard-level telemetry.
-        var owner = blk: {
-            const mutex = &self.async_context.enrichment_lifecycle_mutex;
-            while (!mutex.tryLock()) spinOrYield();
-            defer mutex.unlock();
-            break :blk self.enrichment_owner.bundle.retain();
-        };
-        defer owner.deinit(self.runtime_alloc);
-        const runtime = owner.runtime orelse return null;
-        return runtime.reprocessWorkerProgress();
+        // Optional telemetry must remain available during a blocked worker
+        // shutdown. Lifecycle owns the future, including its stop/join.
+        const mutex = &self.async_context.enrichment_lifecycle_mutex;
+        if (!mutex.tryLock()) return null;
+        defer mutex.unlock();
+        const runtime = self.enrichment_owner.bundle.runtime orelse return null;
+        return runtime.tryReprocessWorkerProgress(runtime.isStarted());
     }
 
     /// Builds the inspection entry for one stored asset value. Only document
@@ -15129,12 +15140,13 @@ pub const DB = struct {
         artifact_name: []const u8,
         value: []u8,
         state: ?[]u8,
+        receipt_out: ?*u64,
     ) !types.DocumentArtifactManifest {
         const content_type = (self.producedAssetContentTypeAlloc(alloc, artifact_name) catch |err| {
             alloc.free(value);
             if (state) |bytes| alloc.free(bytes);
             return err;
-        }) orelse return documentArtifactManifestFromJsonAlloc(alloc, doc_key, artifact_name, value, state);
+        }) orelse return documentArtifactManifestFromJsonAlloc(alloc, doc_key, artifact_name, value, state, receipt_out);
         return producedAssetManifestAlloc(alloc, doc_key, artifact_name, value, state, content_type);
     }
 
@@ -15196,7 +15208,7 @@ pub const DB = struct {
             };
             // Ownership of manifest_json and state moves into the inspection,
             // which frees both itself when it fails.
-            var artifact = try self.documentArtifactInspectionAlloc(alloc, doc_key, artifact_ref.name, manifest_json, state);
+            var artifact = try self.documentArtifactInspectionAlloc(alloc, doc_key, artifact_ref.name, manifest_json, state, null);
             errdefer artifact.deinit(alloc);
             try artifacts.append(alloc, artifact);
         }
@@ -15317,6 +15329,18 @@ pub const DB = struct {
         return self.reprocessDocumentArtifactWithCompletionWait(alloc, doc_key, artifact_name, false, false);
     }
 
+    pub fn reprocessDocumentArtifactAcceptance(
+        self: *DB,
+        alloc: Allocator,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+    ) !types.DocumentArtifactReprocessAcceptance {
+        if (comptime storage_engine.enabled) return storage_engine.call("reprocessDocumentArtifactAcceptance", .{ self, alloc, doc_key, artifact_name });
+        var sequence: u64 = 0;
+        const handled = try self.reprocessDocumentArtifactWithSequence(alloc, doc_key, artifact_name, false, false, &sequence);
+        return .{ .handled = handled, .accepted_sequence = if (sequence != 0) sequence else null };
+    }
+
     fn reprocessDocumentArtifactWithCompletionWait(
         self: *DB,
         alloc: Allocator,
@@ -15324,6 +15348,18 @@ pub const DB = struct {
         artifact_name: []const u8,
         wait_for_completion: bool,
         only_incomplete: bool,
+    ) !bool {
+        return self.reprocessDocumentArtifactWithSequence(alloc, doc_key, artifact_name, wait_for_completion, only_incomplete, null);
+    }
+
+    fn reprocessDocumentArtifactWithSequence(
+        self: *DB,
+        alloc: Allocator,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+        wait_for_completion: bool,
+        only_incomplete: bool,
+        sequence_out: ?*u64,
     ) !bool {
         var cfg = (try self.getEnrichment(alloc, .asset, artifact_name)) orelse {
             if (only_incomplete) return error.InvalidArgument;
@@ -15358,6 +15394,7 @@ pub const DB = struct {
             .wait_for_sync_level = wait_for_completion,
             .force_generated_artifact_names = &force_artifacts,
             .force_only_incomplete_assets = only_incomplete,
+            .reprocess_sequence_out = sequence_out,
         });
         return true;
     }
@@ -62594,6 +62631,7 @@ fn documentArtifactManifestFromJsonAlloc(
     artifact_name: []const u8,
     manifest_json: []u8,
     state_json: ?[]u8,
+    receipt_out: ?*u64,
 ) !types.DocumentArtifactManifest {
     errdefer alloc.free(manifest_json);
     errdefer if (state_json) |value| alloc.free(value);
@@ -62602,6 +62640,7 @@ fn documentArtifactManifestFromJsonAlloc(
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidDocumentExtractionManifest;
     const object = parsed.value.object;
+    if (receipt_out) |out| out.* = (try jsonObjectOptionalU64(object, "reprocess_sequence")) orelse 0;
 
     const artifact_id = try artifact_ids.artifactPublicIdAlloc(alloc, .{
         .document_id = @constCast(doc_key),
@@ -100992,7 +101031,9 @@ test "db public artifact reprocess accepts durable work despite unrelated provid
 
     // Both public endpoints acknowledge the committed request without waiting
     // for the unrelated retry debt. The repair queue still uses full_index.
-    try std.testing.expect(try db.reprocessDocumentArtifact(alloc, "doc:repair", "document_units_v1"));
+    const acceptance = try db.reprocessDocumentArtifactAcceptance(alloc, "doc:repair", "document_units_v1");
+    try std.testing.expect(acceptance.handled);
+    const receipt = acceptance.accepted_sequence orelse return error.TestUnexpectedResult;
     {
         var accepted = (try db.getDocumentArtifactManifest(alloc, "doc:repair", "document_units_v1")) orelse return error.TestUnexpectedResult;
         defer accepted.deinit(alloc);
@@ -101000,8 +101041,18 @@ test "db public artifact reprocess accepts durable work despite unrelated provid
         const reprocess = accepted.reprocess orelse return error.TestUnexpectedResult;
         try std.testing.expectEqual(.pending, reprocess.status);
         try std.testing.expectEqual(before.generation + 1, reprocess.requested_generation);
+        try std.testing.expectEqual(receipt, reprocess.accepted_sequence.?);
         try std.testing.expect(!reprocess.worker.?.background_running);
         try std.testing.expect(reprocess.worker.?.target_sequence > reprocess.worker.?.applied_sequence);
+    }
+    {
+        const lifecycle = &db.async_context.enrichment_lifecycle_mutex;
+        try std.testing.expect(lifecycle.tryLock());
+        defer lifecycle.unlock();
+        var accepted = (try db.getDocumentArtifactManifest(alloc, "doc:repair", "document_units_v1")) orelse return error.TestUnexpectedResult;
+        defer accepted.deinit(alloc);
+        try std.testing.expect(accepted.reprocess.?.worker == null);
+        try std.testing.expectEqual(receipt, accepted.reprocess.?.accepted_sequence.?);
     }
     // Public acceptance commits the request without entering inference. Neither
     // unrelated retries nor rejection by the requested provider can erase it.
@@ -101037,6 +101088,7 @@ test "db public artifact reprocess accepts durable work despite unrelated provid
     try std.testing.expectEqual(before.generation + 1, after.generation);
     try std.testing.expectEqual(.published, after.reprocess.?.status);
     try std.testing.expectEqual(after.generation, after.reprocess.?.requested_generation);
+    try std.testing.expectEqual(receipt, after.reprocess.?.accepted_sequence.?);
     try std.testing.expect(after.reprocess.?.worker == null);
     const embedding_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:retry", "dense_v1");
     defer alloc.free(embedding_key);

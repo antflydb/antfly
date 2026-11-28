@@ -255,6 +255,7 @@ export type {
   DocumentArtifactReprocessJob,
   DocumentArtifactReprocessJobStartRequest,
   DocumentArtifactReprocessResponse,
+  DocumentArtifactReprocessRetry,
   DocumentArtifactReprocessShardCursor,
   DocumentArtifactReprocessStatus,
   DocumentArtifactReprocessWorker,
