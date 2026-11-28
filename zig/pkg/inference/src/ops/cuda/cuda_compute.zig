@@ -47937,7 +47937,8 @@ test "LightOnOCR3 CUDA graph warm input and wide head write their assigned buffe
     const mirror_bytes = 6 * @sizeOf(u16);
     const norm_offset = std.mem.alignForward(usize, mirror_offset + mirror_bytes, 256);
     const norm_bytes = 6 * @sizeOf(f32);
-    var metadata = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, norm_offset + norm_bytes);
+    const output_offset = std.mem.alignForward(usize, norm_offset + norm_bytes, 256);
+    var metadata = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, output_offset + 2 * norm_bytes);
     defer metadata.free(&compute.ctx);
     owner.storage_layout = layout;
     owner.metadata = metadata;
@@ -48052,6 +48053,24 @@ test "LightOnOCR3 CUDA graph warm input and wide head write their assigned buffe
         const reuse_values = try cb.toFloat32(reused, a);
         defer a.free(reuse_values);
         try std.testing.expectEqualSlices(f32, &.{ 2, 3, 5, 7, 11, 13 }, reuse_values);
+
+        owner.storage_layout.?.ffn_outputs = .{ .offset = output_offset, .bytes = 2 * norm_bytes };
+        defer owner.storage_layout.?.ffn_outputs = null;
+        const before_residual = compute.stats.device_alloc_calls;
+        const first = (try tryCapturedResidual(&cb, input, reused, .layer_output)) orelse return error.TestUnexpectedResult;
+        defer cb.free(first);
+        const second = (try tryCapturedResidual(&cb, first, input, .layer_output)) orelse return error.TestUnexpectedResult;
+        defer cb.free(second);
+        try std.testing.expectEqual(metadata.ptr + output_offset, tensorFromCt(first).buffer.ptr);
+        try std.testing.expectEqual(metadata.ptr + output_offset + norm_bytes, tensorFromCt(second).buffer.ptr);
+        try std.testing.expectError(error.InvalidExecutionPlan, tryCapturedResidual(&cb, first, second, .layer_output));
+        try std.testing.expectEqual(before_residual, compute.stats.device_alloc_calls);
+        const first_values = try cb.toFloat32(first, a);
+        defer a.free(first_values);
+        const second_values = try cb.toFloat32(second, a);
+        defer a.free(second_values);
+        try std.testing.expectEqualSlices(f32, &.{ 4, 6, 10, 14, 22, 26 }, first_values);
+        try std.testing.expectEqualSlices(f32, &.{ 6, 9, 15, 21, 33, 39 }, second_values);
     }
 
     var observation = @import("../../execution/runtime_observation.zig").Scope.init();
