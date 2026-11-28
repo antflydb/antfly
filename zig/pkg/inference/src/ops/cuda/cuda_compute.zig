@@ -8299,8 +8299,7 @@ pub const CudaCompute = struct {
             }
         }
         const audio_schedule = @import("../../execution/audio_schedule.zig");
-        if (!audio_schedule.supportsCudaGroupedGraph(recipe.count, recipe.context_right) or
-            !recipe.graph_allowed or !recipe.host_ops_empty or !self.embedding_gemma2_policy.audio_graph) return;
+        if (!recipe.allowsCudaGroupedGraph() or !self.embedding_gemma2_policy.audio_graph) return;
         var segments: [audio_schedule.GroupedRows.max_clips]usize = undefined;
         const rows = try recipe.rowsAndSegments(segments[0..recipe.count]);
         const Inputs = audio_schedule.ExecutionInputs;

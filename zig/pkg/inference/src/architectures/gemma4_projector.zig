@@ -1466,13 +1466,16 @@ test "audio cache recipe shares exact execution key and original HF packed names
     try std.testing.expectEqualSlices(usize, &segments, &measured);
     try std.testing.expectEqual(@as(usize, 33), rows);
     const full_key = batch.key(&segments, 0, batch.blocks);
-    try std.testing.expect(!try batch.matchesGroupedWorkspace(full_key, &segments, rows, 0, batch.blocks));
+    try std.testing.expect(!try batch.matchesGroupedDispatch(full_key, &segments, rows, 0, batch.blocks));
+    batch.graph_allowed = true;
+    batch.host_ops_empty = true;
+    try std.testing.expect(try batch.matchesGroupedDispatch(full_key, &segments, rows, 0, batch.blocks));
     var declared = batch;
     declared.workspace = audio_schedule.WorkspaceDeclaration.init(&.{.{ .allocate = rows * batch.hidden * @sizeOf(f32) }}, 0);
-    try std.testing.expect(try declared.matchesGroupedWorkspace(full_key, &segments, rows, 0, batch.blocks));
-    try std.testing.expect(!try declared.matchesGroupedWorkspace(batch.key(&segments, 1, batch.blocks), &segments, rows, 1, batch.blocks));
-    try std.testing.expect(!try declared.matchesGroupedWorkspace(full_key, &segments, rows + 1, 0, batch.blocks));
-    try std.testing.expect(!try declared.matchesGroupedWorkspace(full_key, &.{ 17, 11, 5 }, rows, 0, batch.blocks));
+    try std.testing.expect(try declared.matchesGroupedDispatch(full_key, &segments, rows, 0, batch.blocks));
+    try std.testing.expect(!try declared.matchesGroupedDispatch(batch.key(&segments, 1, batch.blocks), &segments, rows, 1, batch.blocks));
+    try std.testing.expect(!try declared.matchesGroupedDispatch(full_key, &segments, rows + 1, 0, batch.blocks));
+    try std.testing.expect(!try declared.matchesGroupedDispatch(full_key, &.{ 17, 11, 5 }, rows, 0, batch.blocks));
     const grouping = try audio_schedule.GroupedRows.resolve(batch.frames[0..batch.count]);
     try std.testing.expectEqual(rows, grouping.total);
     try std.testing.expectEqualSlices(usize, &.{ 0, 11, 28 }, grouping.offsets[0..batch.count]);
@@ -5063,8 +5066,7 @@ const GroupedAudioDeclaration = struct {
     }
 
     fn compile(cb: *const ComputeBackend, a: std.mem.Allocator, recipe: AudioCacheRecipe) !?audio_schedule.WorkspaceDeclaration {
-        if (!recipe.source_bf16 or !recipe.graph_allowed or !recipe.host_ops_empty or !recipe.depthwise_cached or
-            !audio_schedule.supportsCudaGroupedGraph(recipe.count, recipe.context_right)) return null;
+        if (!recipe.source_bf16 or !recipe.depthwise_cached or !recipe.allowsCudaGroupedGraph()) return null;
         const query = cb.vtable.regions.audio_execution.workspaceBytes orelse return null;
         if (try query(cb.ptr, .admit) == null) return null;
         if (cb.vtable.regions.audio_execution.cachedWorkspace) |lookup| {
@@ -5212,7 +5214,7 @@ fn tryAudioExecutionRange(cb: *const ComputeBackend, a: std.mem.Allocator, store
     const local_recipe = audioCacheConfig(cfg);
     const key = local_recipe.key(inputs.segments, start, end);
     const recipe = if (admitted_recipe) |candidate| recipe: {
-        if (!(try candidate.matchesGroupedWorkspace(key, inputs.segments, inputs.valid_mask.len, start, end))) break :recipe &local_recipe;
+        if (!(try candidate.matchesGroupedDispatch(key, inputs.segments, inputs.valid_mask.len, start, end))) return null;
         break :recipe candidate;
     } else &local_recipe;
     var relative_keys: [audio_schedule.ExecutionInputs.scale_count]CT = undefined;

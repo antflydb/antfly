@@ -221,10 +221,13 @@ pub const AudioRecipe = struct {
         }
         return hash.final();
     }
-    /// Cache funding binds declarations for the full grouped encoder.
-    pub fn matchesGroupedWorkspace(self: AudioRecipe, dispatch_key: u64, segments: []const usize, row_count: usize, start: usize, end: usize) !bool {
-        if (self.workspace == null or start != 0 or end != self.blocks or self.count != segments.len or
-            !supportsCudaGroupedGraph(segments.len, self.context_right)) return false;
+    pub fn allowsCudaGroupedGraph(self: AudioRecipe) bool {
+        return self.graph_allowed and self.host_ops_empty and supportsCudaGroupedGraph(self.count, self.context_right);
+    }
+
+    /// Observed and declared plans both bind the full grouped encoder.
+    pub fn matchesGroupedDispatch(self: AudioRecipe, dispatch_key: u64, segments: []const usize, row_count: usize, start: usize, end: usize) !bool {
+        if (!self.allowsCudaGroupedGraph() or start != 0 or end != self.blocks or self.count != segments.len) return false;
         var admitted: [GroupedRows.max_clips]usize = undefined;
         const spans = admitted[0..self.count];
         return (try self.rowsAndSegments(spans)) == row_count and

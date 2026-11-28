@@ -3056,6 +3056,14 @@ witness reported 15 arena executions and six graph replays in
 each of its four processes. These results cover the opt-in
 policy on the tested clip cohorts.
 
+Observed and declared grouped CUDA execution now share the same
+admission policy and bind the exact prepared encoder geometry.
+A mismatch in the request shape or recipe uses the eager route
+before entering the workspace. Four focused Spark checks and four
+local checks passed. Released CUDA BF16 and F32 each captured and
+replayed at widths two, three and four, with exact eager vector
+parity after changing the samples.
+
 The Spark serving comparison used the prior grouped-audio server
 from `54b7bbb92d` and the compact-input server with declared graphs on
 both. All 576 measured requests completed and matched output hashes
