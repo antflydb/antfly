@@ -5995,6 +5995,9 @@ pub fn open(path: []const u8, options: api.LiteResolvedOpenOptions, create: bool
     }
     errdefer if (existing == null) @import("io_lifetime.zig").release();
     errdefer if (existing == null) owner.path_lock_io.deinit();
+    // A failed first open may already have started the owner's open worker;
+    // its thread waits on the owner's memory, so it goes before the owner.
+    errdefer if (existing == null) owner.open_worker.stop();
     if (existing == null) {
         owner.reader_coordinator = try native.ReaderCoordinator.create(alloc, io);
         owner.options.reader_coordinator = owner.reader_coordinator;
