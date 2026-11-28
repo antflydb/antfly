@@ -1447,3 +1447,45 @@ test "CUDA audio result observations preserve nested route counts and disabled s
     }
     try testing.expectEqualDeep(CudaAudio{ .warmed = 1, .learning_host_transfer = 1, .recorded_and_launched = 1, .replayed = 1, .eager_assigned = 1, .capture_storage_declined = 1 }, outer.snapshot().cuda_audio.?);
 }
+
+test "CUDA decoder burst timings accumulate across nested observations" {
+    const testing = @import("std").testing;
+    var outer = Scope.init();
+    defer outer.deinit();
+    const captured: CudaDecoderWorkspace = .{
+        .route = .recorded_and_launched,
+        .plan_origin = .observed,
+        .planned_events = 12,
+        .planned_scratch_bytes = 256,
+        .bound_scratch_bytes = 256,
+        .metadata_bytes = 256,
+        .attention_scratch_bytes = 0,
+        .head_bytes = 0,
+        .head_packet_rows = 2,
+        .head_in_stream_arena = false,
+        .readback_bytes = 44,
+        .readback_backing = .admitted_pinned,
+        .rows = 2,
+        .submit_host_ns = 800,
+        .capture_instantiate_host_ns = 600,
+        .readback_host_ns = 200,
+    };
+    cudaDecoderWorkspace(captured);
+    {
+        var inner = Scope.init();
+        defer inner.deinit();
+        var replayed = captured;
+        replayed.route = .replayed;
+        replayed.submit_host_ns = 20;
+        replayed.capture_instantiate_host_ns = 0;
+        replayed.readback_host_ns = 250;
+        cudaDecoderWorkspace(replayed);
+        try testing.expectEqualDeep(replayed, inner.snapshot().cuda_decoder_workspace.?);
+    }
+    const total = outer.snapshot().cuda_decoder_workspace.?;
+    try testing.expectEqual(CudaDecoderWorkspace.Route.replayed, total.route);
+    try testing.expectEqual(@as(u64, 2), total.completed_bursts);
+    try testing.expectEqual(@as(u64, 820), total.submit_host_ns);
+    try testing.expectEqual(@as(u64, 600), total.capture_instantiate_host_ns);
+    try testing.expectEqual(@as(u64, 450), total.readback_host_ns);
+}
