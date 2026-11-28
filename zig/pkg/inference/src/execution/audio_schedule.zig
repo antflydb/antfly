@@ -121,6 +121,20 @@ pub const WorkspaceDeclaration = struct {
     /// Borrowed for the synchronous Stage lifetime, never stored in a cache.
     events: []const @import("stream_workspace.zig").Plan.Declaration,
     published_slot: u15,
+
+    pub fn cacheKey(self: WorkspaceDeclaration, seed: u64) u64 {
+        var hash = std.hash.Wyhash.init(seed);
+        hash.update("declared-audio-workspace-v1");
+        std.hash.autoHash(&hash, self.published_slot);
+        for (self.events) |event| {
+            std.hash.autoHash(&hash, std.meta.activeTag(event));
+            switch (event) {
+                .allocate, .allocate_scratch => |bytes| std.hash.autoHash(&hash, bytes),
+                .release => |slot| std.hash.autoHash(&hash, slot),
+            }
+        }
+        return hash.final();
+    }
 };
 
 /// Copied operation geometry only. The actual Stage certifies the model and

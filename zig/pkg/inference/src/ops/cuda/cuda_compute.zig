@@ -8002,7 +8002,8 @@ pub const CudaCompute = struct {
         var shapes: [Inputs.count][2]i64 = undefined;
         const inputs = try Inputs.describe(&shapes, rows, recipe.hidden, recipe.context_left, recipe.heads);
         const execution_key = recipe.key(segments[0..recipe.count], 0, recipe.blocks);
-        const base = try self.audioCacheBase(execution_key, inputs[0..Inputs.activeCount(!recipe.source_bf16)], null);
+        const plan_key = if (recipe.workspace) |workspace| workspace.cacheKey(execution_key) else execution_key;
+        const base = try self.audioCacheBase(plan_key, inputs[0..Inputs.activeCount(!recipe.source_bf16)], null);
         const existing = self.audioPlanFor(base);
         if (existing) |entry| if (entry.executableFor(base)) |plan| {
             if (!entry.owner.?.managed) try builder.add(.{ .audio_learning = .{ .key = base.key } });
@@ -21455,7 +21456,8 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
     }
     var input_spans: [CudaCompute.AudioPlan.max_inputs]CudaCompute.AudioInputSpan = undefined;
     const spans = input_spans[0..inputs.len];
-    const cache_base = try self.audioCacheBase(key, input_metadata[0..inputs.len], spans);
+    const plan_key = if (dispatch.workspace) |workspace| workspace.cacheKey(key) else key;
+    const cache_base = try self.audioCacheBase(plan_key, input_metadata[0..inputs.len], spans);
     for (inputs, spans) |ct, span| {
         _ = try buffer_mod.validateRegion(tensorFromCt(ct).buffer, span.bytes, @alignOf(f32));
     }
@@ -63463,7 +63465,6 @@ test "CUDA cold audio declaration dispatches before any learning invocation" {
     const cold_key = 0x304;
     const inputs = [_]CT{ identity, identity };
     const geometry: [2]CudaCompute.AudioCacheInput = @splat(.{ .shape = &.{ 2, 2 }, .elements = 4 });
-    const bindings = try compute.audioCacheBase(cold_key, &geometry, null);
     const projection = try SourceLinearGeometry.resolve(2, null, 2, 2);
     const publication_bytes = try checkedMul(projection.output_count, @sizeOf(f32));
     const layout = try sourceLinearLayout(compute.ctx.info.compute_major, projection.rows, 2, 2, true, false);
@@ -63474,9 +63475,11 @@ test "CUDA cold audio declaration dispatches before any learning invocation" {
         .{ .allocate = publication_bytes },
         .{ .release = 0 },
     };
+    const workspace: ops.ComputeBackend.AudioWorkspaceDeclaration = .{ .events = &events, .published_slot = 2 };
+    const bindings = try compute.audioCacheBase(workspace.cacheKey(cold_key), &geometry, null);
     const executes_before = compute.audio_arena_executes;
     const first = (try audioExecutionOp(&compute, cold_key, &inputs, @constCast(&cb), Run.call, .{
-        .workspace = .{ .events = &events, .published_slot = 2 },
+        .workspace = workspace,
     })) orelse return error.TestUnexpectedResult;
     const entry = compute.audioPlanFor(bindings) orelse return error.TestUnexpectedResult;
     const executable = entry.executableFor(bindings) orelse return error.TestUnexpectedResult;
@@ -63488,6 +63491,11 @@ test "CUDA cold audio declaration dispatches before any learning invocation" {
     try std.testing.expect(!entry.warmed);
     try std.testing.expect(entry.owner.?.plan.origin == .declared);
     try std.testing.expectEqual(executes_before + 1, compute.audio_arena_executes);
+    var changed = workspace;
+    changed.published_slot = 0; // released, so it cannot publish
+    try std.testing.expectError(error.InvalidExecutionPlan, audioExecutionOp(&compute, cold_key, &inputs, @constCast(&cb), Run.call, .{ .workspace = changed }));
+    try std.testing.expectEqual(executes_before + 1, compute.audio_arena_executes);
+    try std.testing.expect(entry.executableFor(bindings) != null);
     const allocations = compute.stats.device_alloc_calls;
     const bounded = (try cb.tryBf16SourceOperation(&.{ .clamp = .{ .input = first, .min = 0.25, .reuse_owned_input = true } })) orelse return error.TestUnexpectedResult;
     defer if (bounded != first) cb.free(bounded);
