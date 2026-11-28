@@ -9032,11 +9032,11 @@ fn qwen35OutputProjection(cb: *const ComputeBackend, core: CT, weight: CT, resid
         if (comptime build_options.enable_cuda) {
             if (try @import("../ops/cuda/cuda_compute.zig").CudaCompute.lightOnProjectionResidual(cb, core, weight, prior, rows, in_dim, hidden)) |fused| return fused;
         }
-        const projected = try cb.linearNoBias(core, weight, rows, in_dim, hidden);
+        const projected = try layerAttentionProjection(cb, core, weight, rows, in_dim, hidden);
         defer cb.free(projected);
         return layerAttentionResidual(cb, projected, prior);
     }
-    return cb.linearNoBias(core, weight, rows, in_dim, hidden);
+    return layerAttentionProjection(cb, core, weight, rows, in_dim, hidden);
 }
 
 fn qwen35LinearAttentionWithResidual(
@@ -12527,6 +12527,15 @@ fn runGroupedExpertBatchTensor(
 
 // --- Normalization helpers ---
 
+fn layerAttentionProjection(cb: *const ComputeBackend, input: CT, weight: CT, rows: usize, in_dim: usize, out_dim: usize) !CT {
+    if (comptime build_options.enable_cuda) {
+        if (cb.kind() == .cuda) {
+            if (try @import("../ops/cuda/cuda_compute.zig").tryCapturedAttentionOutputProjection(cb, input, weight, rows, in_dim, out_dim)) |assigned| return assigned;
+        }
+    }
+    return cb.linearNoBias(input, weight, rows, in_dim, out_dim);
+}
+
 fn layerAttentionResidual(cb: *const ComputeBackend, projected: CT, hidden: CT) !CT {
     if (comptime build_options.enable_cuda) {
         if (cb.kind() == .cuda) {
@@ -13278,8 +13287,8 @@ fn attnOutputProject(
             const name = std.fmt.bufPrint(buf, "model.layers.{d}.self_attn.o_proj.weight", .{layer}) catch return error.NameTooLong;
             const w = try getModelWeight(cb, config, name);
             defer cb.free(w);
-            const projected = try cb.linearNoBias(input, w, total, in_dim, out_dim);
-            return projected;
+            if (config.hasQwen35VisionArchitectureContract()) return layerAttentionProjection(cb, input, w, total, in_dim, out_dim);
+            return cb.linearNoBias(input, w, total, in_dim, out_dim);
         },
         .gpt2 => {
             const w_name = std.fmt.bufPrint(buf, "h.{d}.attn.c_proj.weight", .{layer}) catch return error.NameTooLong;

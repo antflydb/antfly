@@ -29924,6 +29924,24 @@ pub fn tryCapturedFinalNorm(cb: *const ops.ComputeBackend, input: CT, weight: CT
     return try rmsNormWithDestination(cb.ptr, input, weight, dim, eps, destination, mirror);
 }
 
+/// Attention has consumed its input normalization before the output GEMM.
+/// Reuse that F32 range through the following residual add.
+pub fn tryCapturedAttentionOutputProjection(cb: *const ops.ComputeBackend, input: CT, weight: CT, rows: usize, in_dim: usize, out_dim: usize) !?CT {
+    if (!acceptsPhysicalImplementation(cb.vtable)) return null;
+    const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
+    const owner = &self.bounded_decode_graph;
+    if (!owner.active or self.capability_profile != .lightonocr3 or rows != owner.rows or out_dim != owner.hidden) return null;
+    const lhs = tensorFromCt(input);
+    const rhs = tensorFromCt(weight);
+    const bytes = try lightOnLinearOutputBytes(self, rhs, rows, out_dim);
+    const storage = (try owner.bindAttentionNorm(bytes)) orelse return null;
+    const destination = storage.output;
+    for ([_]buffer_mod.DeviceBuffer{ lhs.buffer, lhs.bf16_mirror, rhs.buffer }) |source| {
+        if (kernel_geometry.byteRangesOverlap(destination.ptr, destination.len, source.ptr, source.len)) return null;
+    }
+    return try cb.observeBackendEntry(.linear_no_bias, &linearNoBiasWithDestination, .{ self, input, weight, rows, in_dim, out_dim, false, @as(?buffer_mod.DeviceBuffer, destination) });
+}
+
 pub fn tryCapturedAttentionResidual(cb: *const ops.ComputeBackend, a: CT, b: CT) !?CT {
     if (!acceptsPhysicalImplementation(cb.vtable)) return null;
     const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
