@@ -22,7 +22,7 @@ pub const Unary = enum { bound, scale_residual, silu, glu, depthwise };
 
 /// Physical work queried from the same backend that executes the block.
 pub const Physical = union(enum) {
-    admit: void,
+    admit: struct { source_bf16: bool },
     linear: struct { name: []const u8, rows: usize, width: usize, columns: usize },
     norm: struct { name: []const u8, rows: usize, width: usize, segments: []const usize },
     attention: struct { rows: usize, heads: usize, head_dim: usize, chunk: usize, context: usize, left: usize, segments: []const usize },

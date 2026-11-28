@@ -3024,8 +3024,8 @@ now stages 15 inputs. The raw relative-position tensor is consumed
 during key preparation, outside the workspace. At the released
 checkpoint geometry this removes 53,248 bytes from the logical replay
 inputs. Cold funding, sealed-plan lookup and dispatch use the same
-input count. Full-F32 CUDA and Metal use all 17 inputs for their
-existing callbacks.
+input count. At that revision, full-F32 CUDA and Metal used all 17
+inputs for their existing callbacks.
 
 Spark GB10 passed all ten focused checks. The released checkpoint
 also passed all nine combinations of two, three and four clips with
@@ -3108,6 +3108,25 @@ All 96 measured requests across the three widths returned identical
 embedding vectors. Each policy reported a distinct, stable model
 identity. The first full-response comparison identified that metadata
 difference on all three widths.
+
+Full-F32 CUDA now prepares the per-layer relative keys before entering
+the workspace, using the same cache custody as BF16. The F32 graph
+stages 16 inputs and retains its tagged validity mask for packed
+attention. The raw relative-position tensor is no longer staged,
+saving 53,248 logical input bytes and one device-to-device copy per
+replay at the released checkpoint geometry. F32 still learns the
+lifetime schedule for its packed-projection route.
+
+Spark GB10 passed all twelve released-model cases at widths two, three
+and four for declared BF16, observed BF16, and F32 with RMS mirrors
+enabled and disabled. All cases matched eager CUDA exactly with changed
+samples and bound the planned arena size. With F32 mirrors enabled the
+arena sizes were 3,619,584, 5,316,096 and 6,938,112 bytes, a reduction of
+53,248 bytes at each width from the previous measurements. The broader
+Spark audio suite passed 248 checks with 37 skips. Five focused local
+checks passed without skips, including Metal segmented execution and
+cancellation. This qualification measured workspace size and exact
+outputs. The HTTP latency tables above cover the earlier revisions.
 
 ### Isolated Metal E4B HTTP comparison at `58b3917a89`
 

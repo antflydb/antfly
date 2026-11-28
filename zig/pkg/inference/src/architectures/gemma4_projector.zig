@@ -1488,13 +1488,15 @@ test "audio cache recipe shares exact execution key and original HF packed names
         try std.testing.expectEqualSlices(i64, &.{33}, mask.shape);
         try std.testing.expectEqual(rows, mask.elements);
     }
-    for (metadata[Inputs.scales..Inputs.relative]) |scale| {
+    for (metadata[Inputs.scales..Inputs.segment_valid]) |scale| {
         try std.testing.expectEqualSlices(i64, &.{@intCast(batch.hidden / batch.heads)}, scale.shape);
         try std.testing.expectEqual(batch.hidden / batch.heads, scale.elements);
     }
     try std.testing.expectEqualSlices(i64, &.{33}, metadata[Inputs.segment_valid].shape);
     try std.testing.expectEqual(rows, metadata[Inputs.segment_valid].elements);
-    try std.testing.expectEqual(Inputs.scales + Inputs.scale_count, Inputs.prepared_relative_count);
+    try std.testing.expectEqual(Inputs.scales + Inputs.scale_count, Inputs.source_bf16_count);
+    try std.testing.expectEqual(Inputs.segment_valid + 1, Inputs.full_f32_count);
+    try std.testing.expectEqual(Inputs.full_f32_count, batch.cudaExecutionInputCount());
     for (0..12) |layer| for ([_][]const u8{ "q", "k", "v" }, 0..) |component, index| {
         var original: [128]u8 = undefined;
         const logical = try std.fmt.bufPrint(&original, "a.blk.{d}.attn_{s}.weight", .{ layer, component });
@@ -5068,7 +5070,7 @@ const GroupedAudioDeclaration = struct {
     fn compile(cb: *const ComputeBackend, a: std.mem.Allocator, recipe: AudioCacheRecipe) !?audio_schedule.WorkspaceDeclaration {
         if (!recipe.source_bf16 or !recipe.depthwise_cached or !recipe.allowsCudaGroupedGraph()) return null;
         const query = cb.vtable.regions.audio_execution.workspaceBytes orelse return null;
-        if (try query(cb.ptr, .admit) == null) return null;
+        if (try query(cb.ptr, .{ .admit = .{ .source_bf16 = recipe.source_bf16 } }) == null) return null;
         if (cb.vtable.regions.audio_execution.cachedWorkspace) |lookup| {
             if (try lookup(cb.ptr, recipe)) |cached| return cached;
         }
@@ -5220,9 +5222,9 @@ fn tryAudioExecutionRange(cb: *const ComputeBackend, a: std.mem.Allocator, store
     var relative_keys: [audio_schedule.ExecutionInputs.scale_count]CT = undefined;
     var relative_count: usize = 0;
     defer for (relative_keys[0..relative_count]) |ct| cb.free(ct);
-    if (cb.kind() == .cuda and cfg.source_scalar_storage == .bf16) {
+    if (cb.kind() == .cuda) {
         const query = cb.vtable.regions.audio_execution.workspaceBytes orelse return null;
-        if (try query(cb.ptr, .admit) == null) return null;
+        if (try query(cb.ptr, .{ .admit = .{ .source_bf16 = recipe.source_bf16 } }) == null) return null;
         // Both allocation policies execute the same block using prepared
         // constants. An unfunded constant may still leave the eager path in
         // charge before any arena dispatch.
@@ -5230,8 +5232,10 @@ fn tryAudioExecutionRange(cb: *const ComputeBackend, a: std.mem.Allocator, store
             try cb.checkExecutionControl();
             relative_keys[relative_count] = (try audioRelativeKey(cb, a, store, cfg, inputs.rel_in, layer, true)) orelse return null;
             relative_count += 1;
-            var name: [128]u8 = undefined;
-            _ = try depthwiseConvWeightCt(cb, a, store, try AudioCacheRecipe.depthwiseWeightName(&name, layer), cfg.conv_kernel_size, cfg.audio_hidden);
+            if (recipe.source_bf16) {
+                var name: [128]u8 = undefined;
+                _ = try depthwiseConvWeightCt(cb, a, store, try AudioCacheRecipe.depthwiseWeightName(&name, layer), cfg.conv_kernel_size, cfg.audio_hidden);
+            }
         }
     }
     const Run = struct {
@@ -5249,16 +5253,12 @@ fn tryAudioExecutionRange(cb: *const ComputeBackend, a: std.mem.Allocator, store
             layer_inputs.relative_keys = self.relative_keys;
             layer_inputs.relative_key_start = self.start;
             const Input = audio_schedule.ExecutionInputs;
-            if (self.relative_keys.len == 0) {
-                layer_inputs.rel_in = values[Input.relative];
-                if (self.inputs.segment_valid != null) layer_inputs.segment_valid = values[Input.segment_valid];
-            } else {
-                layer_inputs.segment_valid = null;
-            }
+            if (self.relative_keys.len == 0) layer_inputs.rel_in = values[Input.relative];
+            layer_inputs.segment_valid = if (self.inputs.segment_valid != null and values.len > Input.segment_valid) values[Input.segment_valid] else null;
             layer_inputs.valid_ct = values[audio_schedule.ExecutionInputs.valid];
             layer_inputs.segment_starts = if (self.inputs.segment_starts != null) values[audio_schedule.ExecutionInputs.segment_start] else null;
             var scales: [audio_schedule.ExecutionInputs.scale_count]CT = undefined;
-            @memcpy(&scales, values[Input.scales..Input.relative]);
+            @memcpy(&scales, values[Input.scales..Input.segment_valid]);
             layer_inputs.scales = &scales;
             return runAudioLayers(self.cb, self.a, self.store, self.cfg, values[audio_schedule.ExecutionInputs.hidden], &layer_inputs, self.start, self.end);
         }
@@ -5287,7 +5287,7 @@ fn audioExecutionInputs(hidden: CT, inputs: *const AudioLayerInputs) [audio_sche
     values[audio_schedule.ExecutionInputs.valid] = inputs.valid_ct;
     values[audio_schedule.ExecutionInputs.segment_start] = inputs.segment_starts orelse inputs.valid_ct;
     values[audio_schedule.ExecutionInputs.segment_valid] = inputs.segment_valid orelse inputs.valid_ct;
-    @memcpy(values[audio_schedule.ExecutionInputs.scales..audio_schedule.ExecutionInputs.relative], inputs.scales);
+    @memcpy(values[audio_schedule.ExecutionInputs.scales..audio_schedule.ExecutionInputs.segment_valid], inputs.scales);
     return values;
 }
 fn audioLayer(
@@ -5591,8 +5591,9 @@ fn audioSelfAttention(
     const valid_mask = inputs.valid_mask;
     const rows = valid_mask.len;
     var buf: [128]u8 = undefined;
-    const rel = (try audioRelativeKey(cb, allocator, store, cfg, inputs.rel_in, layer, false)).?;
-    defer cb.free(rel);
+    const prepared_relative = inputs.relative_keys.len != 0;
+    const rel = if (prepared_relative) inputs.relative_keys[layer - inputs.relative_key_start] else (try audioRelativeKey(cb, allocator, store, cfg, inputs.rel_in, layer, false)).?;
+    defer if (!prepared_relative) cb.free(rel);
     const choice = if (cfg.source_scalar_storage == .bf16) null else try packedAudioQkv(cb, allocator, store, input, rows, cfg.audio_hidden, layer);
     const packed_rows: ?ops.LinearTripleResult = if (choice) |value| switch (value) {
         .separate => |triple| triple,

@@ -21781,9 +21781,9 @@ fn cachedGroupedAudioWorkspace(ctx: *anyopaque, recipe: CudaCompute.CacheFunding
 fn groupedAudioWorkspaceBytes(ctx: *anyopaque, physical: @import("../../execution/grouped_audio_block.zig").Physical) anyerror!?usize {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     switch (physical) {
-        .admit => {
+        .admit => |precision| {
             if (self.capability_profile != .embedding_gemma2 or !self.embedding_gemma2_policy.audio_graph or
-                sourceScalarStorageOp(ctx, .audio) != .bf16) return null;
+                (sourceScalarStorageOp(ctx, .audio) == .bf16) != precision.source_bf16) return null;
             return 0;
         },
         .linear => |value| {
