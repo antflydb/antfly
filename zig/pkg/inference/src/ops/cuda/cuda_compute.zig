@@ -3985,7 +3985,7 @@ pub const CudaCompute = struct {
             } else {
                 const declared = check_declared_warmup and try @import("bounded_decode_graph.zig").Module.finishDeclaredWarmup(
                     plan,
-                    matched_dispatch and owner.bound_recurrent_joined_projection_bytes != 0 and owner.attention_gates_in_place == owner.expected_attention_calls,
+                    matched_dispatch and owner.bound_recurrent_joined_projection_bytes != 0 and owner.attention_gates_in_place == owner.expected_attention_gates,
                 );
                 owner.phase = if (declared) .capture else .learn;
                 self.launch_route = .warmed;

@@ -339,14 +339,17 @@ pub const Descriptor = struct {
         }
         return storage;
     }
-    pub const DispatchCounts = struct { attention: usize, ragged_recurrent: usize };
+    pub const DispatchCounts = struct { attention: usize, attention_gates: usize, ragged_recurrent: usize };
 
     pub fn dispatchCounts(self: Descriptor) !DispatchCounts {
         if (self.rows < 2 or self.rows > max_rows) return error.InvalidShape;
         const attention_packets = (self.rows - 1) / paged_attention.max_packet_rows + 1;
         const recurrent_packets = (self.rows - 1) / recurrent_packet_rows + 1;
+        // Each token gates the assembled attention output once per layer.
+        const attention_gates = try std.math.mul(usize, self.attention_layers, 2);
         return .{
-            .attention = try std.math.mul(usize, self.attention_layers, 2 * attention_packets),
+            .attention = try std.math.mul(usize, attention_gates, attention_packets),
+            .attention_gates = attention_gates,
             .ragged_recurrent = if (recurrent_packets > 1) try std.math.mul(usize, self.recurrent_layers, 2 * recurrent_packets) else 0,
         };
     }
@@ -755,6 +758,7 @@ pub const Module = struct {
     attention_layers: usize = 0,
     recurrent_layers: usize = 0,
     expected_attention_calls: usize = 0,
+    expected_attention_gates: usize = 0,
     expected_ragged_packets: usize = 0,
     bound_recurrent_scratch_bytes: usize = 0,
     bound_recurrent_joined_projection_bytes: usize = 0,
@@ -930,6 +934,7 @@ pub const Module = struct {
         self.attention_scratch = phase.attention_scratch;
         self.vendor_workspace = phase.vendor_workspace;
         self.expected_attention_calls = dispatch.attention;
+        self.expected_attention_gates = dispatch.attention_gates;
         self.expected_ragged_packets = dispatch.ragged_recurrent;
     }
     pub fn reserveArenaPrepared(self: *Module, ctx: *context.CudaContext, phase: *GraphPhase) !void {
@@ -1948,10 +1953,15 @@ test "CUDA bounded decoder binds zero scratch without reserving a device arena" 
 test "CUDA bounded decoder validates dispatch geometry before preparing storage" {
     const positions: [384]u32 = @splat(0);
     var descriptor: Descriptor = .{ .epoch = 1, .key = &.{1}, .positions = positions[0 .. 64 * 3], .rows = 64, .hidden = 1024, .vocab = 8, .future_tokens = 16, .attention_layers = 3, .recurrent_layers = 5 };
-    try std.testing.expectEqual(Descriptor.DispatchCounts{ .attention = 6, .ragged_recurrent = 0 }, try descriptor.dispatchCounts());
+    try std.testing.expectEqual(Descriptor.DispatchCounts{ .attention = 6, .attention_gates = 6, .ragged_recurrent = 0 }, try descriptor.dispatchCounts());
+    for ([_]usize{ 65, 98 }) |rows| {
+        descriptor.rows = rows;
+        descriptor.positions = positions[0 .. rows * 3];
+        try std.testing.expectEqual(Descriptor.DispatchCounts{ .attention = 12, .attention_gates = 6, .ragged_recurrent = 20 }, try descriptor.dispatchCounts());
+    }
     descriptor.rows = 128;
     descriptor.positions = &positions;
-    try std.testing.expectEqual(Descriptor.DispatchCounts{ .attention = 12, .ragged_recurrent = 20 }, try descriptor.dispatchCounts());
+    try std.testing.expectEqual(Descriptor.DispatchCounts{ .attention = 12, .attention_gates = 6, .ragged_recurrent = 20 }, try descriptor.dispatchCounts());
     descriptor.recurrent_layers = std.math.maxInt(usize);
     var phase: GraphPhase = undefined;
     try std.testing.expectError(error.Overflow, phase.initInto(descriptor));
