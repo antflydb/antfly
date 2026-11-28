@@ -63158,6 +63158,22 @@ test "public source audio linear recreates input bank through actual learning ca
                 }
             } else return error.TestUnexpectedResult;
         }
+        if (iteration == 3) {
+            const Cancelled = struct {
+                fn requested(_: ?*anyopaque) bool {
+                    return true;
+                }
+            };
+            const copies_before = compute.stats.d2d_bytes;
+            const replays_before = compute.audio_graph_replays;
+            const calls_before = run.calls;
+            try std.testing.expectError(error.Cancelled, audioExecutionOp(&compute, 0x303, &.{ projected, identity }, &run, Run.call, .{
+                .control = .{ .cancellation = .{ .is_cancelled_fn = Cancelled.requested } },
+            }));
+            try std.testing.expectEqual(copies_before, compute.stats.d2d_bytes);
+            try std.testing.expectEqual(replays_before, compute.audio_graph_replays);
+            try std.testing.expectEqual(calls_before, run.calls);
+        }
         const before_calls = run.calls;
         var transfers = transfer_audit.Audit{};
         const observation = @import("../../execution/runtime_observation.zig");
