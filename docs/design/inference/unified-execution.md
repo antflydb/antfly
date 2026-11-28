@@ -3057,3 +3057,14 @@ calls, including the final-row readback, was 1.87 ms on Native and
 9.95 ms on Metal at batch one and one token. At batch eight and
 64 tokens, the corresponding medians were 166.42 and 16.06 ms.
 These are within-revision shape measurements.
+
+### Spark CUDA ownership checks at `a1a9b7b886`
+
+The broader storage-based warmup revision passed all 40 focused
+checks with zero skips. Released LightOnOCR-3-0.8B served both pages
+with exact serial parity and replayed using its declared zero-byte
+plan. The installed DECIDE 1B safetensors model passed the HTTP
+classification fixture with CUDA required. Released T5-small passed
+the ONNX Runtime reference, kept all 24 cache slots independently
+owned at prefixes 1, 8, 32 and 64, and fused suffixes after encoder
+retirement. CUDA captured and replayed at each of those prefixes.
