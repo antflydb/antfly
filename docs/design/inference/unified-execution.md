@@ -2972,8 +2972,8 @@ shared the GPU with the same 184 MiB CUDA context throughout.
 | 3 | 34.87 / 35.78 | 34.75 / 35.59 |
 | 4 | 39.44 / 40.26 | 39.41 / 39.66 |
 
-The largest paired median increase was 0.27 ms at width two. Both
-same-binary controls showed variation of that size at this width.
+The largest paired median increase was 0.27 ms at width two. At that
+width, the candidate-only median control varied by 0.77 ms.
 
 ### Isolated Metal E4B HTTP comparison at `58b3917a89`
 
