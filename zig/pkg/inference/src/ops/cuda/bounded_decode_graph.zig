@@ -172,6 +172,24 @@ pub const StorageLayout = struct {
         return self.metadata_bytes - (self.layerWorkspaceOffset() catch unreachable);
     }
 
+    /// The terminal head runs after the final normalization publishes a
+    /// separate tensor. Its bank can alias the layer-live spans.
+    fn layerLiveBytes(self: StorageLayout) !usize {
+        const start = try self.layerWorkspaceOffset();
+        var end = start;
+        for ([_]?Span{
+            self.attention_workspace,
+            self.attention_output,
+            self.recurrent_workspace,
+            self.recurrent_output,
+            self.ffn_workspace,
+            self.ffn_outputs,
+        }) |slot| if (slot) |span| {
+            end = @max(end, try std.math.add(usize, span.offset, span.bytes));
+        };
+        return end - start;
+    }
+
     fn layerWorkspaceOffset(self: StorageLayout) !usize {
         return aligned(try std.math.add(usize, self.counter.offset, self.counter.bytes));
     }
@@ -409,7 +427,7 @@ pub const GraphPhase = struct {
         self.storage_layout.ffn_workspace = try self.storage_layout.declareLayerWorkspace(layout.scratch_bytes);
         // Residuals can cross a layer boundary while layer scratch is reused.
         // Place both alternating publication slots after all serial scratch.
-        const scratch_end = try StorageLayout.aligned(self.storage_layout.layerWorkspaceBytes());
+        const scratch_end = try StorageLayout.aligned(try self.storage_layout.layerLiveBytes());
         self.storage_layout.ffn_outputs = try self.storage_layout.declareLayerRegion(scratch_end, try std.math.mul(usize, layout.output_bytes, 2));
     }
 
@@ -421,7 +439,10 @@ pub const GraphPhase = struct {
         if (descriptor.recurrent_heads) |heads|
             width = @max(width, try std.math.mul(usize, heads.value, recurrent_value_dim));
         const bytes = try std.math.mul(usize, descriptor.rows * @sizeOf(u16), width);
-        const occupied = try StorageLayout.aligned(self.storage_layout.layerWorkspaceBytes());
+        // The ordinary head GEMM also uses projection staging.
+        const layer_bytes = try self.storage_layout.layerLiveBytes();
+        const head_bytes = if (self.storage_layout.shared_head_workspace) |head| head.bytes else 0;
+        const occupied = try StorageLayout.aligned(@max(layer_bytes, head_bytes));
         self.storage_layout.projection_staging = try self.storage_layout.declareLayerRegion(occupied, bytes);
     }
 
@@ -1014,6 +1035,18 @@ test "bounded CUDA decoder shares declared attention and recurrent workspace" {
     try std.testing.expectEqualDeep(composed, phase.storage_layout);
     try phase.prepareWorkspace(.{ .recurrent_scratch = false, .compact_ffn = null, .projection_staging = false });
     try std.testing.expect(phase.storage_layout.recurrent_workspace == null and phase.storage_layout.ffn_outputs == null and phase.storage_layout.projection_staging == null);
+
+    var shared = descriptor;
+    shared.head_storage = .{ .shared_layer_packets = 16 };
+    try phase.initInto(shared);
+    try phase.prepareWorkspace(policy);
+    const shared_layout = phase.storage_layout;
+    const shared_head = shared_layout.shared_head_workspace.?;
+    try std.testing.expectEqualDeep(composed.ffn_outputs, shared_layout.ffn_outputs);
+    const shared_staging = shared_layout.projection_staging.?;
+    try std.testing.expectEqual(composed.projection_staging.?.bytes, shared_staging.bytes);
+    try std.testing.expect(shared_staging.offset >= shared_head.offset + shared_head.bytes);
+    try std.testing.expectEqual(shared_staging.offset + shared_staging.bytes, shared_layout.metadata_bytes);
 
     var fused = descriptor;
     fused.hidden = 1024;
