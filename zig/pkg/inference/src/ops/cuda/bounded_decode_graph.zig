@@ -944,10 +944,10 @@ pub const Module = struct {
 
     pub fn bindFfnOutput(self: *Module, ffn: @import("dense_ffn_workspace.zig").Layout, sources: []const buffer.DeviceBuffer) !buffer.DeviceBuffer {
         if (ffn.rows != self.rows or ffn.hidden != self.hidden) return error.InvalidExecutionPlan;
-        return try self.bindLayerOutput(ffn.output_bytes, sources);
+        return try self.bindLayerResidualOutput(ffn.output_bytes, sources);
     }
 
-    pub fn bindLayerOutput(self: *Module, bytes: usize, sources: []const buffer.DeviceBuffer) !buffer.DeviceBuffer {
+    pub fn bindLayerResidualOutput(self: *Module, bytes: usize, sources: []const buffer.DeviceBuffer) !buffer.DeviceBuffer {
         const layout = self.storage_layout orelse return error.InvalidExecutionPlan;
         const span = layout.ffn_outputs orelse return error.InvalidExecutionPlan;
         if (bytes != span.bytes / 2) return error.InvalidExecutionPlan;

@@ -29961,7 +29961,7 @@ pub fn tryCapturedResidual(cb: *const ops.ComputeBackend, a: CT, b: CT, kind: Ca
         .layer_output => blk: {
             const layout = owner.storage_layout orelse return error.InvalidExecutionPlan;
             if (layout.ffn_outputs == null) return null;
-            break :blk try owner.bindLayerOutput(bytes, &.{ lhs.buffer, rhs.buffer });
+            break :blk try owner.bindLayerResidualOutput(bytes, &.{ lhs.buffer, rhs.buffer });
         },
     };
     try buffer_mod.validateRegions(3, .{ lhs.buffer, rhs.buffer, destination }, @splat(bytes), @splat(@alignOf(f32)), 2);
