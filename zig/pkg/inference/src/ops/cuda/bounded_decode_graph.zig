@@ -1065,11 +1065,10 @@ pub const Module = struct {
         return std.mem.indexOfScalar(u64, self.key, address) != null;
     }
 
-    /// Foreground work may replace provider scratch. Keep only a suspended
-    /// executable whose declared plan uses its own metadata and no borrowed
-    /// vendor workspace or learned allocations.
-    pub fn canKeepSuspendedDuringForeground(self: *const Module) bool {
-        if (!self.rebind_required or self.active or self.phase != .replay or self.graph == null or
+    /// Foreground work may replace provider scratch. Suspension requires a
+    /// declared plan with independently owned metadata and zero scratch.
+    pub fn canSuspendForForeground(self: *const Module) bool {
+        if (self.active or self.phase != .replay or self.graph == null or
             !self.recurrent_page_table_staged or !self.attention_page_tables_staged or
             self.vendor_workspace.ptr != 0 or self.vendor_workspace.len != 0 or self.arena.ptr != 0) return false;
         const plan = self.plan orelse return false;

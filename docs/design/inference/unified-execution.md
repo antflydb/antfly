@@ -3530,6 +3530,15 @@ observed retirement reason. These runs establish output parity for
 the exercised workloads. The throughput effect of actual model
 rebinding remains unqualified.
 
+With the same opt-in, foreground work can now suspend an eligible
+recorded graph before a follower departs. A completed replay counts
+toward the changing-cohort gate only if its sequence bindings
+changed. All four focused Spark checks passed with zero skips.
+The released 8- and 16-row runs again each completed 64 pages with
+exact serial parity and zero changed-cohort replays. The logged
+replay resets changed batch width, which still requires a different
+executable.
+
 The M4 Max focused cohort at `061f213135` passed all seven checks
 with zero skips. It exercised the shared installed Whisper Small
 checkpoint with the Metal backend required, verified assigned packed

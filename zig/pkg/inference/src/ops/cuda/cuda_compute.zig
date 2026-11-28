@@ -3663,7 +3663,8 @@ pub const CudaCompute = struct {
         if (cb.kind() != .cuda) return;
         const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
         if (self.capability_profile != .lightonocr3 or self.ctx.debug_graph_capture_active or self.debug_cuda_graph_capture_active) return;
-        if (self.bounded_decode_graph.graph != null and !self.bounded_decode_graph.canKeepSuspendedDuringForeground()) return error.InvalidExecutionPlan;
+        const graph = &self.bounded_decode_graph;
+        if (graph.graph != null and (!graph.rebind_required or !graph.canSuspendForForeground())) return error.InvalidExecutionPlan;
         if (self.cublaslt) |*blas| _ = try blas.reserveTensorCorePlanSlots(&self.ctx, 64);
     }
 
@@ -4228,8 +4229,11 @@ pub const CudaCompute = struct {
         defer self.bounded_decode_graph.mutex.unlock();
         const owner = &self.bounded_decode_graph;
         if (!owner.retirementPending() or !owner.references(dependency)) return;
-        if ((reason == .foreground_vision or reason == .mixed_prefill) and owner.canKeepSuspendedDuringForeground()) {
-            try owner.validateCleanup(current);
+        if (dependency == null and (reason == .foreground_vision or reason == .mixed_prefill) and
+            owner.canSuspendForForeground() and
+            (owner.rebind_required or platform.env.getenvBool("ANTFLY_CUDA_LIGHTON_GRAPH_REBIND")))
+        {
+            try self.suspendBoundedGraph(current);
             return;
         }
 
@@ -4503,14 +4507,19 @@ pub const CudaCompute = struct {
     fn suspendBoundedGraphBinding(self: *CudaCompute, current: CacheCleanup, dependency: @import("bounded_decode_graph.zig").Module.Dependency) !bool {
         const owner = &self.bounded_decode_graph;
         if (!owner.canSuspendBinding(dependency)) return false;
+        try self.suspendBoundedGraph(current);
+        return true;
+    }
+
+    fn suspendBoundedGraph(self: *CudaCompute, current: CacheCleanup) !void {
+        const owner = &self.bounded_decode_graph;
         try owner.validateCleanup(current);
         if (!owner.rebind_required) {
-            // No later submission may observe the old tables once the
-            // departing row's state can be reused.
+            // Drain the recorded bindings before foreground work or row
+            // retirement can change the physical state they describe.
             try self.ctx.synchronize();
             owner.rebind_required = true;
         }
-        return true;
     }
 
     fn retireCapturedGraph(self: *CudaCompute, current: CacheCleanup, reason: GraphRetirement) !void {
@@ -4563,6 +4572,9 @@ pub const CudaCompute = struct {
         defer if (!claimed) owner.mutex.unlock();
         if (owner.disabled_epoch == epoch) return null;
         const rebind = graph_phase.canRebind(owner);
+        // Restaging the same cohort after foreground work is a refresh.
+        // The replacement receipt requires a different sequence binding.
+        const cohort_rebound = rebind and !std.mem.eql(u64, owner.sequences[0..owner.sequence_count], descriptor.sequences);
         if (!graph_phase.matchesOwner(owner) and !rebind) {
             owner.resetPrepared(&self.ctx, graph_phase) catch |err| switch (err) {
                 error.CudaMemoryLimitExceeded => {
@@ -4605,7 +4617,7 @@ pub const CudaCompute = struct {
             .compute = self,
             .head_destination = head_destination,
             .capture_scope = capture_scope,
-            .inputs_rebound = rebind,
+            .inputs_rebound = cohort_rebound,
         };
     }
 
@@ -59699,6 +59711,13 @@ test "CUDA reader replays one executable after staged follower replacement" {
     try std.testing.expectEqual(@as(u32, 2), table.blocks[1]);
     try std.testing.expectEqual(@as(u32, 7), table.pages[1].tokens);
 
+    try std.testing.expect(owner.canSuspendForForeground());
+    if (platform.env.getenvBool("ANTFLY_CUDA_LIGHTON_GRAPH_REBIND")) {
+        const backend = compute.computeBackend();
+        try CudaCompute.invalidateLightOnDecodeGraphWithCleanup(&backend, .{ .outside_execution = true }, .foreground_vision);
+        try std.testing.expect(owner.rebind_required);
+        try std.testing.expectEqual(exec, owner.graph);
+    }
     try std.testing.expect(!try compute.suspendBoundedGraphBinding(.{ .outside_execution = true }, .{ .sequence = 3 }));
     try std.testing.expect(try compute.suspendBoundedGraphBinding(.{ .outside_execution = true }, .{ .sequence = 4 }));
     try std.testing.expect(owner.rebind_required);
@@ -59706,9 +59725,9 @@ test "CUDA reader replays one executable after staged follower replacement" {
     try CudaCompute.invalidateLightOnDecodeGraphWithCleanup(&backend, .{ .outside_execution = true }, .foreground_vision);
     try CudaCompute.invalidateLightOnDecodeGraphWithCleanup(&backend, .{ .outside_execution = true }, .mixed_prefill);
     try std.testing.expectEqual(exec, owner.graph);
-    try std.testing.expect(owner.canKeepSuspendedDuringForeground());
+    try std.testing.expect(owner.canSuspendForForeground());
     owner.vendor_workspace = try receipt.borrowRange(0, 64);
-    try std.testing.expect(!owner.canKeepSuspendedDuringForeground());
+    try std.testing.expect(!owner.canSuspendForForeground());
     owner.vendor_workspace = .{};
 
     _ = try departing.freeChecked(&compute.ctx);
