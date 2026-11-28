@@ -2810,6 +2810,7 @@ pub const ComputeBackend = struct {
 
     /// Admission, cancellation and publication for composite audio execution.
     pub const AudioExecutionRegion = struct {
+        fitsGroupedWorkspace: ?*const fn (ctx: *anyopaque, recipe: @import("../execution/audio_schedule.zig").AudioRecipe, segments: []const usize, rows: usize) anyerror!bool = null,
         setControl: ?*const fn (ctx: *anyopaque, control: ?InferenceExecutionControl) ?InferenceExecutionControl = null,
         storage: ?*const fn (ctx: *anyopaque, begin: bool) anyerror!bool = null,
         /// run submits work synchronously. Input handles are borrowed for the
@@ -5899,6 +5900,11 @@ pub const ComputeBackend = struct {
             return err;
         };
         return output;
+    }
+
+    pub fn audioExecutionFitsGroupedWorkspace(self: *const ComputeBackend, recipe: @import("../execution/audio_schedule.zig").AudioRecipe, segments: []const usize, rows: usize) !bool {
+        const preflight = self.vtable.regions.audio_execution.fitsGroupedWorkspace orelse return true;
+        return preflight(self.ptr, recipe, segments, rows);
     }
 
     pub fn supportsAudioExecution(self: *const ComputeBackend) bool {

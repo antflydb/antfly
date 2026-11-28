@@ -7944,6 +7944,20 @@ pub const CudaCompute = struct {
     }
     /// Rebuilt under the actual Stage owner after every yield. Only an already
     /// learned event layout can contribute an audio arena request.
+    /// A single operation's mandatory scratch and its live output establish
+    /// a lower bound for the encoder. Decline only when that bound cannot fit.
+    fn audioWorkspaceLowerBoundFits(recipe: CacheFunding.AudioRecipe, segments: []const usize, rows: usize, base: AudioCacheBase) !bool {
+        if (!base.fitsArena()) return false;
+        if (!recipe.source_bf16) return true;
+        const schedule = @import("../../execution/audio_schedule.zig");
+        const Source = @import("local_relative_source.zig");
+        if (segments.len > schedule.GroupedRows.max_clips) return error.InvalidPreparedAudioRecipe;
+        var clips: [schedule.GroupedRows.max_clips]Source.Plan = undefined;
+        const context = try schedule.attentionContextRows(recipe.chunk, recipe.context_left, recipe.context_right);
+        const group = try Source.planGroup(clips[0..segments.len], segments, rows, recipe.heads, recipe.hidden / recipe.heads, recipe.chunk, context, recipe.context_left);
+        return group.bytes <= AudioPlan.limit - base.input_bytes - base.output_bytes;
+    }
+
     pub fn appendAudioCacheWorkload(self: *const CudaCompute, recipe: CacheFunding.AudioRecipe, builder: *CacheFunding.Builder) !void {
         try recipe.validate();
         if (self.capability_profile != .embedding_gemma2) return error.UnsupportedEmbeddingStage;
@@ -7984,6 +7998,7 @@ pub const CudaCompute = struct {
         const inputs = try Inputs.describe(&shapes, rows, recipe.hidden, recipe.context_left, recipe.heads);
         const execution_key = recipe.key(segments[0..recipe.count], 0, recipe.blocks);
         const base = try self.audioCacheBase(execution_key, inputs[0..Inputs.activeCount(!recipe.source_bf16)], null);
+        if (!try audioWorkspaceLowerBoundFits(recipe, segments[0..recipe.count], rows, base)) return;
         const entry = self.audioPlanFor(base) orelse return;
         if (entry.owner == null or !entry.owner.?.managed)
             try builder.add(.{ .audio_learning = .{ .key = base.key } });
@@ -21680,6 +21695,16 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
     out_owned = false;
     return out;
 }
+fn audioWorkspaceFitsOp(ctx: *anyopaque, recipe: CacheFunding.AudioRecipe, segments: []const usize, rows: usize) !bool {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    if (self.capability_profile != .embedding_gemma2 or !self.embedding_gemma2_policy.audio_graph) return false;
+    const Inputs = @import("../../execution/audio_schedule.zig").ExecutionInputs;
+    var shapes: [Inputs.count][2]i64 = undefined;
+    const inputs = try Inputs.describe(&shapes, rows, recipe.hidden, recipe.context_left, recipe.heads);
+    const base = try self.audioCacheBase(0, inputs[0..Inputs.activeCount(!recipe.source_bf16)], null);
+    return CudaCompute.audioWorkspaceLowerBoundFits(recipe, segments, rows, base);
+}
+
 fn audioBatchLayoutsEnabledOp(ctx: *anyopaque) bool {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     return self.capability_profile == .embedding_gemma2;
@@ -38685,6 +38710,7 @@ const vtable: ops.ComputeBackend.VTable = .{
         },
         .audio_execution = .{
             .execute = &audioExecutionOp,
+            .fitsGroupedWorkspace = &audioWorkspaceFitsOp,
             .storage = &sourceAudioStorageOp,
         },
         .audio_attention = .{
@@ -60351,6 +60377,26 @@ test "CUDA audio learning cache state uses actual warm no-plan eligibility and o
     compute.audio_plans.entries[0].owner = null;
     compute.audio_plans.entries[0].disabled = true;
     try std.testing.expect(!(try compute.cacheRequestState(request)).miss);
+}
+
+test "CUDA grouped audio admission rejects an impossible mandatory workspace before execution" {
+    const Source = @import("local_relative_source.zig");
+    const clips = [_]usize{ 12, 25 };
+    var plans: [clips.len]Source.Plan = undefined;
+    const layout = try Source.planGroup(&plans, &clips, 37, 8, 128, 12, 24, 13);
+    var recipe: CacheFunding.AudioRecipe = undefined;
+    recipe.source_bf16 = true;
+    recipe.hidden = 1024;
+    recipe.heads = 8;
+    recipe.chunk = 12;
+    recipe.context_left = 13;
+    recipe.context_right = 0;
+    const output = 37 * 1024 * @sizeOf(f32);
+    var bindings: CudaCompute.AudioCacheBase = .{ .key = 0, .input_bytes = CudaCompute.AudioPlan.limit - layout.bytes - output, .output_bytes = output };
+    try std.testing.expect(try CudaCompute.audioWorkspaceLowerBoundFits(recipe, &clips, 37, bindings));
+    bindings.input_bytes += @import("../../execution/stream_workspace.zig").alignment;
+    try std.testing.expect(bindings.fitsArena());
+    try std.testing.expect(!try CudaCompute.audioWorkspaceLowerBoundFits(recipe, &clips, 37, bindings));
 }
 
 test "CUDA audio declines local capture ownership before any SDK query" {

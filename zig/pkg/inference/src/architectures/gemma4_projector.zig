@@ -4943,6 +4943,8 @@ fn runAudioLayers(cb: *const ComputeBackend, a: std.mem.Allocator, store: *Proje
 }
 fn tryAudioExecutionRange(cb: *const ComputeBackend, a: std.mem.Allocator, store: *ProjectorWeights, cfg: AudioConfig, hidden: CT, inputs: *AudioLayerInputs, start: usize, end: usize, defer_arena: bool) !?CT {
     if (!audioExecutionEligible(cb, store, cfg, inputs)) return null;
+    const recipe = audioCacheConfig(cfg);
+    if (!try cb.audioExecutionFitsGroupedWorkspace(recipe, inputs.segments, inputs.valid_mask.len)) return null;
     const Run = struct {
         cb: *const ComputeBackend,
         a: std.mem.Allocator,
@@ -4966,7 +4968,7 @@ fn tryAudioExecutionRange(cb: *const ComputeBackend, a: std.mem.Allocator, store
     };
     var run = Run{ .cb = cb, .a = a, .store = store, .cfg = cfg, .inputs = inputs, .start = start, .end = end };
     const values = audioExecutionInputs(hidden, inputs);
-    return cb.audioExecutionWithArenaFunding(audioCacheConfig(cfg).key(inputs.segments, start, end), values[0..audio_schedule.ExecutionInputs.activeCount(cb.kind() != .cuda or inputs.segment_valid != null)], &run, Run.call, defer_arena);
+    return cb.audioExecutionWithArenaFunding(recipe.key(inputs.segments, start, end), values[0..audio_schedule.ExecutionInputs.activeCount(cb.kind() != .cuda or inputs.segment_valid != null)], &run, Run.call, defer_arena);
 }
 
 fn audioExecutionEligible(cb: *const ComputeBackend, store: *const ProjectorWeights, cfg: AudioConfig, inputs: *const AudioLayerInputs) bool {
