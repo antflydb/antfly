@@ -94,6 +94,33 @@ pub fn encodePreparedImageTokensTensor(
     prep_cfg: qwen2vl.PreprocessorConfig,
     prepared: qwen2vl.PreparedImage,
 ) !CT {
+    return encodeImageTokensTensor(cb, allocator, cfg, prep_cfg, prepared, false);
+}
+
+/// Takes ownership of the normalized pixel allocation, including on failure.
+pub fn encodeOwnedPreparedImageTokensTensor(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    cfg: gpt_mod.Config,
+    prep_cfg: qwen2vl.PreprocessorConfig,
+    prepared: qwen2vl.PreparedImage,
+) !CT {
+    return encodeImageTokensTensor(cb, allocator, cfg, prep_cfg, prepared, true);
+}
+
+fn encodeImageTokensTensor(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    cfg: gpt_mod.Config,
+    prep_cfg: qwen2vl.PreprocessorConfig,
+    prepared: qwen2vl.PreparedImage,
+    comptime consume_pixels: bool,
+) !CT {
+    var pixels_live = consume_pixels;
+    defer if (pixels_live) {
+        var owned = prepared;
+        owned.deinit();
+    };
     const trace_enabled = visionTraceEnabled();
     var stage_start_ns: u64 = 0;
     if (trace_enabled) {
@@ -113,17 +140,23 @@ pub fn encodePreparedImageTokensTensor(
     const seq_len = geometry.seq_len;
     const merged_tokens = geometry.merged_tokens;
 
-    const patch_rows = try buildPatchRows(allocator, prepared, patch_size, temporal_patch_size, merge_size);
-    defer allocator.free(patch_rows);
-    if (trace_enabled) {
-        std.debug.print(
-            "vision_trace stage=build_patch_rows elapsed_ms={d} seq_len={d} patch_dim={d}\n",
-            .{ nsToMs(try elapsedSince(stage_start_ns)), seq_len, 3 * temporal_patch_size * patch_size * patch_size },
-        );
-        stage_start_ns = try nowNs();
-    }
-
-    var hidden = try patchEmbed(cb, allocator, patch_rows, seq_len, patch_size, temporal_patch_size, embed_dim);
+    var hidden = embedding: {
+        const patch_rows = try buildPatchRows(allocator, prepared, patch_size, temporal_patch_size, merge_size);
+        defer allocator.free(patch_rows);
+        if (consume_pixels) {
+            var owned = prepared;
+            owned.deinit();
+            pixels_live = false;
+        }
+        if (trace_enabled) {
+            std.debug.print(
+                "vision_trace stage=build_patch_rows elapsed_ms={d} seq_len={d} patch_dim={d}\n",
+                .{ nsToMs(try elapsedSince(stage_start_ns)), seq_len, 3 * temporal_patch_size * patch_size * patch_size },
+            );
+            stage_start_ns = try nowNs();
+        }
+        break :embedding try patchEmbed(cb, allocator, patch_rows, seq_len, patch_size, temporal_patch_size, embed_dim);
+    };
     var hidden_live = true;
     errdefer if (hidden_live) cb.free(hidden);
     if (trace_enabled) {
@@ -221,7 +254,8 @@ fn patchEmbed(
     const patch_dim = 3 * temporal_patch_size * patch_size * patch_size;
     if (trace_enabled) stage_start_ns = try nowNs();
     const patch_shape = [_]i32{ @intCast(seq_len), @intCast(patch_dim) };
-    const patch_ct = try cb.fromFloat32Shape(patch_rows, &patch_shape);
+    // Patch rows remain live through the projection and tensor release.
+    const patch_ct = try cb.fromBorrowedFloat32Shape(patch_rows, &patch_shape);
     defer cb.free(patch_ct);
     if (trace_enabled) {
         std.debug.print("vision_trace stage=patch_embed.from_input elapsed_ms={d}\n", .{nsToMs(try elapsedSince(stage_start_ns))});
@@ -236,6 +270,7 @@ fn patchEmbed(
         try cb.primReshape(patch_w, &.{ @intCast(embed_dim), @intCast(patch_dim) });
     defer cb.free(weight_ct);
     const out = try cb.linearNoBias(patch_ct, weight_ct, seq_len, patch_dim, embed_dim);
+    errdefer cb.free(out);
     if (trace_enabled) {
         std.debug.print("vision_trace stage=patch_embed.linear elapsed_ms={d}\n", .{nsToMs(try elapsedSince(stage_start_ns))});
     }

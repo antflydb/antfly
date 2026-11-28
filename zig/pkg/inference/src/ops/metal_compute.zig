@@ -81,7 +81,7 @@ pub fn supportsAssignedDescriptor(descriptor: *const ops.kernel_descriptor.Descr
             !descriptor.input_shapes[0].eq(descriptor.output_shape) or !descriptor.input_shapes[1].eq(descriptor.output_shape) or
             descriptor.input_shapes[2].numElements() != 1) return false,
         .binary => |binary| if ((binary == .add or binary == .multiply) and descriptor.input_shapes[0].numElements().? != descriptor.input_shapes[1].numElements().?) {
-            return false;
+            if (binary != .add or descriptor.columnBiasOperand() == null) return false;
         },
         .dot => |dot| if (descriptor.input_shapes[0].rank() != 2 or !dot.lhs_contract_last or dot.k <= 1 or dot.n <= 1) {
             return false;
@@ -14436,7 +14436,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 assigned.slot.writable_bytes != planned.writable_bytes or !assigned.slot.logical.eq(planned.logical)) return error.InvalidPhysicalStorageAuthority;
             try self.validateProjectionOutput(out_tensor, assigned.*);
         }
-        if (descriptor.operation == .add_mul_scalar or descriptor.operation == .concat or descriptor.operation == .slice or descriptor.operation == .gather or descriptor.operation == .norm or descriptor.operation == .linear or descriptor.operation == .dot or descriptor.operation == .rope or dense_attention) {
+        const column_bias_matrix = if (descriptor.operation == .binary and descriptor.operation.binary == .add and
+            descriptor.input_shapes[0].numElements().? != descriptor.input_shapes[1].numElements().?) descriptor.columnBiasOperand() else null;
+        if (column_bias_matrix != null or descriptor.operation == .add_mul_scalar or descriptor.operation == .concat or descriptor.operation == .slice or descriptor.operation == .gather or descriptor.operation == .norm or descriptor.operation == .linear or descriptor.operation == .dot or descriptor.operation == .rope or dense_attention) {
             for (request.inputs, 0..) |source, index| {
                 const tensor = PreparedCachedOperands.deviceInput(cached_operands, source, index) orelse continue;
                 if (tensor.deviceHandle() == out_tensor.deviceHandle() and kernel_geometry.byteRangesOverlap(@intCast(tensor.deviceByteOffset()), tensor.deviceByteLen(), @intCast(out_tensor.deviceByteOffset()), out_tensor.deviceByteLen())) return error.InvalidAssignedAlias;
@@ -14503,7 +14505,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .binary => |binary| blk: {
                 const rhs = toBuf(request.inputs[1]).metal_tensor.?;
                 break :blk switch (binary) {
-                    .add => try metal_runtime.decoderRuntimeApplyAddInto(self.provider_impl, input, rhs, out_tensor, descriptor.elements()),
+                    .add => if (column_bias_matrix) |matrix|
+                        try metal_runtime.decoderRuntimeApplyAddRhsRepeatInto(self.provider_impl, if (matrix == 0) input else rhs, if (matrix == 0) rhs else input, out_tensor)
+                    else
+                        try metal_runtime.decoderRuntimeApplyAddInto(self.provider_impl, input, rhs, out_tensor, descriptor.elements()),
                     .subtract => (try metal_runtime.decoderRuntimeApplySubtractInto(self.provider_impl, input, rhs, out_tensor)) != null,
                     .multiply => try metal_runtime.decoderRuntimeApplyMultiplyInto(self.provider_impl, input, rhs, out_tensor, descriptor.elements()),
                     .divide => (try metal_runtime.decoderRuntimeApplyDivideInto(self.provider_impl, input, rhs, out_tensor)) != null,
@@ -24093,17 +24098,34 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return self.encodeAudioLinear(ctx, x, request, .prefer_fused);
     }
 
+    const AudioClampBinding = struct {
+        input: MetalTensor,
+        output: MetalTensor,
+        rows: usize,
+        width: usize,
+        bytes: usize,
+        output_bytes: usize,
+
+        fn view(self: *const AudioClampBinding, ct: CT) ?MetalTensor {
+            const target = denseDeviceF32(ct) orelse return null;
+            if (target.isReadOnlyPhysical() or !deviceTensorMatchesLinearRows(&target, self.rows, self.width) or
+                target.deviceByteLen() < self.bytes or target.device.?.ref.runtime != self.output.device.?.ref.runtime or
+                (target.deviceHandle() == self.input.deviceHandle() and kernel_geometry.byteRangesOverlap(target.deviceByteOffset(), self.bytes, self.input.deviceByteOffset(), self.input.deviceByteLen())) or
+                (target.deviceHandle() == self.output.deviceHandle() and kernel_geometry.byteRangesOverlap(target.deviceByteOffset(), self.bytes, self.output.deviceByteOffset(), self.output_bytes))) return null;
+            return target;
+        }
+    };
+
     // The plan retains the scratch throughout ordinary frame encoding.
     // Ordered encoders track the reuse dependency on the same Metal buffer.
-    fn audioEagerClampWorkspace(self: *const MetalCompute, rows: usize, width: usize) ?CT {
+    fn audioEagerClampWorkspace(self: *const MetalCompute, binding: *const AudioClampBinding) ?CT {
         const plan = self.audio_eager_plan orelse return null;
         const runtime = self.provider_impl.raw_decode_runtime;
         if (metal_runtime.hasSubmittedFrame(runtime)) return null;
         for (plan.workspaces) |entry| {
             const ct = entry orelse continue;
-            const view = denseDeviceF32(ct) orelse continue;
-            if (deviceTensorMatchesLinearRows(&view, rows, width) and
-                metal_runtime.antfly_metal_can_reuse_ordered_scratch(runtime, view.deviceHandle()) != 0) return ct;
+            const view = binding.view(ct) orelse continue;
+            if (metal_runtime.antfly_metal_can_reuse_ordered_scratch(runtime, view.deviceHandle()) != 0) return ct;
         }
         return null;
     }
@@ -24162,27 +24184,24 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             defer if (owned_scratch) |*tensor| self.retireTemporaryWorkspaceValue(tensor);
             // Outside a caller-owned frame, submit the dependent clamp and
             // projection kernels together instead of waiting after each one.
-            const input_workspace = request.input_workspace orelse if (clip != null and clip.?.flags & 3 != 0)
-                self.audioEagerClampWorkspace(rows, in_dim)
-            else
-                null;
-            var owns_frame = false;
-            errdefer if (owns_frame) metal_runtime.cancelFrame(runtime) catch {};
-            if (clip) |p| {
-                if (p.flags & 31 != 0 and !metal_runtime.hasActiveFrame(runtime) and !metal_runtime.hasSubmittedFrame(runtime)) {
-                    try metal_runtime.beginFrame(runtime);
-                    owns_frame = true;
-                }
-            }
+            const cb = self.computeBackend();
+            const Submission = @import("../execution/submission.zig").Scope;
+            var frame = try Submission.beginIfNeeded(&cb, if (clip) |p| p.flags & 31 != 0 else false);
+            errdefer frame.deinitChecked() catch platform.inference_process_supervisor.restartWorker();
             var operand = x;
             if (clip) |p| if (p.flags & 3 != 0) {
                 const bytes = try std.math.mul(usize, input_elements, @sizeOf(f32));
+                const binding: AudioClampBinding = .{
+                    .input = x,
+                    .output = mt,
+                    .rows = rows,
+                    .width = in_dim,
+                    .bytes = bytes,
+                    .output_bytes = output_bytes,
+                };
+                const input_workspace = request.input_workspace orelse self.audioEagerClampWorkspace(&binding);
                 const target = if (input_workspace) |scratch| blk: {
-                    const target = denseDeviceF32(scratch) orelse return error.InvalidPreparedProjectionWorkspace;
-                    if (target.isReadOnlyPhysical() or !deviceTensorMatchesLinearRows(&target, rows, in_dim) or target.deviceByteLen() < bytes or
-                        target.device.?.ref.runtime != @as(*anyopaque, @ptrCast(runtime)) or
-                        (target.deviceHandle() == x.deviceHandle() and kernel_geometry.byteRangesOverlap(target.deviceByteOffset(), bytes, x.deviceByteOffset(), x.deviceByteLen())) or
-                        (target.deviceHandle() == mt.deviceHandle() and kernel_geometry.byteRangesOverlap(target.deviceByteOffset(), bytes, mt.deviceByteOffset(), output_bytes))) return error.InvalidPreparedProjectionWorkspace;
+                    const target = binding.view(scratch) orelse return error.InvalidPreparedProjectionWorkspace;
                     toBuf(scratch).metal_tensor.?.invalidateHostMirror();
                     break :blk target;
                 } else blk: {
@@ -24199,14 +24218,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             if (clip) |p| if (p.flags & 28 != 0) {
                 if (!metal_runtime.decoderRuntimeAudioClampInto(self.provider_impl, mt, mt, (p.flags >> 2) & 3, p.output_min, p.output_max, p.flags & 16 != 0)) return error.AudioScheduleRouteChanged;
             };
-            if (owns_frame) {
-                // Hand scratch to the frame's retirement path so an audio
-                // storage scope can reuse it after this submission completes.
+            if (frame.owns) {
+                // Scratch retires on the frame that last consumed it.
                 if (owned_scratch) |*tensor| self.retireTemporaryWorkspaceValue(tensor);
                 owned_scratch = null;
-                try metal_runtime.submitFrame(runtime);
-                owns_frame = false;
-                try metal_runtime.waitFrame(runtime);
+                try frame.finish();
             }
         }
         published = true;
@@ -24366,7 +24382,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
     }
 
-    fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *anyopaque, run: *const fn (*anyopaque, []const CT) anyerror!CT, cleanup: @import("../execution/cleanup_context.zig").Context, defer_arena: bool) anyerror!?CT {
+    fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *anyopaque, run: *const fn (*anyopaque, []const CT) anyerror!CT, dispatch: ops.ComputeBackend.AudioDispatch) anyerror!?CT {
+        const cleanup = dispatch.cleanup;
+        const defer_arena = dispatch.defer_arena;
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         const observation = @import("../execution/runtime_observation.zig");
         const selection = audioExecutionSelection(self, key, inputs) orelse {
@@ -63561,7 +63579,7 @@ test "Metal prepared audio projection consumes disjoint clamp workspace after fu
     const repeat_values = try cb.toFloat32(repeat, a);
     defer a.free(repeat_values);
     try std.testing.expectEqualSlices(f32, expected, repeat_values);
-    var workspaces = [_]?CT{workspace};
+    var workspaces = [_]?CT{ input, destination, workspace };
     var plan: audio_tape.Plan = .{ .workspaces = &workspaces, .input_workspace_bytes = bytes };
     compute.audio_eager_plan = &plan;
     defer compute.audio_eager_plan = null;
@@ -63571,6 +63589,7 @@ test "Metal prepared audio projection consumes disjoint clamp workspace after fu
     const synced_values = try cb.toFloat32(synced, a);
     defer a.free(synced_values);
     try std.testing.expectEqualSlices(f32, expected, synced_values);
+    plan.workspaces = workspaces[2..];
     {
         try metal_runtime_mod.beginFrame(runtime);
         errdefer metal_runtime_mod.cancelFrame(runtime) catch {};
@@ -63583,7 +63602,15 @@ test "Metal prepared audio projection consumes disjoint clamp workspace after fu
         defer cb.free(second);
         try std.testing.expectEqual(before_frames, metal_runtime_mod.frameCommandBufferCount(runtime));
         try metal_runtime_mod.submitFrame(runtime);
-        try std.testing.expect(compute.audioEagerClampWorkspace(rows, width) == null);
+        const binding: MetalCompute.AudioClampBinding = .{
+            .input = source,
+            .output = MetalCompute.denseDeviceF32(destination).?,
+            .rows = rows,
+            .width = width,
+            .bytes = bytes,
+            .output_bytes = bytes,
+        };
+        try std.testing.expect(compute.audioEagerClampWorkspace(&binding) == null);
         try metal_runtime_mod.waitFrame(runtime);
         const first_values = try cb.toFloat32(first, a);
         defer a.free(first_values);

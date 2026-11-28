@@ -1592,6 +1592,19 @@ pub const ScheduledStep = struct {
     };
 };
 
+/// A scheduled prefix can use its chunk-sized epoch workspace. A direct
+/// prefix requires storage for the complete prompt, including deep-stack work.
+pub const PositionedRoute = enum {
+    direct,
+    scheduled,
+
+    pub fn select(chunk_rows: usize, scheduler_available: bool, deepstack_layers: usize) !PositionedRoute {
+        if (scheduler_available and deepstack_layers == 0) return .scheduled;
+        if (chunk_rows != 0) return error.InvalidPreparedPrompt;
+        return .direct;
+    }
+};
+
 /// One borrowed positioned-prefix request. Queue work and its prefix remain
 /// stack-owned until the existing wait protocol publishes ready or drains it.
 /// Physical execution never borrows a task pipeline or tokenizer.
@@ -1603,7 +1616,6 @@ pub const PositionedRequest = struct {
     io: std.Io,
     control: ?control.InferenceExecutionControl,
     continuation: control.InferenceExecutionControl,
-    chunk_rows: usize,
     wants_greedy: bool,
     executor: graph_mod.decoder_step_executor.Executor,
     publication: graph_mod.decoder_step_executor.Executor.Publication,
@@ -1617,7 +1629,8 @@ pub const PositionedRequest = struct {
         const lease = self.lease;
         const io = self.io;
         if (!self.item.model.hasQwen35VisionArchitectureContract() or state.total_tokens != 0 or self.item.geometry_tokens != seq or self.item.deepstack_layer_count != 0) return error.InvalidPreparedPrompt;
-        const chunk_rows = if (self.chunk_rows == 0) seq else @min(seq, self.chunk_rows);
+        const workspace_rows = self.executor.prepared_qwen_prefill_chunk_rows;
+        const chunk_rows = if (workspace_rows == 0) seq else @min(seq, workspace_rows);
         var processed: usize = 0;
         scheduler.notePrefillProgress(lease, 0, seq);
         while (processed < seq) {
@@ -2924,9 +2937,8 @@ test "positioned request cancellation preserves actual Native prefix and state b
                 .io = std.testing.io,
                 .control = null,
                 .continuation = .{ .check_fn = cancelled },
-                .chunk_rows = 1,
                 .wants_greedy = false,
-                .executor = .{ .context = .{ .allocator = a, .cb = &cb, .gpt_config = &cfg } },
+                .executor = .{ .context = .{ .allocator = a, .cb = &cb, .gpt_config = &cfg }, .prepared_qwen_prefill_chunk_rows = 1 },
                 .publication = .{ .ptr = &publications, .publish_fn = publish },
             };
             try std.testing.expectError(error.Cancelled, request.runScheduled());

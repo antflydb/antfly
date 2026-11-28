@@ -255,8 +255,9 @@ pub fn scoreDocument(
     if (images.len == 0) return error.NoImages;
 
     var prepared_images = std.ArrayListUnmanaged(qwen2vl.PreparedImage).empty;
+    var consumed_images: usize = 0;
     defer {
-        for (prepared_images.items) |*img| img.deinit();
+        for (prepared_images.items[consumed_images..]) |*img| img.deinit();
         prepared_images.deinit(allocator);
     }
     // Reserve list metadata before producing any owner. Appending a completed
@@ -272,10 +273,10 @@ pub fn scoreDocument(
     defer prepared_doc.deinit();
 
     var doc_encoded = if (vision_session == null)
-        (try encodeDocumentStreamingNative(cb, allocator, gpt_cfg, prep_cfg, prepared_doc, prepared_images.items, execution_control)) orelse
-            try encodePreparedDocumentCompatibility(cb, allocator, vision_session, gpt_cfg, prep_cfg, prepared_doc, prepared_images.items, execution_control)
+        (try encodeDocumentStreamingNative(cb, allocator, gpt_cfg, prep_cfg, prepared_doc, prepared_images.items, &consumed_images, execution_control)) orelse
+            try encodePreparedDocumentCompatibility(cb, allocator, vision_session, gpt_cfg, prep_cfg, prepared_doc, prepared_images.items, &consumed_images, execution_control)
     else
-        try encodePreparedDocumentCompatibility(cb, allocator, vision_session, gpt_cfg, prep_cfg, prepared_doc, prepared_images.items, execution_control);
+        try encodePreparedDocumentCompatibility(cb, allocator, vision_session, gpt_cfg, prep_cfg, prepared_doc, prepared_images.items, &consumed_images, execution_control);
     defer doc_encoded.deinit();
 
     return reranking.lateInteractionScore(
@@ -300,8 +301,10 @@ fn encodePreparedDocumentCompatibility(
     prep_cfg: qwen2vl.PreprocessorConfig,
     prepared_doc: qwen2vl.PreparedTextInput,
     prepared_images: []const qwen2vl.PreparedImage,
+    consumed_images: *usize,
     execution_control: ?InferenceExecutionControl,
 ) !EncodedSequence {
+    std.debug.assert(consumed_images.* == 0);
     var image_embeddings = std.ArrayListUnmanaged([]f32).empty;
     var native_image_embeddings = std.ArrayListUnmanaged(NativeImageEmbedding).empty;
     defer {
@@ -315,8 +318,9 @@ fn encodePreparedDocumentCompatibility(
         for (prepared_images, 0..) |prepared, index| {
             if (execution_control) |control|
                 try control.update(.executing, @intCast(index), @intCast(prepared_images.len));
+            consumed_images.* += 1;
             native_image_embeddings.appendAssumeCapacity(.{
-                .tensor = try qwen2vl_vision.encodePreparedImageTokensTensor(cb, allocator, gpt_cfg, prep_cfg, prepared),
+                .tensor = try qwen2vl_vision.encodeOwnedPreparedImageTokensTensor(cb, allocator, gpt_cfg, prep_cfg, prepared),
                 .token_count = prepared.image_token_count,
             });
         }
@@ -325,7 +329,8 @@ fn encodePreparedDocumentCompatibility(
         for (prepared_images, 0..) |prepared, index| {
             if (execution_control) |control|
                 try control.update(.executing, @intCast(index), @intCast(prepared_images.len));
-            image_embeddings.appendAssumeCapacity(try encodeImageTokens(cb, allocator, vision_session, gpt_cfg, prep_cfg, prepared, execution_control));
+            consumed_images.* += 1;
+            image_embeddings.appendAssumeCapacity(try runVisionSession(allocator, vision_session.?, prepared, gpt_cfg.hidden_size, execution_control, true));
         }
     }
 
@@ -345,9 +350,10 @@ fn encodeDocumentStreamingNative(
     prep_cfg: qwen2vl.PreprocessorConfig,
     prepared: qwen2vl.PreparedTextInput,
     images: []const qwen2vl.PreparedImage,
+    consumed_images: *usize,
     execution_control: ?InferenceExecutionControl,
 ) !?EncodedSequence {
-    var producer = NativeVisionProducer{ .cb = cb, .allocator = allocator, .cfg = cfg, .prep_cfg = prep_cfg, .images = images, .control = execution_control };
+    var producer = NativeVisionProducer{ .cb = cb, .allocator = allocator, .cfg = cfg, .prep_cfg = prep_cfg, .images = images, .consumed_images = consumed_images, .control = execution_control };
     return encodeDocumentStreamingProducer(cb, allocator, cfg, prep_cfg, prepared, images, &producer, execution_control);
 }
 
@@ -357,9 +363,15 @@ const NativeVisionProducer = struct {
     cfg: gpt_mod.Config,
     prep_cfg: qwen2vl.PreprocessorConfig,
     images: []const qwen2vl.PreparedImage,
+    consumed_images: ?*usize = null,
     control: ?InferenceExecutionControl,
     fn produce(self: *@This(), index: usize) !CT {
         if (self.control) |control| try control.update(.executing, @intCast(index), @intCast(self.images.len));
+        if (self.consumed_images) |consumed| {
+            std.debug.assert(consumed.* == index);
+            consumed.* += 1;
+            return qwen2vl_vision.encodeOwnedPreparedImageTokensTensor(self.cb, self.allocator, self.cfg, self.prep_cfg, self.images[index]);
+        }
         return qwen2vl_vision.encodePreparedImageTokensTensor(self.cb, self.allocator, self.cfg, self.prep_cfg, self.images[index]);
     }
     fn release(self: *@This(), tensor: CT) void {
@@ -545,7 +557,7 @@ pub fn encodeImageTokens(
     execution_control: ?InferenceExecutionControl,
 ) ![]f32 {
     if (vision_session) |vs| {
-        return runVisionSession(allocator, vs, prepared, gpt_cfg.hidden_size, execution_control);
+        return runVisionSession(allocator, vs, prepared, gpt_cfg.hidden_size, execution_control, false);
     }
     return qwen2vl_vision.encodePreparedImageTokens(cb, allocator, gpt_cfg, prep_cfg, prepared);
 }
@@ -558,7 +570,13 @@ fn runVisionSession(
     prepared: qwen2vl.PreparedImage,
     expected_hidden_size: u32,
     execution_control: ?InferenceExecutionControl,
+    comptime take_pixels: bool,
 ) ![]f32 {
+    var owns_pixels = take_pixels;
+    defer if (owns_pixels) {
+        var owned = prepared;
+        owned.deinit();
+    };
     const input_info = vision_session.inputInfo();
     var needs_grid = false;
     for (input_info) |info| {
@@ -566,7 +584,11 @@ fn runVisionSession(
     }
 
     const pixel_shape = [_]i64{ 1, 3, @intCast(prepared.resized_height), @intCast(prepared.resized_width) };
-    var pixel_tensor = try Tensor.initFloat32(allocator, "pixel_values", &pixel_shape, prepared.pixel_values);
+    var pixel_tensor = if (take_pixels)
+        try Tensor.initFloat32Owned(prepared.allocator, "pixel_values", &pixel_shape, prepared.pixel_values)
+    else
+        try Tensor.initFloat32(allocator, "pixel_values", &pixel_shape, prepared.pixel_values);
+    owns_pixels = false;
     defer pixel_tensor.deinit();
 
     var grid_tensor: ?Tensor = null;
@@ -1318,7 +1340,13 @@ const DocumentProducerOomFixture = struct {
         return .native;
     }
     fn close(_: *anyopaque) void {}
-    fn vision(_: *anyopaque, _: []const Tensor, a: std.mem.Allocator) ![]Tensor {
+    const VisionContext = struct { expected_pixels: ?[]const f32 = null };
+
+    fn vision(raw: *anyopaque, inputs: []const Tensor, a: std.mem.Allocator) ![]Tensor {
+        const ctx: *const VisionContext = @ptrCast(@alignCast(raw));
+        if (ctx.expected_pixels) |expected| {
+            try std.testing.expectEqual(@intFromPtr(expected.ptr), @intFromPtr(inputs[0].data.ptr));
+        }
         const values = [_]f32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 };
         const outputs = try a.alloc(Tensor, 1);
         errdefer a.free(outputs);
@@ -1337,7 +1365,7 @@ const DocumentProducerOomFixture = struct {
         var table = token.vtable.*;
         table.encode = encode;
         token.vtable = &table;
-        var context: u8 = 0;
+        var context: VisionContext = .{};
         const imported = backends.Session{ .ptr = &context, .vtable = &.{ .run = vision, .inputInfo = info, .outputInfo = info, .backend = backend, .close = close } };
         var config = ResidentDocumentFixture.config();
         config.vision_embed_dim = 4;
@@ -1345,6 +1373,11 @@ const DocumentProducerOomFixture = struct {
         config.vision_num_attention_heads = 1;
         const prep = qwen2vl.PreprocessorConfig{ .min_pixels = 16, .max_pixels = 16, .patch_size = 2, .merge_size = 1, .temporal_patch_size = 1 };
         const query = EncodedSequence{ .allocator = a, .input_ids = @constCast(&[_]i32{1}), .attention_mask = @constCast(&[_]i32{1}), .hidden_states = @constCast(&[_]f32{ 1, 2, 3 }), .hidden_size = 3 };
+        const owned = try qwen2vl.prepareImage(a, &png_1x1, prep);
+        context.expected_pixels = owned.pixel_values;
+        const projected = try runVisionSession(a, imported, owned, config.hidden_size, null, true);
+        a.free(projected);
+        context.expected_pixels = null;
         const score = try scoreDocument(&cb, a, imported, token, .{}, config, prep, query, "doc", &.{ &png_1x1, &png_1x1 }, 12, false, null);
         try std.testing.expect(std.math.isFinite(score));
         // The canonical Native branch reaches its real patch-weight lookup
@@ -1440,7 +1473,10 @@ const StreamingDocumentFixture = struct {
         defer a.free(held);
         // Independent original produce-all/assembly path, not another invocation
         // of the streaming helper. Partial runs consume 2/4 and 1/4 image rows.
-        const one = try qwen2vl_vision.encodePreparedImageTokensTensor(reference, a, cfg, prep, first);
+        var owned_first = first;
+        owned_first.allocator = a;
+        owned_first.pixel_values = try a.dupe(f32, first.pixel_values);
+        const one = try qwen2vl_vision.encodeOwnedPreparedImageTokensTensor(reference, a, cfg, prep, owned_first);
         defer reference.free(one);
         const two = try qwen2vl_vision.encodePreparedImageTokensTensor(reference, a, cfg, prep, second);
         defer reference.free(two);

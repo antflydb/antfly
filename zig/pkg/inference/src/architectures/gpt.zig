@@ -3848,7 +3848,7 @@ pub fn forwardFinalHiddenWithSharedKvOutputAndFinalNorm(
     if (!is_freestanding and prefillTraceEnabled() and decode_context != null and decode_context.?.attention_mode == .paged_prefill) {
         debugPrint("prefill-trace: gpt final norm start\n", .{});
     }
-    const final_hidden = if (final_norm) try applyFinalNorm(cb, allocator, config, hidden) else hidden;
+    const final_hidden = if (final_norm) try applyFinalNormInternal(cb, allocator, config, hidden, null, trace_sink == null and decode_context != null and decode_context.?.prepared_lighton_decode) else hidden;
     if (reserved_hidden) |*carrier| {
         carrier.deinit(cb, false);
         reserved_hidden = null;
@@ -6878,7 +6878,7 @@ fn decoderBlockImpl(
             false;
         const attn_out = try qwen35LinearAttentionWithResidual(cb, allocator, config, normed, batch, query_seq_len, layer, decode_context, &name_buf, if (fuse_residual) hidden else null);
         defer if (!fuse_residual) freeTensorWithCleanup(cb, attn_out, raw_overrides.cleanup);
-        const attn_res = if (fuse_residual) attn_out else try cb.residualAdd(attn_out, hidden);
+        const attn_res = if (fuse_residual) attn_out else try layerAttentionResidual(cb, attn_out, hidden);
         errdefer freeTensorWithCleanup(cb, attn_res, raw_overrides.cleanup);
 
         compute_region_scope.deinit();
@@ -6896,7 +6896,7 @@ fn decoderBlockImpl(
         defer freeTensorWithCleanup(cb, ffn_out, raw_overrides.cleanup);
         debug_timing_stats.ffn_nanos += @intCast(monotonicNowNs() - ffn_started_at);
 
-        const result = try cb.residualAdd(ffn_out, attn_res);
+        const result = try layerFfnResidual(cb, ffn_out, attn_res);
         freeTensorWithCleanup(cb, attn_res, raw_overrides.cleanup);
         try dumpLayerLastRowStats(cb, allocator, layer, result, hidden_size);
         return result;
@@ -7220,6 +7220,12 @@ fn decoderBlockImpl(
             q_projected_owned = false;
             break :transfer_q .{ q_projected, null };
         } else split_q: {
+            if (comptime build_options.enable_cuda) {
+                if (cb.kind() == .cuda and config.hasQwen35VisionArchitectureContract()) {
+                    if (try @import("../ops/cuda/cuda_compute.zig").tryCapturedSplitQueryGate(cb, q_projected, total, num_heads, head_dim)) |assigned|
+                        break :split_q .{ assigned[0], assigned[1] };
+                }
+            }
             const split = try cb.splitPerHeadGate(q_projected, total, num_heads, head_dim);
             break :split_q .{ split.query, split.gate };
         };
@@ -7523,6 +7529,9 @@ fn decoderBlockImpl(
         try maybeDumpGatedLayerStageStats(cb, allocator, layer, "attn-raw", attn_out, num_heads * head_dim);
         const gated_attn_out = if (q_gate) |gate| blk_gate: {
             try maybeDumpGatedLayerStageStats(cb, allocator, layer, "gate", gate, num_heads * head_dim);
+            if (comptime build_options.enable_cuda) {
+                if (try @import("../ops/cuda/cuda_compute.zig").tryCapturedAttentionGate(cb, attn_out, gate, projected.gate_sigmoid)) break :blk_gate attn_out;
+            }
             const sigmoid_gate = if (projected.gate_sigmoid) gate else try cb.sigmoid(gate);
             defer if (sigmoid_gate != gate) freeTensorWithCleanup(cb, sigmoid_gate, raw_overrides.cleanup);
             break :blk_gate try cb.multiply(attn_out, sigmoid_gate);
@@ -7792,7 +7801,7 @@ fn decoderBlockImpl(
         }
 
         // Residual
-        break :blk try cb.residualAdd(proj, hidden);
+        break :blk try layerAttentionResidual(cb, proj, hidden);
     };
     var attn_res_owned = true;
     errdefer if (attn_res_owned) freeTensorWithCleanup(cb, attn_res, raw_overrides.cleanup);
@@ -7953,7 +7962,7 @@ fn decoderBlockImpl(
     const result = if (ffn_out_includes_residual) blk: {
         free_ffn_out = false;
         break :blk ffn_out;
-    } else try cb.residualAdd(ffn_out, attn_res);
+    } else try layerFfnResidual(cb, ffn_out, attn_res);
     errdefer freeTensorWithCleanup(cb, result, raw_overrides.cleanup);
     freeTensorWithCleanup(cb, attn_res, raw_overrides.cleanup);
     attn_res_owned = false;
@@ -8105,9 +8114,9 @@ fn tryLightOnAttentionInputs(
         else => return err,
     };
     defer cb.free(k_base);
-    const qw = try maybeAdjustNormWeight(cb, allocator, config, q_base, head_dim);
+    const qw = try adjustDecoderNormWeight(cb, allocator, config, q_base, head_dim, .query);
     defer if (qw != q_base) cb.free(qw);
-    const kw = try maybeAdjustNormWeight(cb, allocator, config, k_base, head_dim);
+    const kw = try adjustDecoderNormWeight(cb, allocator, config, k_base, head_dim, .key);
     defer if (kw != k_base) cb.free(kw);
     return cuda.lightOnAttentionInputs(cb, query_gate, key, qw, kw, positions, rows, heads, kv_heads);
 }
@@ -8152,7 +8161,7 @@ fn maybeApplyQKHeadNormWithCleanup(
         else => return err,
     };
     defer freeTensorWithCleanup(cb, base_weight, cleanup);
-    const adjusted_weight = try maybeAdjustNormWeight(cb, allocator, config, base_weight, head_dim);
+    const adjusted_weight = try adjustDecoderNormWeight(cb, allocator, config, base_weight, head_dim, if (std.mem.eql(u8, proj, "q")) .query else .key);
     defer if (adjusted_weight != base_weight) freeTensorWithCleanup(cb, adjusted_weight, cleanup);
 
     const num_heads_for_norm = total_dim / head_dim;
@@ -8209,7 +8218,7 @@ pub fn maybeApplyQKHeadNormRope(
         else => return err,
     };
     defer cb.free(base_weight);
-    const adjusted_weight = try maybeAdjustNormWeight(cb, allocator, config, base_weight, head_dim);
+    const adjusted_weight = try adjustDecoderNormWeight(cb, allocator, config, base_weight, head_dim, if (std.mem.eql(u8, proj, "q")) .query else .key);
     defer if (adjusted_weight != base_weight) cb.free(adjusted_weight);
 
     return try cb.rmsNormHeadsRope(
@@ -8309,6 +8318,15 @@ pub fn lookupScaledTokenEmbeddingsTensor(
     if (try cb.embeddingLookupTensorScaled(embed_w, input_token, total, hidden_size, scale)) |scaled| return scaled;
     const embedded = (try cb.embeddingLookupTensor(embed_w, input_token, total, hidden_size)) orelse return null;
     return try maybeScaleTokenEmbeddings(cb, allocator, config, embedded, total, hidden_size);
+}
+
+fn adjustDecoderNormWeight(cb: *const ComputeBackend, allocator: std.mem.Allocator, config: Config, weight: CT, dim: usize, kind: @import("../ops/cuda/bounded_decode_graph.zig").Module.NormWeight) !CT {
+    if (comptime build_options.enable_cuda) {
+        if (config.hasQwen35VisionArchitectureContract() and !std.math.approxEqAbs(f32, config.norm_weight_offset, 0, 1e-6)) {
+            if (try @import("../ops/cuda/cuda_compute.zig").tryCapturedAdjustedNormWeight(cb, weight, dim, config.norm_weight_offset, kind)) |assigned| return assigned;
+        }
+    }
+    return maybeAdjustNormWeight(cb, allocator, config, weight, dim);
 }
 
 pub fn maybeAdjustNormWeight(
@@ -9032,11 +9050,19 @@ fn qwen35OutputProjection(cb: *const ComputeBackend, core: CT, weight: CT, resid
         if (comptime build_options.enable_cuda) {
             if (try @import("../ops/cuda/cuda_compute.zig").CudaCompute.lightOnProjectionResidual(cb, core, weight, prior, rows, in_dim, hidden)) |fused| return fused;
         }
-        const projected = try cb.linearNoBias(core, weight, rows, in_dim, hidden);
+        const projected = try layerAttentionProjection(cb, core, weight, rows, in_dim, hidden);
         defer cb.free(projected);
-        return cb.residualAdd(projected, prior);
+        return layerAttentionResidual(cb, projected, prior);
     }
-    return cb.linearNoBias(core, weight, rows, in_dim, hidden);
+    return layerAttentionProjection(cb, core, weight, rows, in_dim, hidden);
+}
+
+fn recurrentInputProjection(cb: *const ComputeBackend, input: CT, weight: CT, rows: usize, hidden: usize, width: usize, kind: @import("../ops/cuda/bounded_decode_graph.zig").Module.RecurrentProjection) !CT {
+    if (comptime build_options.enable_cuda) {
+        const cuda = @import("../ops/cuda/cuda_compute.zig");
+        if (try cuda.tryCapturedInputProjection(cb, input, weight, rows, hidden, width, .{ .recurrent = kind })) |result| return result;
+    }
+    return cb.linearNoBias(input, weight, rows, hidden, width);
 }
 
 fn qwen35LinearAttentionWithResidual(
@@ -9108,25 +9134,25 @@ fn qwen35LinearAttentionWithResidual(
         break :fused null;
     };
     defer if (fused_projections) |projections| for (projections) |projection| cb.free(projection);
-    const mixed = if (fused_projections) |projections| projections[0] else try cb.linearNoBias(input, mixed_w, total, hidden_size, conv_dim);
+    const mixed = if (fused_projections) |projections| projections[0] else try recurrentInputProjection(cb, input, mixed_w, total, hidden_size, conv_dim, .mixed);
     defer if (fused_projections == null) cb.free(mixed);
 
     const z_w_name = std.fmt.bufPrint(name_buf, "model.layers.{d}.linear_attn.in_proj_z.weight", .{layer}) catch return error.NameTooLong;
     const z_w = try getModelWeight(cb, config, z_w_name);
     defer cb.free(z_w);
-    const z = if (fused_projections) |projections| projections[1] else try cb.linearNoBias(input, z_w, total, hidden_size, value_dim);
+    const z = if (fused_projections) |projections| projections[1] else try recurrentInputProjection(cb, input, z_w, total, hidden_size, value_dim, .gate);
     defer if (fused_projections == null) cb.free(z);
 
     const b_w_name = std.fmt.bufPrint(name_buf, "model.layers.{d}.linear_attn.in_proj_b.weight", .{layer}) catch return error.NameTooLong;
     const b_w = try getModelWeight(cb, config, b_w_name);
     defer cb.free(b_w);
-    const beta_proj = if (fused_projections) |projections| projections[2] else try cb.linearNoBias(input, b_w, total, hidden_size, value_heads);
+    const beta_proj = if (fused_projections) |projections| projections[2] else try recurrentInputProjection(cb, input, b_w, total, hidden_size, value_heads, .beta);
     defer if (fused_projections == null) cb.free(beta_proj);
 
     const a_w_name = std.fmt.bufPrint(name_buf, "model.layers.{d}.linear_attn.in_proj_a.weight", .{layer}) catch return error.NameTooLong;
     const a_w = try getModelWeight(cb, config, a_w_name);
     defer cb.free(a_w);
-    const a_proj = if (fused_projections) |projections| projections[3] else try cb.linearNoBias(input, a_w, total, hidden_size, value_heads);
+    const a_proj = if (fused_projections) |projections| projections[3] else try recurrentInputProjection(cb, input, a_w, total, hidden_size, value_heads, .decay);
     defer if (fused_projections == null) cb.free(a_proj);
 
     if (comptime build_options.enable_metal) {
@@ -10484,7 +10510,11 @@ fn runPackedQwenAttention(
     const a = std.heap.page_allocator;
     const width = num_heads * head_dim;
     const kv_width = num_kv_heads * head_dim;
-    const result = (try cb.allocUninitF32Shape(&.{ @intCast(total), @intCast(width) })) orelse return error.UnsupportedTensorType;
+    const assigned_output = if (cb.kind() == .cuda and !sink.hasMetadata())
+        try @import("../ops/cuda/cuda_compute.zig").tryCapturedPackedAttentionOutput(cb, total, width)
+    else
+        null;
+    const result = assigned_output orelse (try cb.allocUninitF32Shape(&.{ @intCast(total), @intCast(width) })) orelse return error.UnsupportedTensorType;
     errdefer cb.free(result);
     var offset: usize = 0;
     var index: usize = 0;
@@ -10497,12 +10527,6 @@ fn runPackedQwenAttention(
             while ((cb.kind() != .cuda or count < max_cuda_packet_rows) and index + count < lengths.len and lengths[index + count] == 1 and views[index + count].per_item_mode == .paged_decode) : (count += 1) {}
         }
         const rows = if (count > 1) count else len;
-        const q = try cb.sliceRows2D(a, Q, offset, rows, width);
-        defer cb.free(q);
-        const k = try cb.sliceRows2D(a, K, offset, rows, kv_width);
-        defer cb.free(k);
-        const v = try cb.sliceRows2D(a, V, offset, rows, kv_width);
-        defer cb.free(v);
         var item = attention;
         if (count > 1) {
             // Every query is one token, so this contiguous subrange has the
@@ -10532,8 +10556,15 @@ fn runPackedQwenAttention(
             item.kv_position_offset = view.per_item_kv_position_offset.?;
         }
         const assigned = cb.kind() == .cuda and count > 1 and !sink.hasMetadata() and
-            try @import("../ops/cuda/cuda_compute.zig").tryCapturedPackedAttentionInto(cb, q, k, v, item, num_heads, num_kv_heads, head_dim, result, offset);
+            try @import("../ops/cuda/cuda_compute.zig").tryCapturedPackedAttentionInto(cb, Q, K, V, item, num_heads, num_kv_heads, head_dim, result, offset);
         if (!assigned) {
+            if (assigned_output != null) return error.InvalidExecutionPlan;
+            const q = try cb.sliceRows2D(a, Q, offset, rows, width);
+            defer cb.free(q);
+            const k = try cb.sliceRows2D(a, K, offset, rows, kv_width);
+            defer cb.free(k);
+            const v = try cb.sliceRows2D(a, V, offset, rows, kv_width);
+            defer cb.free(v);
             const output = try runPreparedAttentionWithSinkMetadata(cb, q, k, v, item, sink, count, num_heads, num_kv_heads, head_dim);
             defer cb.free(output);
             if (!try cb.copyRows2D(a, result, offset, output, 0, rows, width)) return error.UnsupportedTensorType;
@@ -12522,6 +12553,33 @@ fn runGroupedExpertBatchTensor(
 
 // --- Normalization helpers ---
 
+fn layerAttentionProjection(cb: *const ComputeBackend, input: CT, weight: CT, rows: usize, in_dim: usize, out_dim: usize) !CT {
+    if (comptime build_options.enable_cuda) {
+        if (cb.kind() == .cuda) {
+            if (try @import("../ops/cuda/cuda_compute.zig").tryCapturedAttentionOutputProjection(cb, input, weight, rows, in_dim, out_dim)) |assigned| return assigned;
+        }
+    }
+    return cb.linearNoBias(input, weight, rows, in_dim, out_dim);
+}
+
+fn layerAttentionResidual(cb: *const ComputeBackend, projected: CT, hidden: CT) !CT {
+    if (comptime build_options.enable_cuda) {
+        if (cb.kind() == .cuda) {
+            if (try @import("../ops/cuda/cuda_compute.zig").tryCapturedResidual(cb, projected, hidden, .attention)) |assigned| return assigned;
+        }
+    }
+    return cb.residualAdd(projected, hidden);
+}
+
+fn layerFfnResidual(cb: *const ComputeBackend, projected: CT, hidden: CT) !CT {
+    if (comptime build_options.enable_cuda) {
+        if (cb.kind() == .cuda) {
+            if (try @import("../ops/cuda/cuda_compute.zig").tryCapturedResidual(cb, projected, hidden, .layer_output)) |assigned| return assigned;
+        }
+    }
+    return cb.residualAdd(projected, hidden);
+}
+
 fn applyAttnNorm(cb: *const ComputeBackend, allocator: std.mem.Allocator, config: Config, hidden: CT, layer: usize, buf: *[256]u8) !CT {
     return applyNormAt(cb, allocator, config, hidden, layer, "attn", buf);
 }
@@ -12556,8 +12614,13 @@ fn applyNormAt(cb: *const ComputeBackend, allocator: std.mem.Allocator, config: 
             const name = std.fmt.bufPrint(buf, "model.layers.{d}.{s}", .{ layer, suffix }) catch return error.NameTooLong;
             const base_w = try getModelWeight(cb, config, name);
             defer cb.free(base_w);
-            const w = try maybeAdjustNormWeight(cb, allocator, config, base_w, dim);
+            const w = try adjustDecoderNormWeight(cb, allocator, config, base_w, dim, .hidden);
             defer if (w != base_w) cb.free(w);
+            if (comptime build_options.enable_cuda) {
+                if (config.hasQwen35VisionArchitectureContract() and cb.kind() == .cuda) {
+                    if (try @import("../ops/cuda/cuda_compute.zig").tryCapturedLayerNorm(cb, hidden, w, dim, config.norm_eps)) |assigned| return assigned;
+                }
+            }
             return cb.rmsNorm(hidden, w, dim, config.norm_eps);
         },
         .gpt2 => {
@@ -12633,6 +12696,17 @@ pub fn applyFinalNormWithCleanup(
     hidden: CT,
     cleanup: ?*const @import("../execution/cleanup_context.zig").Context,
 ) !CT {
+    return applyFinalNormInternal(cb, allocator, config, hidden, cleanup, false);
+}
+
+fn applyFinalNormInternal(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    hidden: CT,
+    cleanup: ?*const @import("../execution/cleanup_context.zig").Context,
+    reuse_graph_input: bool,
+) !CT {
     const dim = config.hidden_size;
     switch (config.family) {
         .deepseek_v4 => {
@@ -12648,8 +12722,13 @@ pub fn applyFinalNormWithCleanup(
         .llama, .mistral, .qwen2, .qwen3, .qwen3_vl, .qwen3_5, .gemma, .bitnet => {
             const base_w = try getModelWeight(cb, config, "model.norm.weight");
             defer freeTensorWithCleanup(cb, base_w, cleanup);
-            const w = try maybeAdjustNormWeight(cb, allocator, config, base_w, dim);
+            const w = try adjustDecoderNormWeight(cb, allocator, config, base_w, dim, .hidden);
             defer if (w != base_w) freeTensorWithCleanup(cb, w, cleanup);
+            if (comptime build_options.enable_cuda) {
+                if (reuse_graph_input and cb.kind() == .cuda) {
+                    if (try @import("../ops/cuda/cuda_compute.zig").tryCapturedFinalNorm(cb, hidden, w, dim, config.norm_eps)) |assigned| return assigned;
+                }
+            }
             const result = try cb.rmsNorm(hidden, w, dim, config.norm_eps);
             return result;
         },
@@ -13071,6 +13150,13 @@ fn attnProject(
             const name = std.fmt.bufPrint(buf, "model.layers.{d}.self_attn.{s}_proj.weight", .{ layer, proj }) catch return error.NameTooLong;
             const w = try getModelWeight(cb, config, name);
             defer cb.free(w);
+            if (comptime build_options.enable_cuda) {
+                if (config.hasQwen35VisionArchitectureContract() and cb.kind() == .cuda) {
+                    const projection: @import("../ops/cuda/bounded_decode_graph.zig").Module.AttentionProjection =
+                        if (std.mem.eql(u8, proj, "q")) .query else if (std.mem.eql(u8, proj, "k")) .key else .value;
+                    if (try @import("../ops/cuda/cuda_compute.zig").tryCapturedInputProjection(cb, input, w, total, in_dim, out_dim, .{ .attention = projection })) |assigned| return assigned;
+                }
+            }
             return cb.linearNoBias(input, w, total, in_dim, out_dim);
         },
         .gpt2 => {
@@ -13243,8 +13329,8 @@ fn attnOutputProject(
             const name = std.fmt.bufPrint(buf, "model.layers.{d}.self_attn.o_proj.weight", .{layer}) catch return error.NameTooLong;
             const w = try getModelWeight(cb, config, name);
             defer cb.free(w);
-            const projected = try cb.linearNoBias(input, w, total, in_dim, out_dim);
-            return projected;
+            if (config.hasQwen35VisionArchitectureContract()) return layerAttentionProjection(cb, input, w, total, in_dim, out_dim);
+            return cb.linearNoBias(input, w, total, in_dim, out_dim);
         },
         .gpt2 => {
             const w_name = std.fmt.bufPrint(buf, "h.{d}.attn.c_proj.weight", .{layer}) catch return error.NameTooLong;

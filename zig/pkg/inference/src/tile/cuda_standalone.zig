@@ -112,6 +112,7 @@ pub const gated_delta_entries = .{
     .ragged_recurrent_prefix_only = "lighton_ragged_recurrent_prefix_only",
     .ragged_prefix_gated_norm = "lighton_ragged_prefix_gated_norm",
     .decode_fused_p2 = "lighton_decode_fused_p2",
+    .decode_fused_p2_device_pages = "antfly_gdn_decode_p2_device_pages",
 };
 pub const gated_delta = nativeProfile("gated_delta", "lighton_recurrent.ptx", "gated_delta_recurrent.cu", 75, gated_delta_entries, &.{ "--fmad=false", "-std=c++17" });
 pub const vision_projection_bf16_entries = .{

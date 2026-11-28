@@ -15,7 +15,6 @@
 
 const std = @import("std");
 const platform = @import("antfly_platform");
-const c_file = @import("../util/c_file.zig");
 const image = @import("image.zig");
 const gpt_arch = @import("../architectures/gpt.zig");
 const gpt_mod = @import("../models/gpt.zig");
@@ -158,83 +157,8 @@ pub fn appendSliceInto(ids: []i32, mask: []i32, start: usize, limit: usize, valu
     return pos;
 }
 
-pub fn loadPreprocessorConfig(allocator: std.mem.Allocator, model_dir: []const u8) !PreprocessorConfig {
-    if (c_file.readFileFromDir(allocator, model_dir, "preprocessor_config.json")) |bytes| {
-        defer allocator.free(bytes);
-        return parsePreprocessorConfig(allocator, bytes);
-    } else |_| {}
-
-    const bytes = try c_file.readFileFromDir(allocator, model_dir, "processor_config.json");
-    defer allocator.free(bytes);
-    return parsePreprocessorConfig(allocator, bytes);
-}
-
-pub fn parsePreprocessorConfig(allocator: std.mem.Allocator, json_bytes: []const u8) !PreprocessorConfig {
-    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json_bytes, .{});
-    defer parsed.deinit();
-    if (parsed.value != .object) return error.InvalidPreprocessorConfig;
-    const root = parsed.value.object;
-    const obj = blk: {
-        if (root.get("image_processor")) |value| {
-            if (value == .object) break :blk value.object;
-        }
-        break :blk root;
-    };
-
-    var config = PreprocessorConfig{};
-    if (obj.get("resample")) |value| {
-        if (value != .integer) return error.UnsupportedQwen2VlPreprocessorConfig;
-        const code = std.math.cast(u8, value.integer) orelse return error.UnsupportedQwen2VlPreprocessorConfig;
-        config.resample = std.enums.fromInt(qwen2vl_types.ImageResample, code) orelse return error.UnsupportedQwen2VlPreprocessorConfig;
-    }
-    if (obj.get("do_resize")) |v| {
-        if (jsonBool(v)) |value| config.do_resize = value;
-    }
-    if (obj.get("do_rescale")) |v| {
-        if (jsonBool(v)) |value| config.do_rescale = value;
-    }
-    if (obj.get("do_normalize")) |v| {
-        if (jsonBool(v)) |value| config.do_normalize = value;
-    }
-    if (obj.get("do_convert_rgb")) |v| {
-        if (jsonBool(v)) |value| config.do_convert_rgb = value;
-    }
-    if (obj.get("rescale_factor")) |v| {
-        if (jsonF32(v)) |value| config.rescale_factor = value;
-    }
-    if (obj.get("min_pixels")) |v| {
-        if (jsonU32(v)) |value| config.min_pixels = value;
-    }
-    if (obj.get("max_pixels")) |v| {
-        if (jsonU32(v)) |value| config.max_pixels = value;
-    }
-    if (obj.get("size")) |v| {
-        if (v == .object) {
-            if (v.object.get("shortest_edge")) |edge| {
-                if (jsonU32(edge)) |value| config.min_pixels = value;
-            }
-            if (v.object.get("longest_edge")) |edge| {
-                if (jsonU32(edge)) |value| config.max_pixels = value;
-            }
-        }
-    }
-    if (obj.get("patch_size")) |v| {
-        if (jsonU32(v)) |value| config.patch_size = value;
-    }
-    if (obj.get("temporal_patch_size")) |v| {
-        if (jsonU32(v)) |value| config.temporal_patch_size = value;
-    }
-    if (obj.get("merge_size")) |v| {
-        if (jsonU32(v)) |value| config.merge_size = value;
-    }
-    if (obj.get("image_mean")) |v| {
-        if (parseRgbTriple(v)) |value| config.image_mean = value;
-    }
-    if (obj.get("image_std")) |v| {
-        if (parseRgbTriple(v)) |value| config.image_std = value;
-    }
-    return config;
-}
+pub const loadPreprocessorConfig = qwen2vl_types.loadPreprocessorConfig;
+pub const parsePreprocessorConfig = qwen2vl_types.parsePreprocessorConfig;
 
 pub const ImageGeometry = struct {
     resized_width: u32,
@@ -277,21 +201,37 @@ pub fn imageGeometryForEncoded(bytes: []const u8, config: PreprocessorConfig) !I
     return imageGeometry(info.width, info.height, config);
 }
 
+pub const ImageAdmission = struct {
+    visual_tokens: usize = 0,
+    host_working_bytes: usize = 0,
+};
+
 /// Initial preparation forecast. Earlier normalized images remain live during
 /// the current decode/resize. Executors must use admitted allocation ownership:
 /// codec scratch and allocator bookkeeping may exceed this geometry forecast.
-pub fn imageWorkingBytes(images: []const []const u8, config: PreprocessorConfig) !usize {
+pub fn imageAdmission(images: []const []const u8, config: PreprocessorConfig) !ImageAdmission {
     var retained: usize = 0;
-    var peak: usize = 0;
+    var admission: ImageAdmission = .{};
     for (images) |bytes| {
         const info = try image.inspectEncodedForInference(bytes, null);
         const geometry = try imageGeometry(info.width, info.height, config);
-        const preprocess = try @import("antfly_image").processing.preprocessingWorkingBytes(info.width, info.height, geometry.resized_width, geometry.resized_height, imageResample(config));
         const decode = try image.sourceDecodeWorkingBytes(info.width, info.height);
-        peak = @max(peak, try std.math.add(usize, retained, try std.math.add(usize, decode, preprocess)));
-        retained = try std.math.add(usize, retained, try std.math.mul(usize, try std.math.mul(usize, geometry.resized_width, geometry.resized_height), 12));
+        // Decode returns dense RGB after releasing its codec workspace.
+        const source_pixels = try std.math.mul(usize, info.width, info.height);
+        const source_rgb = try std.math.mul(usize, source_pixels, 3);
+        const preprocess = try @import("antfly_image").processing.preprocessingWorkingBytes(info.width, info.height, geometry.resized_width, geometry.resized_height, imageResample(config));
+        const working = @max(decode, try std.math.add(usize, source_rgb, preprocess));
+        admission.visual_tokens = try std.math.add(usize, admission.visual_tokens, geometry.image_token_count);
+        admission.host_working_bytes = @max(admission.host_working_bytes, try std.math.add(usize, retained, working));
+        const output_pixels = try std.math.mul(usize, geometry.resized_width, geometry.resized_height);
+        const output_bytes = try std.math.mul(usize, output_pixels, 3 * @sizeOf(f32));
+        retained = try std.math.add(usize, retained, output_bytes);
     }
-    return peak;
+    return admission;
+}
+
+pub fn imageWorkingBytes(images: []const []const u8, config: PreprocessorConfig) !usize {
+    return (try imageAdmission(images, config)).host_working_bytes;
 }
 
 pub fn prepareImage(allocator: std.mem.Allocator, image_bytes: []const u8, config: PreprocessorConfig) !PreparedImage {
@@ -354,8 +294,9 @@ pub fn prepareExpandedPromptEmbeddings(
     var prepared_images = try allocator.alloc(PreparedImage, images.len);
     defer allocator.free(prepared_images);
     var prepared_count: usize = 0;
+    var consumed_count: usize = 0;
     defer {
-        for (prepared_images[0..prepared_count]) |*prepared| prepared.deinit();
+        for (prepared_images[consumed_count..prepared_count]) |*prepared| prepared.deinit();
     }
     for (images, 0..) |image_bytes, idx| {
         debugQwenVlStage("prepare image {d} bytes={d}", .{ idx, image_bytes.len });
@@ -381,7 +322,8 @@ pub fn prepareExpandedPromptEmbeddings(
     defer composition.deinit();
     for (prepared_images, 0..) |prepared, idx| {
         debugQwenVlStage("encode projected image {d}", .{idx});
-        const projected = try qwen2vl_vision.encodePreparedImageTokensTensor(cb, allocator, config, prep_cfg, prepared);
+        consumed_count += 1;
+        const projected = try qwen2vl_vision.encodeOwnedPreparedImageTokensTensor(cb, allocator, config, prep_cfg, prepared);
         defer cb.free(projected);
         const shape = try cb.tensorShape(projected, allocator);
         defer allocator.free(shape);
@@ -483,22 +425,6 @@ pub fn smartResize(width: u32, height: u32, config: PreprocessorConfig) !ResizeD
     return .{ .width = target_w, .height = target_h };
 }
 
-/// Exact upper bound for admission before image dimensions are known.
-pub fn maxImageTokenCount(config: PreprocessorConfig) !usize {
-    if (config.patch_size == 0 or config.merge_size == 0 or
-        config.max_pixels == 0 or config.min_pixels > config.max_pixels)
-    {
-        return error.InvalidPreprocessorConfig;
-    }
-    const factor = std.math.mul(usize, config.patch_size, config.merge_size) catch
-        return error.InvalidPreprocessorConfig;
-    const pixels_per_token = std.math.mul(usize, factor, factor) catch
-        return error.InvalidPreprocessorConfig;
-    const token_count = config.max_pixels / pixels_per_token;
-    if (token_count == 0) return error.InvalidPreprocessorConfig;
-    return token_count;
-}
-
 fn alignNearest(value: u32, factor: u32) u32 {
     const rounded = ((@as(u64, value) + factor / 2) / factor) * factor;
     const max_aligned = (std.math.maxInt(u32) / factor) * factor;
@@ -507,39 +433,6 @@ fn alignNearest(value: u32, factor: u32) u32 {
 
 fn alignFloor(value: u32, factor: u32) u32 {
     return @max(factor, (value / factor) * factor);
-}
-
-fn parseRgbTriple(v: std.json.Value) ?[3]f32 {
-    if (v != .array or v.array.items.len != 3) return null;
-    var result: [3]f32 = undefined;
-    for (v.array.items, 0..) |item, idx| {
-        result[idx] = switch (item) {
-            .float => |f| @floatCast(f),
-            .integer => |i| @floatFromInt(i),
-            else => return null,
-        };
-    }
-    return result;
-}
-
-fn jsonBool(v: std.json.Value) ?bool {
-    return switch (v) {
-        .bool => |b| b,
-        else => null,
-    };
-}
-fn jsonU32(v: std.json.Value) ?u32 {
-    return switch (v) {
-        .integer => |i| @intCast(i),
-        else => null,
-    };
-}
-fn jsonF32(v: std.json.Value) ?f32 {
-    return switch (v) {
-        .float => |f| @floatCast(f),
-        .integer => |i| @floatFromInt(i),
-        else => null,
-    };
 }
 
 test "parse qwen2vl preprocessor config" {
@@ -772,7 +665,7 @@ test "qwen admission image-token bound covers aligned preprocessing" {
         .patch_size = 14,
         .merge_size = 2,
     };
-    const bound = try maxImageTokenCount(cfg);
+    const bound = try qwen2vl_types.maxImageTokenCount(cfg);
     try std.testing.expectEqual(@as(usize, 1280), bound);
     for ([_][2]u32{ .{ 224, 448 }, .{ 4096, 4096 }, .{ 1, std.math.maxInt(u32) }, .{ std.math.maxInt(u32), 1 } }) |shape| {
         const dims = try smartResize(shape[0], shape[1], cfg);
@@ -782,7 +675,7 @@ test "qwen admission image-token bound covers aligned preprocessing" {
     }
     try std.testing.expectError(
         error.InvalidPreprocessorConfig,
-        maxImageTokenCount(.{ .min_pixels = 2, .max_pixels = 1 }),
+        qwen2vl_types.maxImageTokenCount(.{ .min_pixels = 2, .max_pixels = 1 }),
     );
 }
 
@@ -883,8 +776,12 @@ test "model processor resampling header-only geometry matches execution for ever
         try std.testing.expectEqual(geometry.resized_height, actual.resized_height);
         try std.testing.expectEqual(geometry.image_grid_thw, actual.image_grid_thw);
         try std.testing.expectEqual(geometry.image_token_count, actual.image_token_count);
-        const single = try imageWorkingBytes(&.{png}, config);
-        const pair = try imageWorkingBytes(&.{ png, png }, config);
-        try std.testing.expectEqual(single + actual.pixel_values.len * @sizeOf(f32), pair);
+        const single = try imageAdmission(&.{png[0..24]}, config);
+        const pair = try imageAdmission(&.{ png, png }, config);
+        const preprocess = try @import("antfly_image").processing.preprocessingWorkingBytes(2, 1, actual.resized_width, actual.resized_height, imageResample(config));
+        try std.testing.expectEqual(@as(usize, 6) + preprocess, single.host_working_bytes);
+        try std.testing.expectEqual(actual.image_token_count, single.visual_tokens);
+        try std.testing.expectEqual(actual.image_token_count * 2, pair.visual_tokens);
+        try std.testing.expectEqual(single.host_working_bytes + actual.pixel_values.len * @sizeOf(f32), pair.host_working_bytes);
     }
 }

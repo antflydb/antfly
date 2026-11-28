@@ -879,7 +879,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     var vision_publication: ?VisionPublication = null;
     defer if (comptime build_options.enable_cuda) if (vision_publication) |*publication| publication.deinit();
     if (comptime build_options.enable_cuda) if (generation_resources.resources) |*primary| {
-        const publication_bytes = if (backend_kind == .cuda and draft_model == null and config.qwen3vl_parity_json_path == null) generation.nativeCudaVisionPublicationBytes(allocator, opts.model_dir, gpt_config, &messages, @intCast(@max(config.max_tokens, 1)), 1) catch 0 else 0;
+        const publication_bytes = if (backend_kind == .cuda and draft_model == null and config.qwen3vl_parity_json_path == null) generation.nativeCudaVisionPublicationBytes(allocator, opts.model_dir, gpt_config, &messages, @intCast(@max(config.max_tokens, 1))) catch 0 else 0;
         vision_publication = try generation.prepareNativeVisionPublication(model.session, primary, publication_bytes, 1, budget_limits, .{});
     };
     var publication_cleanup: ?@import("execution/cleanup_owner.zig").Owner = if (vision_publication != null) try @import("execution/cleanup_owner.zig").Owner.beginAdmitted(model.session) else null;

@@ -373,8 +373,10 @@ pub const KernelScope = struct {
     native_program_bank: ?NativeProgramBank = null,
     metal_serial_workspace: ?SerialWorkspaceObservation = null,
     cuda_audio_workspace: ?CudaAudioWorkspace = null,
+    cuda_vendor_convolution: ?CudaVendorConvolution = null,
     cuda_decoder_workspace: ?CudaDecoderWorkspace = null,
     cuda_decoder_declines: ?CudaDecoderDeclines = null,
+    cuda_decoder_retirements: ?CudaDecoderRetirements = null,
     attached: bool = false,
     /// Must be called only after the owner reaches final address-stable storage.
     pub fn begin(self: *KernelScope) void {
@@ -435,7 +437,11 @@ pub const CudaAudio = struct {
     learning_output_mismatch: u64 = 0,
     learning_host_transfer: u64 = 0,
     learning_unsealed: u64 = 0,
+    learning_admission_declined: u64 = 0,
+    declaration_admission_declined: u64 = 0,
+    disabled_plan: u64 = 0,
     arena_unavailable: u64 = 0,
+    workspace_preflight_declined: u64 = 0,
     input_alias_declined: u64 = 0,
     capture_storage_declined: u64 = 0,
     capture_begin_declined: u64 = 0,
@@ -466,15 +472,25 @@ pub const CudaAudioWorkspace = struct {
     route: Route,
     plan_origin: @import("stream_workspace.zig").Origin,
     planned_events: usize,
+    /// Operation-local scratch declared inside a composite allocation recipe.
+    declared_operation_scratch_intervals: usize = 0,
     planned_arena_bytes: usize,
     /// Arena capacity saved by repacking the same scratch lifetimes with
     /// external publication. This excludes the separate output bank.
     repacked_scratch_savings_bytes: usize,
     bound_arena_bytes: usize,
     bound_input_bytes: usize,
+    /// Logical bytes copied or reused for the accepted graph launch.
+    /// Eager assigned execution borrows its caller inputs.
+    staged_inputs: ?AudioInputStaging = null,
     planned_terminal_bytes: usize,
     bound_terminal_bytes: usize,
     terminal_outside_arena: bool,
+};
+
+pub const AudioInputStaging = struct {
+    copied_bytes: usize = 0,
+    reused_bytes: usize = 0,
 };
 
 pub inline fn cudaAudioWorkspace(workspace: CudaAudioWorkspace) void {
@@ -486,9 +502,48 @@ pub inline fn cudaAudioWorkspace(workspace: CudaAudioWorkspace) void {
 /// Physical geometry for the last decoder burst that completed its receipt.
 /// Multiple bursts can share a diagnostic interval. Their workspace sizes
 /// describe stage backing and cannot be summed to obtain an invocation peak.
+/// Accepted host SDK calls, including capture recording. Graph replay and
+/// opaque vendor kernels do not increment these counters.
+pub const CudaVendorConvolution = struct {
+    forward_calls: u64 = 0,
+    bias_calls: u64 = 0,
+    max_explicit_workspace_bytes: usize = 0,
+    max_source_bank_bytes: usize = 0,
+
+    pub fn accumulate(self: *CudaVendorConvolution, delta: CudaVendorConvolution) void {
+        self.forward_calls +|= delta.forward_calls;
+        self.bias_calls +|= delta.bias_calls;
+        self.max_explicit_workspace_bytes = @max(self.max_explicit_workspace_bytes, delta.max_explicit_workspace_bytes);
+        self.max_source_bank_bytes = @max(self.max_source_bank_bytes, delta.max_source_bank_bytes);
+    }
+
+    pub inline fn record(workspace_bytes: usize, source_bytes: usize, bias: bool) void {
+        var active = active_kernels;
+        while (active) |scope| : (active = scope.previous) {
+            if (scope.cuda_vendor_convolution == null) scope.cuda_vendor_convolution = .{};
+            const totals = &scope.cuda_vendor_convolution.?;
+            if (bias) {
+                totals.bias_calls +|= 1;
+            } else {
+                totals.forward_calls +|= 1;
+                totals.max_explicit_workspace_bytes = @max(totals.max_explicit_workspace_bytes, workspace_bytes);
+                totals.max_source_bank_bytes = @max(totals.max_source_bank_bytes, source_bytes);
+            }
+        }
+    }
+};
+
 pub const CudaDecoderWorkspace = struct {
     completed_bursts: u64 = 1,
     eager_bursts: u64 = 0,
+    recorded_bursts: u64 = 0,
+    replayed_bursts: u64 = 0,
+    rebound_bursts: u64 = 0,
+    /// Host wall time through kernel submission or graph launch. Capture
+    /// instantiation is a subset, and readback includes device completion.
+    submit_host_ns: u64 = 0,
+    capture_instantiate_host_ns: u64 = 0,
+    readback_host_ns: u64 = 0,
     route: Route,
     plan_origin: ?@import("stream_workspace.zig").Origin,
     planned_events: usize,
@@ -500,6 +555,26 @@ pub const CudaDecoderWorkspace = struct {
     shared_layer_workspace_bytes: usize = 0,
     attention_scratch_bytes: usize,
     recurrent_scratch_bytes: usize = 0,
+    recurrent_page_table_bytes: usize = 0,
+    attention_page_table_bytes: usize = 0,
+    /// Each layer's output is live alongside that layer's scratch.
+    declared_attention_output_bytes: usize = 0,
+    declared_recurrent_output_bytes: usize = 0,
+    declared_recurrent_joined_projection_bytes: usize = 0,
+    /// Replay reports the bindings and dispatches saved by graph recording.
+    bound_recurrent_joined_projection_bytes: usize = 0,
+    attention_gates_in_place: usize = 0,
+    declared_ffn_scratch_bytes: usize = 0,
+    declared_ffn_output_bank_bytes: usize = 0,
+    declared_projection_staging_bytes: usize = 0,
+    declared_attention_residual_bytes: usize = 0,
+    declared_attention_inputs_bytes: usize = 0,
+    declared_attention_projection_bytes: [3]usize = @splat(0),
+    declared_norm_weight_bytes: usize = 0,
+    declared_layer_norm_bytes: usize = 0,
+    declared_layer_norm_mirror_bytes: usize = 0,
+    declared_final_norm_mirror_bytes: usize = 0,
+    declared_final_norm_mirror_offset: usize = 0,
     /// Bytes in the independently admitted bank. Arena-backed packets are
     /// already accounted for by bound_scratch_bytes.
     head_bytes: usize,
@@ -526,6 +601,14 @@ pub inline fn cudaDecoderWorkspace(workspace: CudaDecoderWorkspace) void {
             .recorded_and_launched, .replayed => 0,
         };
         scope.cuda_decoder_workspace.?.eager_bursts = (if (prior) |previous| previous.eager_bursts else 0) +| eager;
+        scope.cuda_decoder_workspace.?.recorded_bursts = (if (prior) |previous| previous.recorded_bursts else 0) +| @as(u64, @intFromBool(workspace.route == .recorded_and_launched));
+        scope.cuda_decoder_workspace.?.replayed_bursts = (if (prior) |previous| previous.replayed_bursts else 0) +| @as(u64, @intFromBool(workspace.route == .replayed));
+        if (prior) |previous| {
+            scope.cuda_decoder_workspace.?.rebound_bursts +|= previous.rebound_bursts;
+            scope.cuda_decoder_workspace.?.submit_host_ns +|= previous.submit_host_ns;
+            scope.cuda_decoder_workspace.?.capture_instantiate_host_ns +|= previous.capture_instantiate_host_ns;
+            scope.cuda_decoder_workspace.?.readback_host_ns +|= previous.readback_host_ns;
+        }
     }
 }
 
@@ -541,6 +624,7 @@ pub const CudaDecoderDeclines = struct {
     unstable_recurrent_state: u64 = 0,
     admission_or_revalidation: u64 = 0,
     workspace_admission: u64 = 0,
+    insufficient_replay_horizon: u64 = 0,
 
     pub const Reason = @import("std").meta.FieldEnum(CudaDecoderDeclines);
     pub const Counts = [@typeInfo(CudaDecoderDeclines).@"struct".field_names.len]u64;
@@ -556,6 +640,46 @@ noinline fn cudaDecoderDeclinedEnabled(reason: CudaDecoderDeclines.Reason) void 
         if (scope.cuda_decoder_declines == null) scope.cuda_decoder_declines = .{};
         switch (reason) {
             inline else => |tag| @field(scope.cuda_decoder_declines.?, @tagName(tag)) +|= 1,
+        }
+    }
+}
+
+/// Successful destruction of a previously bound decoder cohort.
+pub const CudaDecoderRetirements = struct {
+    before_recording: u64 = 0,
+    before_replay: u64 = 0,
+    after_replay: u64 = 0,
+    unavailable: u64 = 0,
+    last: Event,
+
+    pub const Reason = enum {
+        state_mutation,
+        reader_epoch,
+        foreground_step,
+        foreground_vision,
+        foreground_prefill,
+        page_state_cleanup,
+        mixed_prefill,
+        eager_decode,
+        binding_changed,
+        epoch_finished,
+    };
+    pub const Stage = enum { before_recording, before_replay, after_replay, unavailable };
+    pub const Event = struct { reason: Reason, stage: Stage, rows: usize };
+};
+
+pub inline fn cudaDecoderRetired(event: CudaDecoderRetirements.Event) void {
+    if (active_kernels != null) cudaDecoderRetiredEnabled(event);
+}
+
+noinline fn cudaDecoderRetiredEnabled(event: CudaDecoderRetirements.Event) void {
+    var active = active_kernels;
+    while (active) |scope| : (active = scope.previous) {
+        if (scope.cuda_decoder_retirements == null) scope.cuda_decoder_retirements = .{ .last = event };
+        const result = &scope.cuda_decoder_retirements.?;
+        result.last = event;
+        switch (event.stage) {
+            inline else => |stage| @field(result, @tagName(stage)) +|= 1,
         }
     }
 }
@@ -1378,7 +1502,57 @@ test "CUDA audio result observations preserve nested route counts and disabled s
         cudaAudioResult(.replayed);
         cudaAudioResult(.eager_assigned);
         cudaAudioResult(.capture_storage_declined);
-        try testing.expectEqualDeep(CudaAudio{ .replayed = 1, .eager_assigned = 1, .capture_storage_declined = 1 }, inner.snapshot().cuda_audio.?);
+        cudaAudioResult(.learning_admission_declined);
+        try testing.expectEqualDeep(CudaAudio{ .replayed = 1, .eager_assigned = 1, .capture_storage_declined = 1, .learning_admission_declined = 1 }, inner.snapshot().cuda_audio.?);
     }
-    try testing.expectEqualDeep(CudaAudio{ .warmed = 1, .learning_host_transfer = 1, .recorded_and_launched = 1, .replayed = 1, .eager_assigned = 1, .capture_storage_declined = 1 }, outer.snapshot().cuda_audio.?);
+    try testing.expectEqualDeep(CudaAudio{ .warmed = 1, .learning_host_transfer = 1, .recorded_and_launched = 1, .replayed = 1, .eager_assigned = 1, .capture_storage_declined = 1, .learning_admission_declined = 1 }, outer.snapshot().cuda_audio.?);
+}
+
+test "CUDA decoder burst timings accumulate across nested observations" {
+    const testing = @import("std").testing;
+    var outer = KernelScope{};
+    outer.begin();
+    defer _ = outer.finish();
+    const captured: CudaDecoderWorkspace = .{
+        .route = .recorded_and_launched,
+        .plan_origin = .observed,
+        .planned_events = 12,
+        .planned_scratch_bytes = 256,
+        .bound_scratch_bytes = 256,
+        .metadata_bytes = 256,
+        .attention_scratch_bytes = 0,
+        .head_bytes = 0,
+        .head_packet_rows = 2,
+        .head_in_stream_arena = false,
+        .readback_bytes = 44,
+        .readback_backing = .admitted_pinned,
+        .rows = 2,
+        .submit_host_ns = 800,
+        .capture_instantiate_host_ns = 600,
+        .readback_host_ns = 200,
+    };
+    cudaDecoderWorkspace(captured);
+    {
+        var inner = KernelScope{};
+        inner.begin();
+        defer _ = inner.finish();
+        var replayed = captured;
+        replayed.route = .replayed;
+        replayed.rebound_bursts = 1;
+        replayed.submit_host_ns = 20;
+        replayed.capture_instantiate_host_ns = 0;
+        replayed.readback_host_ns = 250;
+        cudaDecoderWorkspace(replayed);
+        replayed.replayed_bursts = 1;
+        try testing.expectEqualDeep(replayed, inner.cuda_decoder_workspace.?);
+    }
+    const total = outer.cuda_decoder_workspace.?;
+    try testing.expectEqual(CudaDecoderWorkspace.Route.replayed, total.route);
+    try testing.expectEqual(@as(u64, 2), total.completed_bursts);
+    try testing.expectEqual(@as(u64, 1), total.rebound_bursts);
+    try testing.expectEqual(@as(u64, 1), total.recorded_bursts);
+    try testing.expectEqual(@as(u64, 1), total.replayed_bursts);
+    try testing.expectEqual(@as(u64, 820), total.submit_host_ns);
+    try testing.expectEqual(@as(u64, 600), total.capture_instantiate_host_ns);
+    try testing.expectEqual(@as(u64, 450), total.readback_host_ns);
 }

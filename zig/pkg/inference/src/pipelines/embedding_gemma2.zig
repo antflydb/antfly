@@ -2088,7 +2088,8 @@ fn projectCohortParts(a: std.mem.Allocator, session: Session, cb: *const Compute
                 for (wave.audio[0..wave.count], audio[0..wave.count]) |*clip, *dest| dest.* = clip;
             }
             var projected = if (image) try projectPreparedImages(true, cb, a, wave.images[0..wave.count], scratch, base, control, options.timings, null, scheduler.retained, scheduler.lane.credit(), scheduler.lane) else try projector.encodePreparedEmbeddingGemma2AudioBatchResident(cb, a, audio[0..wave.count]);
-            defer projected.deinit();
+            var projection_owned = true;
+            defer if (projection_owned) projected.deinit() else projected.allocator.free(projected.tokens_per_image);
             if (@import("antfly_platform").env.getenvBool("ANTFLY_GEMMA4_GROUP_BROKER_TRACE")) std.debug.print("gemma4-group-tower kind={s} items={d}\n", .{ if (image) "image" else "audio", projected.max_batch_executed });
             var first: usize = 0;
             for (projected.tokens_per_image, wave.indexes[0..wave.count]) |tokens, slot| {
@@ -2106,12 +2107,22 @@ fn projectCohortParts(a: std.mem.Allocator, session: Session, cb: *const Compute
                     first += tokens;
                     continue;
                 }
-                const view = try cb.sliceRows2D(a, projected.embeddings, first, tokens, 512);
-                const escaped = if (cb.embedding_stage != null) StageLane.escapeCurrent(cb, view) catch |err| {
-                    cb.free(view);
-                    return err;
-                } else view;
-                if (cb.embedding_stage != null) cb.free(view);
+                const escaped = if (!image and wave.count == 1 and projected.output_ownership == .completed_fresh_destination) whole: {
+                    if (cb.embedding_stage != null) {
+                        if (cb.kind() == .cuda) {
+                            try scheduler.lane.prepareCudaInputHandoff(&projected.embeddings);
+                        } else {
+                            try scheduler.lane.retainProjectedOutput(&projected);
+                        }
+                    }
+                    projection_owned = false;
+                    break :whole projected.embeddings;
+                } else sliced: {
+                    const view = try cb.sliceRows2D(a, projected.embeddings, first, tokens, 512);
+                    if (cb.embedding_stage == null) break :sliced view;
+                    defer cb.free(view);
+                    break :sliced try StageLane.escapeCurrent(cb, view);
+                };
                 result.parts[ref.group][ref.part] = .{ .id = if (image) 258880 else 258881, .embeddings = &.{}, .tensor = escaped, .tokens = tokens };
                 first += tokens;
             }
@@ -3679,21 +3690,25 @@ fn boundedGroupPlanning(backend: @import("../backends/backends.zig").BackendType
 fn preparedVisionScratch(session: Session, images: []const projector.PreparedImage, limit: usize, control: Control) !usize {
     const backend = session.backend();
     const tower = if (boundedVision(backend)) try projector.embeddingGemma2PreparedPlanScratch(images) else try projector.embeddingGemma2PreparedScratch(images, limit);
-    // CPU/Metal retain their existing arithmetic and memory admission. CUDA's
-    // source pooling bank is live in addition to the already retained tower.
-    // Unknown custom cold receivers retain a conservative source-bank bound.
-    // Authenticated full-F32 receivers keep their original footprint exactly.
+    // CUDA source projections may pad tower rows and keep a separate pooling
+    // bank live. Use both bounds for receivers without an authenticated policy.
     var source_pool = backend == .cuda;
+    var source_padded = source_pool;
     if (comptime @import("build_options").enable_cuda) if (source_pool) {
         if (try @import("../backends/cold_compute_target.zig").Retained.acquire(session, control)) |value| {
             var retained = value;
             defer retained.deinit();
-            if (try @import("../ops/cuda/cuda_compute.zig").CudaCompute.sourceScalarStorageForTarget(retained.target, .linear)) |linear|
+            const CudaCompute = @import("../ops/cuda/cuda_compute.zig").CudaCompute;
+            if (try CudaCompute.sourceVisionGeometryForTarget(retained.target)) |geometry|
+                source_padded = geometry == .source_padded;
+            if (try CudaCompute.sourceScalarStorageForTarget(retained.target, .linear)) |linear|
                 source_pool = projector.embeddingGemma2SourcePoolSelected(.cuda, linear);
         }
     };
     const pool = try projector.embeddingGemma2SourcePoolScratch(images, source_pool);
-    return std.math.add(usize, tower, pool);
+    const source_tower = if (source_padded) try projector.embeddingGemma2SourceVisionScratch(images) else 0;
+    if (source_tower > limit) return error.ImageBatchBudgetExceeded;
+    return std.math.add(usize, @max(tower, source_tower), pool);
 }
 
 pub fn boundedVision(backend: @import("../backends/backends.zig").BackendType) bool {
@@ -5569,6 +5584,21 @@ test "embeddinggemma2 CUDA prepared mixed cohorts preserve singleton vectors and
         try std.testing.expectEqual(count, raw_count);
         try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(vector), std.mem.sliceAsBytes(raw_vector));
     }
+    // A single image needs the full padded CUDA source-row reservation.
+    const single_control = Control{ .native_call_policy = .in_process };
+    var single_errors: [1]?anyerror = @splat(null);
+    const single = try embedGroupCohort(a, session, hf.tokenizer(), groups[0..1], .{}, null, single_control, &single_errors);
+    defer {
+        for (single.vectors) |row| a.free(row);
+        a.free(single.vectors);
+        a.free(single.input_tokens);
+    }
+    try std.testing.expectEqual(@as(?anyerror, null), single_errors[0]);
+    const single_expected = try embed(a, session, hf.tokenizer(), groups[0], .{}, null, single_control);
+    defer a.free(single_expected.vector);
+    try std.testing.expectEqual(single_expected.input_tokens, single.input_tokens[0]);
+    try std.testing.expectEqualSlices(f32, single_expected.vector, single.vectors[0]);
+
     for (groups, actual.vectors, actual.input_tokens, errors) |group, vector, count, err| {
         try std.testing.expectEqual(@as(?anyerror, null), err);
         const expected = try embed(a, session, hf.tokenizer(), group, .{}, null, .{ .native_call_policy = .in_process });
@@ -6641,18 +6671,64 @@ test "embeddinggemma2 CUDA original grouped Stage output escrow preserves instru
     try std.testing.expectEqual(raw.vector.len, owned.vectors.values(0).len);
     for (raw.vector, owned.vectors.values(0)) |x, y| try std.testing.expectApproxEqAbs(x, y, 1e-3);
     try std.testing.expect(!probe.violation.load(.acquire) and scheduler.head == null);
-    // This is the actual prepared-audio public caller, separate from Content's
-    // singleton frontend above. Equal real clips naturally form a B2 cohort;
-    // repeated B2 runs cover any enabled warm/learned arena policy unchanged.
-    const clips = [_]@import("audio_preparation.zig").Clip{ .{ .bytes = audio }, .{ .bytes = audio } };
+    // Keep the real clip's format and vary both the lengths and samples.
+    // Length sorting must scatter embeddings back into the caller's order.
+    var decoded = try @import("audio.zig").decodeWav(a, audio);
+    defer decoded.deinit();
+    const reversed = try a.dupe(f32, decoded.samples);
+    defer a.free(reversed);
+    std.mem.reverse(f32, reversed);
+    const width = if (platform.env.getenv("ANTFLY_TEST_GROUPED_AUDIO_WIDTH")) |value|
+        try std.fmt.parseUnsigned(usize, value, 10)
+    else
+        2;
+    if (width < 2 or width > 4) return error.InvalidTestAudioWidth;
+    const Clip = @import("audio_preparation.zig").Clip;
+    var initial: [4]Clip = undefined;
+    var changed: [4]Clip = undefined;
+    for (0..width) |index| {
+        const length = decoded.samples.len - decoded.samples.len / 24 * index;
+        initial[index] = .{ .pcm = .{ .samples = decoded.samples[0..length], .sample_rate = decoded.sample_rate } };
+        changed[index] = .{ .pcm = .{ .samples = reversed[0..length], .sample_rate = decoded.sample_rate } };
+    }
+    const clips = initial[0..width];
     const AudioWitness = struct {
+        source_bf16: bool = false,
         owners: usize = 0,
         graphs: usize = 0,
         executions: u64 = 0,
         replays: u64 = 0,
+        declared_owners: usize = 0,
         max_planned_arena_bytes: usize = 0,
+        max_declared_operation_scratch_intervals: usize = 0,
         max_captured_arena_bytes: usize = 0,
         max_repacked_scratch_savings_bytes: usize = 0,
+        fn setGraphPolicy(actual: Session, supplied: Control, enabled: bool) !bool {
+            var waiter = Scheduler.Waiter{};
+            try actual.enterExecutionCohort(actual.execution_gate, supplied, &waiter);
+            defer actual.leaveExecutionCohort(actual.execution_gate, &waiter);
+            const target = (try actual.coldComputeTarget(supplied)) orelse return error.MissingActualCudaTarget;
+            if (target != .cuda) return error.MissingActualCudaTarget;
+            const cuda = @import("../ops/cuda/cuda_compute.zig");
+            const compute: *cuda.CudaCompute = @ptrCast(@alignCast(target.cuda.implementation_context));
+            const previous = compute.embedding_gemma2_policy.audio_graph;
+            compute.embedding_gemma2_policy.audio_graph = enabled;
+            return previous;
+        }
+        fn requireReplaySample(actual: Session, supplied: Control) !void {
+            var waiter = Scheduler.Waiter{};
+            try actual.enterExecutionCohort(actual.execution_gate, supplied, &waiter);
+            defer actual.leaveExecutionCohort(actual.execution_gate, &waiter);
+            const target = (try actual.coldComputeTarget(supplied)) orelse return error.MissingActualCudaTarget;
+            if (target != .cuda) return error.MissingActualCudaTarget;
+            const cuda = @import("../ops/cuda/cuda_compute.zig");
+            const compute: *cuda.CudaCompute = @ptrCast(@alignCast(target.cuda.implementation_context));
+            // Request the existing replay sampling route even when timing
+            // selected ordinary execution on this particular device.
+            for (&compute.embedding_gemma2_execution.arenas) |*arena| {
+                if (arena.kind == .audio and arena.graph != null) arena.replay_samples = 0;
+            }
+        }
         fn read(actual: Session, supplied: Control) !@This() {
             // Metadata only, under the SAME actual model cohort. Attest the
             // canonical full published CUDA table before inspecting its ctx;
@@ -6666,11 +6742,17 @@ test "embeddinggemma2 CUDA original grouped Stage output escrow preserves instru
             const cuda = @import("../ops/cuda/cuda_compute.zig");
             try cuda.CudaCompute.checkRequestCacheRetirement(&cb);
             const compute: *const cuda.CudaCompute = @ptrCast(@alignCast(cb.ptr));
-            var result = @This(){ .executions = compute.audio_arena_executes, .replays = compute.audio_graph_replays };
+            var result = @This(){
+                .source_bf16 = (try cb.sourceScalarStorage(.audio)) == .bf16,
+                .executions = compute.audio_arena_executes,
+                .replays = compute.audio_graph_replays,
+            };
             for (compute.audio_plans.entries) |entry| if (entry.owner != null and entry.owner.?.managed and !entry.disabled) {
                 result.owners += 1;
+                if (entry.owner.?.plan.origin == .declared) result.declared_owners += 1;
                 if (entry.owner.?.executable) |executable| {
                     result.max_planned_arena_bytes = @max(result.max_planned_arena_bytes, executable.storage.bytes);
+                    result.max_declared_operation_scratch_intervals = @max(result.max_declared_operation_scratch_intervals, entry.owner.?.plan.declared_operation_scratch_intervals);
                     if (executable.storage.external_output)
                         result.max_repacked_scratch_savings_bytes = @max(result.max_repacked_scratch_savings_bytes, entry.owner.?.plan.external_scratch_savings_bytes);
                 }
@@ -6683,18 +6765,28 @@ test "embeddinggemma2 CUDA original grouped Stage output escrow preserves instru
         }
     };
     const audio_optin = platform.env.getenvBool("ANTFLY_INFERENCE_CUDA_EMBEDDING_GEMMA2_AUDIO_GRAPH");
+    const observed_workspace = platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_AUDIO_OBSERVE_WORKSPACE");
+    var audio_observation = @import("../execution/runtime_observation.zig").Scope.init();
+    defer audio_observation.deinit();
     const audio_before = try AudioWitness.read(session, control);
     stage = "prepare first audio cohort";
-    const first_audio = try embedAudios(a, session, hf.tokenizer(), &clips, options, session.execution_gate, control, null);
+    const first_audio = try embedAudios(a, session, hf.tokenizer(), clips, options, session.execution_gate, control, null);
     defer {
         for (first_audio.vectors) |vector| a.free(vector);
         a.free(first_audio.vectors);
         a.free(first_audio.input_tokens);
     }
-    try std.testing.expectEqual(@as(usize, 2), first_audio.vectors.len);
+    try std.testing.expectEqual(width, first_audio.vectors.len);
+    try std.testing.expectEqual(BatchExecution.Execution.native_batch, first_audio.execution);
+    if (audio_optin and !observed_workspace and audio_before.source_bf16) {
+        stage = "verify cold declared audio ownership";
+        const cold = try AudioWitness.read(session, control);
+        try std.testing.expect(cold.declared_owners > audio_before.declared_owners);
+        try std.testing.expect(cold.executions > audio_before.executions);
+    }
     stage = "replay repeated audio cohorts";
     for (0..if (audio_optin) @as(usize, 6) else @as(usize, 2)) |_| {
-        const repeated_audio = try embedAudios(a, session, hf.tokenizer(), &clips, options, session.execution_gate, control, null);
+        const repeated_audio = try embedAudios(a, session, hf.tokenizer(), clips, options, session.execution_gate, control, null);
         defer {
             for (repeated_audio.vectors) |vector| a.free(vector);
             a.free(repeated_audio.vectors);
@@ -6711,18 +6803,57 @@ test "embeddinggemma2 CUDA original grouped Stage output escrow preserves instru
     if (audio_optin) {
         stage = "verify captured audio ownership and replay";
         std.debug.print("embeddinggemma2 CUDA grouped audio before={any} after={any}\n", .{ audio_before, audio_after });
+        std.debug.print("embeddinggemma2 CUDA grouped audio routes={any}\n", .{audio_observation.snapshot().cuda_audio});
         try std.testing.expect(audio_after.owners > audio_before.owners);
+        if (observed_workspace) {
+            try std.testing.expectEqual(audio_before.declared_owners, audio_after.declared_owners);
+        } else {
+            try std.testing.expect(audio_after.declared_owners > audio_before.declared_owners);
+        }
         try std.testing.expect(audio_after.graphs > audio_before.graphs);
         try std.testing.expect(audio_after.executions >= audio_before.executions + 2);
         try std.testing.expect(audio_after.replays > audio_before.replays);
         try std.testing.expect(audio_after.max_captured_arena_bytes > 0);
         try std.testing.expect(audio_after.max_planned_arena_bytes > 0);
-        std.debug.print("embeddinggemma2 CUDA grouped audio max_planned_arena_bytes={d} max_captured_arena_bytes={d} max_repacked_scratch_savings_bytes={d} replays={d}\n", .{
+        std.debug.print("embeddinggemma2 CUDA grouped audio max_planned_arena_bytes={d} max_captured_arena_bytes={d} max_repacked_scratch_savings_bytes={d} replays={d} declared_operation_scratch_intervals={d}\n", .{
             audio_after.max_planned_arena_bytes,
             audio_after.max_captured_arena_bytes,
             audio_after.max_repacked_scratch_savings_bytes,
             audio_after.replays - audio_before.replays,
+            audio_after.max_declared_operation_scratch_intervals,
         });
+    }
+    if (audio_optin) {
+        stage = "compare eager grouped audio with captured execution";
+        try AudioWitness.requireReplaySample(session, control);
+        const changed_audio = try embedAudios(a, session, hf.tokenizer(), changed[0..width], options, session.execution_gate, control, null);
+        defer {
+            for (changed_audio.vectors) |vector| a.free(vector);
+            a.free(changed_audio.vectors);
+            a.free(changed_audio.input_tokens);
+        }
+        const changed_witness = try AudioWitness.read(session, control);
+        try std.testing.expect(changed_witness.replays > audio_after.replays);
+        try std.testing.expectEqualSlices(usize, first_audio.input_tokens, changed_audio.input_tokens);
+        for (first_audio.vectors, changed_audio.vectors) |before, after|
+            try std.testing.expect(!std.mem.eql(f32, before, after));
+
+        const previous = try AudioWitness.setGraphPolicy(session, control, false);
+        const eager_audio = try embedAudios(a, session, hf.tokenizer(), changed[0..width], options, session.execution_gate, control, null);
+        defer {
+            for (eager_audio.vectors) |vector| a.free(vector);
+            a.free(eager_audio.vectors);
+            a.free(eager_audio.input_tokens);
+        }
+        const eager_witness = try AudioWitness.read(session, control);
+        _ = try AudioWitness.setGraphPolicy(session, control, previous);
+        try std.testing.expectEqual(changed_witness.executions, eager_witness.executions);
+        try std.testing.expectEqual(changed_witness.replays, eager_witness.replays);
+        try std.testing.expectEqualSlices(usize, changed_audio.input_tokens, eager_audio.input_tokens);
+        try std.testing.expectEqual(changed_audio.vectors.len, eager_audio.vectors.len);
+        for (changed_audio.vectors, eager_audio.vectors) |expected, actual| {
+            try std.testing.expectEqualSlices(f32, expected, actual);
+        }
     }
     // Existing six-second closed.mp4 naturally selects six unique frames:
     // image_batch uses one full4 +one final2 flush, without changing cadence.

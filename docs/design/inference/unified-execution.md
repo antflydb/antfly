@@ -425,7 +425,48 @@ preparation API do not by themselves complete these remaining requirements:
   scheduler turns and publishes progress after successful runtime completion.
   The CUDA replay-capacity and native prefill chunk-size decisions named in
   #1771 already live in `decoder_storage.zig` and `decoder_prefill.zig`,
-  respectively.
+  respectively. The Qwen3-VL projector owns the checkpoint-derived image
+  limits and prompt budget clipping used by admission, image preparation,
+  pinned CUDA uploads and singleton publication. The Qwen processor
+  descriptor owns parsing for both projector families. The singleton
+  publisher's unused batched planning branch was removed. Seven local
+  checks verified processor parsing, header geometry, admission and exact
+  pinned upload sizing, including text-only requests without allocation.
+  The Qwen2-VL fallback also forecasts visual rows and host working
+  bytes from the same encoded-image header pass. Generation sums
+  those actual visual rows in prompt order and keeps the existing
+  per-image allowance. Nine local checks passed, including repeated
+  image references, agreement with prepared pixels, and rejection
+  of out-of-range processor integers. The fallback workspace forecast
+  now takes the peak of codec decode and resize with the live RGB
+  input, including earlier prepared images in both phases. Codec
+  allocations above the forecast still acquire credit through the
+  runtime allocator. Eighteen focused checks passed, covering retained
+  inputs, late growth, denial, cancellation and refunds. Generation
+  transfers each prepared image to the encoder after validating the
+  full prompt. Normalized pixels retire after patch-row construction
+  and host patch rows retire after patch embedding. The borrowed encoder
+  callers share the same short patch-row lifetime. Seven Native and
+  Metal checks passed locally, and Spark passed all four CUDA and
+  cleanup checks, including parity against the Native image producer.
+  ColQwen document scoring uses the same consuming encoder for native
+  streaming and compatibility projection. Its imported-session route
+  retires each input after the session returns. A pre-submission decline
+  preserves the entire input cohort for compatibility, while failure
+  after consumption retires only the remaining images. Six Native and
+  Metal checks and two Spark checks passed, covering held outputs,
+  imported and native allocation failures, and provider parity.
+  The imported vision input now adopts the normalized pixels directly
+  into its host tensor. The tensor releases the pixels on session exit,
+  and the prepared image keeps cleanup responsibility if shape allocation
+  fails. Four focused checks passed, including pointer identity at the
+  session callback, allocation failure and Native/Metal output parity.
+  Qwen2-VL and the Qwen3-VL split patch projection now borrow their
+  host patch rows through the shared compute input contract on Native.
+  The patch row owner outlives the input handle and projection call.
+  Six focused checks passed, including the Native no-copy contract,
+  actual ColQwen projection parity on Native and Metal, and allocation
+  failure and cancellation cleanup.
 
 - Imported ONNX and architecture graphs share the bounded specialization owner
   in `execution/specialization_cache.zig`, with stable executable handles,
@@ -1460,6 +1501,32 @@ The released two-row LightOnOCR HTTP graph replay reported a
 297,216-byte shared layer workspace and a 44-byte admitted pinned
 readback. The reported workspace equals the largest stage bound.
 
+At `e208032e8d`, all 26 scoped Spark CUDA checks passed without skips.
+With the declared shared logits bank enabled, released LightOnOCR
+replayed two rows with exact HTTP output parity. The shared stage bank
+was 1,986,560 bytes, including the logits span, with a 44-byte admitted
+pinned readback. The assigned-buffer fixture also matched the separate
+bank path while consuming an empty stream workspace for the head.
+
+At `4492c73407`, all 28 scoped Spark CUDA checks passed without skips.
+The declared BF16 source convolution packs produced exact border values
+with and without bias in two cuDNN forwards. The released shared-head
+HTTP replay and the 128-page recurrent partition fixture passed again.
+
+A same-binary default/shared/shared/default comparison at
+`4492c73407` completed 64 pages per arm with exact serial parity.
+Rates were 18.6430, 19.1465, 19.6339 and 20.7716 pages/s. Timed
+replay widths were 7, 3, none and 64. Only the final default arm met
+the 64-row gate. In the second shared arm, page-state cleanup retired
+the 64-row graph before capture finished, after two tokens of progress.
+Throughput parity for the shared bank remains unqualified.
+
+At `2c6206072a`, the scoped page retirement changes passed the host
+dispatch geometry, recurrent cleanup and checked KV release tests.
+The physical graph park/restore fixture compiled and skipped locally.
+Its Spark run checks unrelated retirement, replay and affected-sequence
+retirement before the unchanged timed cohort is retried.
+
 At `ee3629cec0`, five scoped Metal audio tests passed without skips.
 The replay fixture rejected missing and excess input bindings before
 dispatch. The same run covered fresh inputs, held results, and
@@ -1469,6 +1536,17 @@ At `194e567a75`, six scoped Metal tests passed without skips. They
 covered checked attention geometry, rejection of live output aliases,
 reuse of retired handles, and the existing audio replay paths.
 
+At `ce443928a5`, all seven selected local tests passed without skips
+with direct Metal access. The run covered prepared audio replay with
+fresh inputs, selector eviction, held results and admission recovery,
+plus pending cuDNN receipt aggregation and both CUDA workspace reports.
+
+Spark at `bb2c665e11` passed all 31 selected CUDA checks without skips.
+The source convolution fixture matched exact BF16 values and recorded
+two accepted forwards, one accepted bias call and a source bank larger
+than the explicit SDK workspace. The physical graph convolution and
+pending receipt aggregation checks passed in the same run.
+
 This audit reconciles the original `2f2438e67f` implementation review
 against merged main `4951ca13f9` with later evidence. Each serving
 measurement identifies the revision that ran.
@@ -1477,13 +1555,13 @@ deletion and qualification gates.
 
 | Requirement | State | Evidence and remaining gate |
 | --- | --- | --- |
-| Shared liveness and authoritative storage | Partial | Assigned execution and admitted storage share dependency analysis. Metal image and video bind workspaces through the vision region. CUDA attention and unfused recurrent decoding share one declared bank, verified on the released LightOnOCR HTTP route at `4da5997db2`. Grouped audio and the remaining decoder operations still learn their composite schedules. The compatibility table identifies opaque vendor workspaces with separate accounting. |
-| Stable addresses and CUDA capture | Partial | Released T5-small replayed at prefixes 1, 8, 32 and 64. Released EmbeddingGemma 2 grouped audio captured and replayed using a 38,017,792-byte arena. The context-level projector guard declines unplanned cuBLASLt staging before allocation. LightOnOCR-3-4B shared logits backing replayed at up to 98 rows with exact parity across repeated 128-page, 24 GiB runs. The full-width default had no wide replay in the ABBA pair, while the shared arena was 1.55% slower on average. Default throughput and declared ordinary and capture workspace parity remain open. |
+| Shared liveness and authoritative storage | Partial | Assigned execution and admitted storage share dependency analysis. Metal image and video use the admitted vision region. CUDA decoder attention, recurrent projections, norm adjustment and dense FFN share admitted layer storage. At `e32afca66d`, the released cache-disabled 0.8B reader replayed with no learned bytes and the 4B graph recorded zero allocations at 98 rows. Released BF16 and F32 grouped audio derive their lifetimes before dispatch. F32 warms vendor storage once and binds the declared schedule without learning allocation lifetimes. At `ee73544213`, the Metal planner owns the column-bias destination and the subsequent integer gather output, including immutable index validation before submission. The corresponding Spark CUDA regression cohort passed all eight checks, including early rejection of both column-bias operand orders by the flat assigned path. Other decoder and audio representations and specialized Metal scopes remain open. Opaque vendor workspace retains separate accounting. |
+| Stable addresses and CUDA capture | Partial | Released T5-small captured and replayed at prefixes 1, 8, 32 and 64. Released BF16 grouped audio captured and replayed within its 36,788,736-byte arena, including cancellation before staging and successful later replay. At `ec457e03ca`, declared F32 captured and replayed with exact eager parity at widths two through four, with and without RMS mirrors. The released two-page LightOnOCR reader skipped its learning burst with declared warmup. At `e32afca66d`, 4B replayed a declared zero-byte plan at 60 rows and an observed zero-byte plan at 98 rows. At `4985997ee6`, both timed 256-page 4B runs replayed declared zero-byte plans at 98 rows with exact serial parity and zero retirement-capacity retries. Paired ordinary/capture throughput and other signatures remain open. |
 | Runtime-owned state and physical policy | Partial | `decoder_storage.zig` owns Gemma 4 replay capacity and `decoder_prefill.zig` owns chunk selection, eager binding and scheduled cancellation. The shared frame owner controls media view retirement. Metal HTTP acquires and pins the existing per-layer input table before decoder state advances. Residual task-bound state and cache policy need provider-specific verification and migration. |
-| Resident placement | Partial | The released fused T5-small step retired its encoder activations before decoding on CPU, Metal and CUDA. Spark recorded 393,216 device-to-device gather bytes and zero gather downloads. Imported ONNX handoff tests exercise exact output custody and host fallback on all three providers. Metal verifies a scalar token readback and a one-row fallback. At `bd0e05a4e3`, Spark passed the device gather and consumed a retained audio output view without a device copy. Other eligible stateful and opaque producer/consumer pairs still need qualification. |
+| Resident placement | Partial | Released T5-small retired encoder activations before fused suffix execution and kept all 24 cache slots independently owned at prefixes 1, 8, 32 and 64 on CPU, Metal and CUDA. Spark recorded 393,216 device-to-device gather bytes and zero gather downloads. Imported ONNX handoff tests exercise exact output custody and host fallback on all three providers. Metal verifies a scalar token readback and a one-row fallback. At `bd0e05a4e3`, Spark passed the device gather and consumed a retained audio output view without a device copy. Other eligible stateful and opaque producer/consumer pairs still need qualification. |
 | Task orchestration | Partial | Media tasks call shared frame and projection retirement owners. Scheduled generation routes publish independent outputs through runtime callbacks. Some hardware-specific paths still choose or own physical transitions in model and task code. |
-| Ownership and deletion | Partial | Nine execution source moves, removal of the 34-line legacy ONNX KV file and 24-line CUDA coverage wrapper, and removal of direct Metal frame-view, projection-slot and vision-workspace wrappers. The remaining compatibility owners retain the deletion gates in the preceding table. |
-| Common telemetry | Partial | Invocation reports distinguish gather transfers and ordering, CUDA audio learning and replay outcomes, and actual workspace bindings. LightOnOCR reports warmed and learned eager bursts alongside capture and replay, distinguishes declared and bound scratch, and attributes recurrent use to the shared backing. The nested report and physical replay fixtures verify completed-burst accounting and pinned readback. The Metal audio selector uses completed GPU timing through existing frame retirement. Cross-provider lifetime attribution and coverage of opaque and pending routes remain open. |
+| Ownership and deletion | Partial | Nine execution source moves, removal of the 34-line legacy ONNX KV file and 24-line CUDA coverage wrapper, removal of direct Metal frame-view, projection-slot and vision-workspace wrappers, and deletion of the observed device-address branch for CUDA source temporary scratch at `4c91972c58`. The source route still needs current-head physical qualification. The remaining compatibility owners retain the deletion gates in the preceding table. |
+| Common telemetry | Partial | Invocation reports distinguish gather transfers and ordering, CUDA audio learning and replay outcomes, and actual workspace bindings. LightOnOCR reports warmed and learned eager bursts alongside capture and replay, distinguishes declared and bound scratch, and attributes recurrent use to the shared backing. Nested and physical fixtures verify burst accounting and pinned readback. Wide receipts identify replay width, workspace origin and learned bytes. The benchmark also preserves the capacity-retry count when a run fails. The released BF16 EmbeddingGemma 2 receipt at `a1e8a50b22` counted 132 operation scratch intervals in the declared and captured 36,788,736-byte arena and verified repeated outputs. The Metal audio selector uses completed GPU timing through existing frame retirement. Cross-provider lifetime attribution and coverage of opaque and pending routes remain open. |
 
 At `f61c0c11f4`, a rename-aware source diff against merged main
 `4951ca13f9` shows 11,153 removed and 51,938 added lines across non-renamed
@@ -1550,6 +1628,13 @@ Subsequent scoped qualification covers these production paths:
 | `defbd61b8f` | Spark GB10 CUDA, page-capacity bounds and assigned attention output | All 27 focused checks passed with zero skips. The 1,025-token batch matched independent paged attention and verified direct destination parity and alias rejection before KV writes. The released 0.8B HTTP fixture replayed two rows with a 44-byte pinned receipt. Direct driver validation of the checked-in PTX captured 64 rows and a three-row tail with reused scratch, then matched all outputs on two replays with changed inputs. | The direct driver result covers the CUDA packets. Actual serving replay above 64 rows, comparative performance and the complete composite declaration remain open. |
 | `21c14d7bf4` | Spark GB10 CUDA, stable paged-attention backing and released LightOnOCR 0.8B | All 26 focused checks passed with zero skips. The HTTP fixture replayed two rows with 297,216 bytes of admitted attention scratch and a 44-byte pinned receipt. A separate prefill-first run admitted a 128-page window across two requests, completed all 128 pages with exact serial parity, and replayed at most three rows. | The wide replay gate failed. Physical replay above 64 rows, comparative performance and the complete composite declaration remain open. |
 | `7b3f44fccc` | Spark GB10 CUDA, predeclared paged-attention geometry | All 24 checks passed with zero skips. The layout test checked full and tail packets; the released LightOnOCR HTTP fixture replayed two rows with a 44-byte admitted pinned receipt. Grouped audio and paged KV mutation checks passed in the same run. | Physical wide-cohort replay and a complete composite workspace declaration. |
+| `c35ca1e482` | Spark GB10 CUDA, assigned FFN and merged ONNX token readback | All 60 checks passed with zero skips. The full and compact FFN precision schedules recorded one declared scratch interval and preserved numerical parity. GLiDE passed the tiled FFN checks. The merged decoder downloaded exactly four bytes after stage submission, preserved cache position when readback was denied, and matched the next reference row after retry. | The paired public CUDA HTTP benchmark uses this same revision. Later split audio attention publication has a separate qualification gate. |
+| `58b3917a89` | M4 Max Native CPU and Metal, released Whisper Small against issue baseline `9e4af7f847` | All ABBA task outputs matched exactly and reached EOS on the selected backend. Each backend had 32 measured requests per side, with three warmups per arm. CPU task-lifecycle median/p95 was 654.25/658.25 → 654.47/656.11 ms. Metal was 461.86/462.96 → 345.08/345.92 ms. Both same-binary controls passed, with less than 0.25% drift across measured percentiles. | One fixed audio fixture and the complete task lifecycle. Updated public HTTP and Spark performance comparisons remain separate gates. |
+| `29393629e3` | Spark GB10 CUDA, bounded decoder workspace and released T5-small | All 56 checks passed with zero skips. The imported CUDA decoder passed resident cache handoff. Released T5-small matched its full-prefix reference, held 12 independent self-cache and 12 cross-cache slots starting at prefill for prefixes 1, 8, 32 and 64, and fused serving suffixes after encoder retirement. Released LightOnOCR replayed a two-row decode with 44 bytes of admitted pinned readback and 2,017,280 bytes of shared layer storage. | The last warm T5 samples were 1.85, 1.88, 1.94 and 1.69 ms by prefix. These are single-cohort measurements without a paired baseline. The later exact FFN binding and scoped allocator changes are in a separate build. |
+| `78da7dbf0c` | M4 Max Metal, shared audio frame ownership and merged ONNX handoff with released T5-small | All seven checks passed with zero skips. The cohort covered shared submission cancellation and foreign-frame ownership, audio scratch reuse and recovery after admission pressure, and merged decoder token selection with a denied-transfer retry. Released T5-small retained 12 independent self-cache and 12 cross-cache slots at each tested step and matched cached decoding against its full-prefix reference. The separate serving fixture fused suffixes after encoder retirement. | This cohort verified correctness and custody. Current-head comparison against the issue baseline remains open. |
+| `3ab6ccb1d1` | M4 Max Metal, merged ONNX token selection and released T5-small | All four checks passed with zero skips. The synthetic merged decoder selected a token with less than one vocabulary row of download, preserved its suffix position when readback was denied, and matched the reference next row after retry. Released T5-small retained independent cache ownership at prefixes 1, 8, 32 and 64, and the separate microbatch fixture fused suffixes after encoder retirement. The Metal audio projection workspace test also passed. | The subsequent shared audio submission owner and readback preflight need physical qualification. This run did not compare latency against the issue baseline. |
+| `c33d8628ee` | Spark GB10 CUDA, physical source convolution and channel RMS, released EmbeddingGemma 2 grouped audio | All 49 checks passed with zero skips. Direct convolution bound one conversion interval without application device allocation in the assigned run. Single-CTA F32 channel RMS needed no scratch interval. Grouped audio replayed twice and reported 132 operation-declared scratch intervals in the same 38,017,792-byte planned and captured arena. | The composite recipe still observes cross-operation lifetimes. This cohort measured correctness and physical ownership. |
+| `c2448bed34` | Spark GB10 CUDA, physical FFN and cuDNN workspace, released LightOnOCR HTTP | All 47 checks passed with zero skips. Both direct FFN precision variants passed. LightOnOCR replayed a two-row decode with 44 admitted pinned readback bytes and 2,017,280 bytes of shared layer backing. | The separate 64-page ABBA run matched the serial reference in all four arms. Independent head storage measured 19.3975 and 20.1913 pages/s, with maximum replay widths of 0 and 64. Shared head storage measured 19.8275 and 19.3277 pages/s and reached 64 rows in both arms. The first control failed the 64-row replay gate, so the run does not establish throughput parity at matched replay widths. |
 | `d239dbfdaa` | Spark GB10 CUDA, paged KV suffix validation, released LightOnOCR and grouped audio | All 22 checks passed with zero skips, including the direct paged-attention page-binding test and shared region validation. The released HTTP reader replayed with a 44-byte admitted pinned receipt. | The paged-attention scratch declaration landed after this run. The decoder still learns the composite lifetime schedule. |
 | `20a5386d14` | Spark GB10 CUDA, released LightOnOCR 0.8B HTTP, assigned decoder head, and released grouped audio | The initial run passed 19 checks and missed the grouped audio fixture. That check passed on the same binary using the established fixture, for 20 verified checks with zero skips. LightOn used a 44-byte pinned receipt and the assigned head test wrote directly into its declared bank. Grouped audio again captured once and replayed twice. | Later preflight ordering changes and the complete declared scratch schedule. |
 | `999368a573` | Spark GB10 CUDA, released LightOnOCR 0.8B HTTP and EmbeddingGemma 2 grouped audio | All 17 checks passed with zero skips. LightOn replayed a two-row decode with a 44-byte receipt in admitted pinned storage. Grouped audio recorded one graph and replayed twice with an identical 38,017,792-byte planned and captured arena. | The two composite scratch recipes still depend on observed allocation schedules. This run tested dispatch and ownership without a throughput comparison. |
@@ -2609,3 +2694,1135 @@ mean arm-median latency was 643.89 versus 643.86 ms for image and
 across arms. The toggle did not yield a measurable serving improvement,
 so the experimental source was removed. The receipt hash is
 `d5f38ffee83de0327e1fb51684e3001629da39d85e6ae2d32126d18f5a0bb2a0`.
+
+On Spark GB10 at `2c6206072a`, 34 CUDA checks passed without skips.
+The parked decoder graph survived unrelated sequence and recurrent
+retirement, replayed with exact outputs, and retired when a captured
+binding was released. Released grouped audio matched its repeated
+vectors exactly using a 38,017,792-byte arena and two graph replays.
+The test log hash is
+`239004836385b43638fbca95668a45fbb6aadb6f44de877c01d89fc4fe926ef1`.
+
+All four arms of the same-binary default/shared/shared/default
+LightOnOCR 2×32-page comparison matched the serial outputs exactly.
+Throughputs were 19.9178, 20.1425, 19.6868 and 20.9036 pages/s. Maximum
+timed replay widths were 2, 0, 64 and 64 rows. A1 retired its 64-row
+capture after two tokens during page cleanup. B1 recorded no replay.
+Both final arms replayed at 64 rows and retired the captured binding
+after ten tokens. The measured throughputs do not establish a reliable
+default/shared difference because replay eligibility differed across arms.
+
+At `6d4977de07` on Spark, all 34 selected CUDA checks passed without
+skips. Source local-relative attention wrote into assigned output rows
+with exact single- and multi-block outputs, unchanged sentinel rows,
+and zero device-to-device copy bytes. The released grouped checkpoint
+still matched repeated vectors exactly and replayed twice with
+38,017,792 planned and captured arena bytes. The test log hash is
+`a079da40a732781946571f5ce5979d3d17c8b8bd6ada5284597e43c116f94616`.
+
+On Spark GB10 at `386a7ba09e`, 37 CUDA checks passed without skips.
+The grouped local-relative attention fixture verified exact independent
+clip outputs and one workspace allocation interval. Released grouped
+audio still recorded two replays and 38,017,792 planned and captured
+arena bytes. The log hash is
+`e6c5014329628389a1178a560f0466dafc03682df7c19428e0b69006851f6c12`.
+
+The same-binary LightOnOCR 2×32-page ABBA comparison matched the
+serial output in all four arms. Rates were 8.5401, 7.0469, 13.3180
+and 9.3791 pages/s. Maximum replay widths were 19, 3, 8 and 0.
+The last arm retired a 64-row graph while it was still learning.
+All four arms failed the exact 64-row replay gate. A separate process
+held a GPU context when inspected after the run. These receipts
+establish output parity for this comparison, with throughput and
+consistent 64-row replay still unqualified.
+
+On Spark GB10 at `211c80a1f9`, all 39 selected CUDA checks passed
+without skips. The released LightOnOCR HTTP fixture replayed two rows
+and matched the serial text exactly. It reported 44 pinned readback
+bytes, 297,216 attention scratch bytes, 16,384 attention output bytes,
+16,384 recurrent output bytes, and 2,002,944 bytes in the shared layer
+bank. Separate physical fixtures passed for both F32 and compact BF16
+FFN arithmetic against independent references. Released grouped audio
+matched exactly across repeats and recorded two replays with
+38,017,792 planned and captured arena bytes. The test log hash is
+`313a207f8120d6a30c4210c55ecd4d1b52bc74c5ed6ec31b9e52d9456dd58b66`.
+
+The following same-binary LightOnOCR default/shared/shared/default
+comparison at `211c80a1f9` again matched serial text in every arm. Rates
+were 19.8708, 19.5106, 18.6225 and 8.3353 pages/s. Maximum timed replay
+widths were 64, 3, 8 and 0 rows. Foreground steps retired learning
+graphs at widths 61 and 56, and retired a 63-row graph in the capture
+phase. Since only the first arm passed the exact 64-row gate, this
+comparison leaves throughput parity open.
+
+### Spark HTTP regression comparison at `c35ca1e482`
+
+The native CUDA HTTP server on the GB10 compared the candidate against the
+frozen `9e4af7f847` baseline. AA, ABBA and BB used three warmups per arm,
+then 16 measured requests per side per workload. The receipt pinned both
+binaries, fixture and request hashes. Another process held a 184 MiB GPU
+context at startup, so these are shared-GPU timings. Exact outputs matched
+on all nine workloads supported by both builds in all sampled arms.
+DECIDE returned the expected unsupported response on the baseline and
+passed all candidate arms. These six baseline responses were the only
+failures reported by the harness.
+
+| Workload | Baseline p50 / p95 (ms) | Candidate p50 / p95 (ms) |
+| --- | ---: | ---: |
+| Whisper Small | 383.71 / 385.55 | 383.22 / 383.99 |
+| EmbeddingGemma 2 text | 8.73 / 9.23 | 8.85 / 9.76 |
+| LightOnOCR 3 | 325.02 / 326.99 | 323.12 / 325.64 |
+| GLiNER 2.5 | 13.03 / 13.97 | 10.57 / 11.76 |
+| DECIDE | Unsupported | 40.10 / 41.54 |
+| Qwen 3 | 85.46 / 86.75 | 85.77 / 87.21 |
+| Gemma 4 E4B text | 221.34 / 223.16 | 221.16 / 224.87 |
+| Gemma 4 E4B image | 279.51 / 299.54 | 277.94 / 279.14 |
+| Gemma 4 E4B audio | 215.95 / 223.94 | 212.64 / 218.29 |
+| Gemma 4 E4B video | 254.30 / 256.27 | 251.48 / 253.30 |
+
+EmbeddingGemma 2 text p95 rose in the mixed comparison. The p95 controls
+span 9.00–9.27 ms on baseline and 9.10–9.38 ms on candidate. An isolated
+repeat is required to resolve the mixed-load tail. The test covered
+EmbeddingGemma 2 text and Gemma 4 audio. Grouped EmbeddingGemma 2 audio
+needs its own comparison, including the workspace changes after this
+candidate.
+
+### Spark grouped audio and decoder qualification at `109f9b5c9e`
+
+The GB10 focused run passed 71 selected checks with zero skips. It covered
+grouped audio attention against isolated clips, flat and mixed serving
+admission, renewed input staging, and the released EmbeddingGemma 2
+checkpoint. The original grouped Stage fixture captured and replayed
+twice. Its planned and captured arenas were both 38,017,792 bytes and
+included 132 operation scratch intervals. The composite still uses
+observed tensor lifetimes. Grouped HTTP latency and throughput are a
+separate comparison.
+
+The same build passed Florence batched prefix storage and admission
+retry, bounded decoder FFN and recurrent workspace fixtures, and merged
+T5-small decoder capture and replay at prefixes 1, 8, 32, and 64.
+
+### CPU HTTP regression comparison at `58b3917a89`
+
+The local M4 Max native CPU server compared the candidate against
+`9e4af7f847` using AA, ABBA and BB controls, with 16 measured requests per
+side and exact outputs on ten supported workloads. The only output
+failures were grouped EmbeddingGemma 2 audio, including the baseline-only
+repeat. That group requires separate qualification. The ABBA median
+latencies for Gemma 4 E4B were 7,944.50 to 3,052.69 ms (text),
+5,497.47 to 3,603.59 ms (image), 1,272.09 to 952.75 ms (audio), and
+5,118.14 to 2,995.43 ms (video). The six other passing workloads were
+within 1% at p50 except DECIDE, which improved from 126.82 to 122.46 ms.
+
+### Paired EmbeddingGemma 2 HTTP comparisons
+
+Against the frozen `9e4af7f847` baseline, the listed comparisons matched
+outputs exactly in AA, ABBA, and BB. CUDA measured 40 requests per side.
+CPU and Metal measured 16 per side. The Spark run shared the GPU with a
+184 MiB context. The CPU grouped-audio run pinned the DFT implementation
+on both builds after default CPU audio had baseline repeatability drift.
+
+| Candidate | Backend and workload | Baseline p50 / p95 (ms) | Candidate p50 / p95 (ms) |
+| --- | --- | ---: | ---: |
+| `109f9b5c9e` | CUDA text | 8.63 / 9.15 | 8.64 / 9.48 |
+| `109f9b5c9e` | CUDA grouped audio, default settings | 50.12 / 50.65 | 47.81 / 48.28 |
+| `58b3917a89` | Metal grouped audio | 39.66 / 43.08 | 36.31 / 41.53 |
+| `58b3917a89` | CPU grouped audio, pinned DFT | 228.44 / 230.23 | 227.45 / 229.17 |
+
+CUDA text's ABBA p95 difference was smaller than the spread between
+the two baseline-only p95 controls. Default CUDA grouped audio's
+candidate-only p50 range was 48.28–48.49 ms versus 50.10–50.44 ms in
+the baseline controls.
+
+With the CUDA audio graph option enabled on both builds, the same 40-request
+paired comparison also matched exactly. Baseline p50/p95 were 50.44/51.17 ms
+and candidate p50/p95 were 49.06/49.43 ms. Candidate-only p50 controls were
+48.59–48.95 ms. The HTTP run confirms behavior with the option enabled.
+Actual capture and replay counts come from the separate released-checkpoint
+fixture. The default-mode and graph-enabled runs were separate comparisons,
+so their latency difference does not isolate graph replay overhead.
+
+The subsequent Spark paired run at `24d2051504` used the same frozen
+baseline, request and 40 measured requests per side. Outputs matched
+exactly across AA, ABBA and BB under both policies. One other GPU context
+held 184 MiB throughout. Default grouped audio improved from 50.57/51.21
+to 49.01/49.95 ms p50/p95. With capture enabled on both builds, it improved
+from 50.34/51.25 to 48.51/49.20 ms. The separate released-model fixture at
+`a7d8bcfa6a` passed 26 focused checks with zero skips and replayed twice.
+Its 36,788,736-byte captured arena includes 132 operation scratch intervals.
+The encoder still observes the composite tensor lifetimes.
+
+At `10cbd19523`, the released grouped-audio model also matched exactly on
+local M4 Max Metal and CPU across AA, ABBA and BB with 16 measured requests
+per side. Metal p50/p95 went from 37.74/43.60 to 36.38/41.26 ms. Native CPU
+with the DFT pinned went from 227.28/233.91 to 226.39/228.98 ms. All 26 Spark
+checks passed again with zero skips and the same 36,788,736-byte capture.
+
+On Spark GB10, `a1e8a50b22` passed all 30 focused checks with zero skips.
+The released EmbeddingGemma 2 BF16 two-clip cohort admitted and bound the
+complete declaration on its first invocation. Across seven executions it
+created one graph, replayed four times, and returned exactly repeated
+embeddings. The planned and captured arena both measured 36,788,736 bytes
+with 132 operation scratch intervals. Two local CPU contract checks passed
+for the full-range declaration and last-use compiler.
+
+The paired Spark HTTP comparison used one `a1e8a50b22` server binary with
+CUDA media batching and audio graphs enabled on both sides. Every embedding
+matched exactly across the observed-only, ABBA, and declared-only controls.
+Three- and four-clip requests used unequal lengths. Each group width had
+32 measured requests per side and zero failures.
+
+| Clips | Observed p50 / p95 (ms) | Declared p50 / p95 (ms) |
+| --- | ---: | ---: |
+| 2 | 26.91 / 29.66 | 27.26 / 27.95 |
+| 3 | 32.25 / 34.89 | 32.53 / 33.35 |
+| 4 | 36.08 / 38.11 | 36.50 / 37.38 |
+
+The paired median differences were 0.28–0.42 ms. The observed-only median
+spread was 0.75–1.33 ms. Every paired p95 improved. One unrelated GPU
+context held 184 MiB before and after the comparison. A separate untimed
+public serving run recorded 18 arena executions and nine graph replays
+across six requests at each group width.
+
+At `e10519eb17`, all 31 Spark focused checks passed with zero skips.
+The released LightOnOCR-3-0.8B public reader returned the same outputs as
+the serial reference for two pages. Its bounded CUDA decoder replayed
+two rows with a 44-byte admitted pinned receipt, a 2,004,992-byte shared
+layer workspace and 297,216 bytes of declared attention scratch. The
+fixture verified terminal logits storage reuse and the sizes of the
+attention normalization, mirror and residual regions. This is a
+correctness and storage receipt, with latency still to qualify.
+
+Spark repeated the released reader and grouped audio checks at `68933620f2`.
+All 33 selected checks passed with zero skips. The fused attention input
+fixture verified both head geometries using prebound query, key and gate
+spans, exact agreement with ordinary fused outputs, and zero device
+allocations in the assigned calls. The released reader again replayed two
+rows with the 44-byte pinned receipt and 2,004,992-byte shared layer
+workspace. The paired serving comparison runs separately.
+
+The Spark two-page LightOnOCR HTTP comparison used `a1e8a50b22` as
+the baseline and `68933620f2` as the candidate. All 144 measured requests
+matched exactly across AA, ABBA and BB. Every phase logged two-row graph
+replay on each request, including warmups. One other GPU context held
+184 MiB before and after the run. Paired median/p95 changed from
+472.01/481.77 ms to 466.74/497.06 ms. The two baseline-only arms reached
+472.97 and 478.79 ms at p95, and the two candidate-only arms reached
+495.87 and 498.25 ms. The median improved 1.1% and the p95 was 3.2% higher.
+The corresponding CPU image preprocessing p95 moved from 27.11 to
+20.69 ms. Subtracting each request’s measured preprocessing time still
+gave 455.79 versus 479.98 ms at p95, so preprocessing did not explain
+the increase. This remainder also includes admission, device execution
+and publication. The tail requires a repeat on the current revision
+before performance qualification can close.
+
+The consolidated Spark decoder revision `fd867e8e5a` passed all 33 checks
+with zero skips. It verified the remaining normalization and output
+projection reuse, physical alternating FFN slots, and rejection of a
+write over a live slot. The released two-page reader again reported
+exact parity and two-row replay with 44 pinned readback bytes and a
+2,004,992-byte shared workspace. The paired latency run uses that
+tested revision.
+
+The merged `a081307661` tree passed nine focused checks on the local
+M4 Max with hardware access and zero skips. Eight exercised the Metal
+provider, including live SDK backing after owner close, audio-bank
+admission and rollback, fresh arena outputs with held earlier results,
+disjoint clamp scratch under fallback and pressure, and external-frame
+custody. The ninth verified nested decoder timing totals. The initial
+sandboxed run skipped the eight Metal cases and supplied no hardware
+evidence.
+
+The larger Spark repeat compared the same baseline with `fd867e8e5a`
+in both run orders. All 320 measured requests matched exactly, with no
+failures. Every phase reached two-row CUDA replay on all measured requests
+and warmups.
+
+| Order | Baseline p50 / p95 (ms) | Candidate p50 / p95 (ms) |
+| --- | ---: | ---: |
+| ABBA | 465.29 / 474.14 | 465.17 / 494.34 |
+| BAAB | 469.31 / 481.01 | 469.68 / 482.48 |
+| Pooled | 467.67 / 478.52 | 467.12 / 491.54 |
+
+The baseline-only p95 controls were 476.99 and 498.00 ms. The
+candidate-only p95 controls were 477.22 and 478.43 ms. The paired p95
+difference changed from 20.20 to 1.47 ms with run order. The 21.01 ms
+baseline control spread prevents isolating a revision effect from this
+comparison. Decoder phase attribution remains open.
+
+The merged `965718e7f7` tree passed all 34 selected Spark checks with
+zero skips and exercised the opt-in burst profiler on the released
+two-page LightOnOCR reader. Warm/learn host submission took 2.29/2.17 ms,
+and the recorded burst took 3.71 ms including 1.94 ms of graph
+instantiation. The six replay submissions took 2.24–10.05 microseconds
+on the host. Their existing readback path took 17.19–17.34 ms per burst,
+including GPU completion. This single fixture verifies the phase timing
+boundaries. It does not attribute the paired HTTP tail.
+
+### Shared grouped CUDA audio block at `b4d02a9862`
+
+Declared and observed BF16 CUDA audio plans execute the same encoder block
+program with prepared relative keys. Cold declaration metadata grows with
+the emitted events, and both modes preserve the eager route when the
+graph is unavailable. The released EmbeddingGemma 2 checkpoint passed
+all 45 focused Spark checks in declared mode and its grouped fixture
+passed again in observed mode using the same executable. Both plans used
+a 36,788,736-byte arena with 132 scratch intervals. Declared mode bound the
+arena on the first invocation and replayed four times in seven calls.
+Observed mode warmed and learned first, then replayed twice.
+
+The production HTTP comparison used the same binary and fixtures for both
+policies. It ran 32 measured requests per side and group width in AA, ABBA
+and BB. All 576 requests succeeded. The output hashes matched across
+policies and matched the earlier `a1e8a50b22` comparison. A separate
+untimed witness recorded 18 arena executions and nine graph replays.
+
+| Clips | Observed p50 / p95 (ms) | Declared p50 / p95 (ms) |
+| --- | ---: | ---: |
+| 2 | 27.45 / 30.09 | 27.03 / 27.90 |
+| 3 | 32.82 / 35.20 | 32.15 / 32.76 |
+| 4 | 36.57 / 39.93 | 35.70 / 36.30 |
+
+Spark shared the GPU with another Inkling process during this comparison.
+The four-clip observed-only p95 ranged from 39.66 to 88.87 ms. The paired
+measurements showed no latency regression for the declared route. The
+controls limit attribution of the difference to the workspace policy.
+Graph selection stays opt-in. F32 and ungrouped audio retain their existing
+execution and ownership paths.
+
+At `54b7bbb92d`, the released BF16 grouped encoder uses the shared block
+in eager execution as well. An eager block resolves the same relative-key
+constant before the Q/K/V projections and releases its own handle.
+Captured execution borrows the admitted constants and the declaration
+does not charge them as scratch. On Spark, all nine focused CUDA checks
+passed. Reusing the same test binary, the released model passed again
+with observed allocation and with graphs disabled from initialization.
+The same-session eager comparison was bit-for-bit equal to captured
+execution and did not increment the arena or replay counters. Both
+capture policies retained the 36,788,736-byte arena and 132 operation
+scratch intervals.
+
+The HTTP comparison against `4b17a05de6` ran with graphs disabled on
+both binaries. All 576 measured requests succeeded and the output hashes
+matched across AA, ABBA, and BB for distinct unequal-length clips. Spark
+shared the GPU with the same 184 MiB CUDA context throughout.
+
+| Clips | Previous p50 / p95 (ms) | Shared eager block p50 / p95 (ms) |
+| --- | ---: | ---: |
+| 2 | 31.86 / 32.81 | 32.13 / 33.04 |
+| 3 | 34.87 / 35.78 | 34.75 / 35.59 |
+| 4 | 39.44 / 40.26 | 39.41 / 39.66 |
+
+The largest paired median increase was 0.27 ms at width two. At that
+width, the candidate-only median control varied by 0.77 ms.
+
+### CUDA grouped audio replay inputs
+
+The EmbeddingGemma 2 source BF16 encoder already prepares the relative
+key for each layer outside the audio workspace. Its grouped CUDA plan
+now stages 15 inputs. The raw relative-position tensor is consumed
+during key preparation, outside the workspace. At the released
+checkpoint geometry this removes 53,248 bytes from the logical replay
+inputs. Cold funding, sealed-plan lookup and dispatch use the same
+input count. At that revision, full-F32 CUDA and Metal used all 17
+inputs for their existing callbacks.
+
+Spark GB10 passed all ten focused checks. The released checkpoint
+also passed all nine combinations of two, three and four clips with
+declared, observed and eager CUDA execution. The test used unequal
+clip lengths and verified exact vector equality between replay and
+eager CUDA after changing the samples. Both workspace policies bound
+exactly the planned arena at each width, with 132 operation scratch
+intervals.
+The arena sizes were 36,672,000, 38,132,736 and 39,529,472 bytes,
+respectively. Three local M4 Max audio and layout checks also passed.
+
+A separate Spark probe ran the F32 fallback by making the optional
+cuDNN provider unavailable. Eager CUDA passed at width four. The
+observed graph opt-in produced zero arena executions and zero replays
+at width two on both the previous and current binaries, and at width
+four on the current binary. F32 capture remains unqualified for this
+configuration. The common report now distinguishes declaration funding
+denial, learning funding denial and fallback from a disabled plan.
+Four focused Spark checks passed. The same executable's F32 probe
+recorded one warm execution, one unsealed learning run and five disabled
+plan fallbacks. It recorded zero funding denials and zero learning host
+transfers. The BF16 arm recorded one graph and replayed four times.
+
+Spark inspection identified two live allocations at F32 sealing,
+the published tensor and its BF16 RMS mirror. The audio workspace now
+retires owned mirrors on the callback result before sealing or
+validating the F32 publication. With cuDNN unavailable and mirrors
+enabled, the released F32 checkpoint captured and replayed at widths
+two, three and four. The planned and captured arenas agreed at
+3,672,832, 5,369,344 and 6,991,360 bytes. Replay with changed samples
+matched eager vectors exactly at each width. Five focused checks also
+passed, including the released BF16 checkpoint and borrowed input
+rejection. F32 still learns its workspace schedule.
+
+The production Spark server at `fca741e4b5` compared eager CUDA and
+the F32 graph policy in one binary with cuDNN unavailable and RMS
+mirrors enabled. All 576 measured HTTP requests matched canonical
+outputs across AA, ABBA and BB, with 32 samples per side per width
+and eight warmups per arm. The two policies each reported a stable,
+distinct model identity. An unrelated CUDA context held 184 MiB
+throughout.
+
+| Clips | Eager p50 / p95 (ms) | Graph policy p50 / p95 (ms) |
+| --- | ---: | ---: |
+| 2 | 21.54 / 22.23 | 19.56 / 19.97 |
+| 3 | 24.03 / 24.75 | 22.53 / 23.33 |
+| 4 | 26.77 / 27.66 | 24.74 / 26.21 |
+
+The paired median improvements ranged from 6.2% to 9.2%. The
+largest same-policy median spread was 0.39 ms. The untimed replay
+witness reported 15 arena executions and six graph replays in
+each of its four processes. These results cover the opt-in
+policy on the tested clip cohorts.
+
+Observed and declared grouped CUDA execution now share the same
+admission policy and bind the exact prepared encoder geometry.
+A mismatch in the request shape or recipe uses the eager route
+before entering the workspace. Four focused Spark checks and four
+local checks passed. Released CUDA BF16 and F32 each captured and
+replayed at widths two, three and four, with exact eager vector
+parity after changing the samples.
+
+The Spark serving comparison used the prior grouped-audio server
+from `54b7bbb92d` and the compact-input server with declared graphs on
+both. All 576 measured requests completed and matched output hashes
+across AA, ABBA and BB. Both servers reported source BF16 audio in
+every arm. An unrelated CUDA context held 184 MiB throughout.
+
+| Clips | Prior p50 / p95 (ms) | Compact inputs p50 / p95 (ms) |
+| --- | ---: | ---: |
+| 2 | 26.78 / 28.59 | 26.88 / 27.93 |
+| 3 | 32.01 / 33.20 | 32.22 / 33.02 |
+| 4 | 36.11 / 36.92 | 35.91 / 37.06 |
+
+The paired medians moved by at most 0.21 ms. Baseline-only median
+controls differed by 0.19–0.71 ms, depending on width.
+
+A same-binary ABBA comparison then toggled the CUDA audio graph policy.
+All 96 measured requests across the three widths returned identical
+embedding vectors. Each policy reported a distinct, stable model
+identity. The first full-response comparison identified that metadata
+difference on all three widths.
+
+Full-F32 CUDA now prepares the per-layer relative keys before entering
+the workspace, using the same cache custody as BF16. The F32 graph
+stages 16 inputs and retains its tagged validity mask for packed
+attention. The raw relative-position tensor is no longer staged,
+saving 53,248 logical input bytes and one device-to-device copy per
+replay at the released checkpoint geometry. F32 still learns the
+lifetime schedule for its packed-projection route.
+
+Spark GB10 passed all twelve released-model cases at widths two, three
+and four for declared BF16, observed BF16, and F32 with RMS mirrors
+enabled and disabled. All cases matched eager CUDA exactly with changed
+samples and bound the planned arena size. With F32 mirrors enabled the
+arena sizes were 3,619,584, 5,316,096 and 6,938,112 bytes, a reduction of
+53,248 bytes at each width from the previous measurements. The broader
+Spark audio suite passed 248 checks with 37 skips. Five focused local
+checks passed without skips, including Metal segmented execution and
+cancellation. This qualification measured workspace size and exact
+outputs. The HTTP latency tables above cover the earlier revisions.
+
+Both CUDA precisions now borrow the twelve immutable query scales from
+the model cache. Replay stages three inputs for BF16 and four for F32.
+A missing cached scale selects eager execution. The same released-model
+Spark matrix passed all twelve cases with exact eager parity after
+changing samples, and both precisions used 6,144 fewer arena bytes at
+each width. The recipe, allocation cleanup and Metal segmented execution
+checks passed locally.
+
+The F32 and source BF16 routes now share the encoder block order and
+stage retirement. F32 retains its existing packed projection and
+precision-specific operations. The same twelve released-model cases
+passed on Spark with exact eager parity and the same arena capacities as
+the preceding check. Four local Native and Metal audio checks passed.
+
+Cold F32 audio prepares eligible packed QKV weights before binding the
+workspace plan's weight generation. Admission and dispatch share the
+same packed-weight identity. A Spark device check verified stable packed
+addresses, no projection launch during preparation, and exact projection
+output. The twelve released-model audio cases also passed with the
+packing policy enabled and matched eager CUDA exactly.
+
+The released F32 route now declares the grouped workspace, including
+clamp lifetimes and optional RMS mirrors. An ordinary submission warms
+vendor staging before the plan binds its addresses. The width-two Spark
+receipt recorded one warm submission, zero learned plans, one capture,
+and three replays. Spark passed all 21 released-model cases across
+declared BF16 and declared or observed F32 at widths two through four,
+with exact eager parity after changing the samples. Declared F32 also
+passed with the packed projection policy enabled. Planned and captured
+arena sizes matched the previous observed capacities. Three local
+audio and Metal checks passed.
+
+The Spark production HTTP server at `ec457e03ca` compared observed and
+declared F32 workspaces in the same binary. All 576 measured requests
+succeeded and matched output hashes across AA, ABBA and BB. Each arm
+had eight warmups and 16 measured requests per width. All 12 processes
+reported full F32, with cuDNN unavailable and RMS mirrors enabled. An
+unrelated CUDA context held 184 MiB throughout.
+
+| Clips | Observed p50 / p95 (ms) | Declared p50 / p95 (ms) |
+| --- | ---: | ---: |
+| 2 | 20.11 / 20.76 | 19.80 / 20.33 |
+| 3 | 22.39 / 23.58 | 22.43 / 23.33 |
+| 4 | 24.83 / 25.75 | 24.96 / 25.88 |
+
+All three median changes and the two- and four-clip p95 changes fell
+within the respective same-policy spreads. The three-clip p95 improved
+by 0.25 ms. The untimed declared-policy run
+recorded 15 arena executions and six graph replays. The timed arms
+measure warm whole-request latency. The physical fixture above
+establishes that the declared route skips allocation learning.
+
+Convolution execution and both CUDA declarations now share one stage
+body. The GGUF adapter retains its converted normalization weight
+mapping. The nine released Spark cases kept exact eager parity and the
+same arena capacities. Five local checks passed, including the official
+E4B QAT GGUF projector on Metal. The resident single- and two-clip
+outputs matched exactly, and the fully device-executed result was
+within 0.00563 of the host reference.
+
+Feed-forward execution and both declarations also share one lifetime
+schedule. The provider-specific up projection and fused normalization
+and residual keep their existing implementations. All nine Spark
+cases again matched eager CUDA with identical arena capacities. Four
+local Native and Metal checks passed, including the official E4B
+projector with the same 0.00563 maximum device-versus-host difference.
+
+Attention also shares projection order, packed-QKV splitting, output
+clamping, and intermediate retirement between declaration and execution.
+All nine released Spark cases kept exact eager parity and unchanged
+arena capacities. Four local checks passed, including the dedicated
+Metal packed attention clamp and mask check and the official E4B QAT
+GGUF projector.
+
+### Isolated Metal E4B HTTP comparison at `58b3917a89`
+
+The local M4 Max used the same pinned binaries as the mixed serving
+comparison and loaded only the official E4B QAT GGUF. All four modalities
+matched outputs exactly in AA, ABBA, and BB, with 16 samples per side.
+The isolated run had zero capacity errors. The mixed run had returned
+retryable capacity errors in baseline controls after loading other models.
+
+| Modality | Baseline p50 / p95 (ms) | Candidate p50 / p95 (ms) |
+| --- | ---: | ---: |
+| Text | 452.49 / 470.01 | 453.21 / 453.89 |
+| Image | 1,088.10 / 1,089.87 | 738.62 / 740.04 |
+| Audio | 291.08 / 292.63 | 290.35 / 291.27 |
+| Video | 1,042.34 / 1,043.71 | 706.81 / 708.62 |
+
+At `94962f73b5`, five focused M4 Max fixtures passed with zero skips.
+Native and Metal matched the Florence full-prefix oracle with batched
+strides, retained results, and cancellation. Metal segmented audio used
+the production mask bank and matched isolated clips. The three-clip,
+1,000-frame admission fixture measured 108,101,632 incremental device
+bytes within its 134,217,728-byte ceiling. The frontend submission
+fixture preserved the caller's frame ownership.
+
+### Spark qualification of declared decoder Q/K/V storage
+
+Spark passed all 34 focused checks at `4a5809a18b` with zero skips. The
+physical fixture verified assigned Q/K/V destinations and the standalone
+query/gate split. The released LightOnOCR-3-0.8B HTTP test matched serial
+output for both pages and captured one two-row graph followed by six
+replays. Readback used the admitted 44-byte pinned buffer, and the shared
+layer workspace remained 2,004,992 bytes. The replay readback, including
+GPU completion, took 17.15–17.35 ms. This fixture measured correctness
+and physical ownership. It did not compare request latency distributions.
+
+A separate four-arm same-binary control at `4a5809a18b` matched all
+80 measured HTTP outputs, with six warmups per arm. Each request
+completed one warm burst, one learning burst, one recorded burst and
+six replays. End-to-end median/p95 was 470.43/478.83 ms. The two pooled
+control sides measured 470.71/479.24 and 468.36/475.74 ms.
+
+| Per-request phase | Median / p95 (ms) |
+| --- | ---: |
+| CPU preprocessing | 19.96 / 26.10 |
+| Decoder host submission | 6.41 / 6.73 |
+| Graph instantiation, included in submission | 0.60 / 0.72 |
+| Decoder readback, including GPU completion | 156.52 / 157.85 |
+| HTTP time outside the measured phases | 287.48 / 293.93 |
+
+Readback stayed within 1.33 ms from median to p95. The remaining HTTP
+interval includes vision, prefill, singleton decode, and request
+overhead. The control does not identify their individual contributions
+or assign the earlier paired p95 difference to a decoder revision.
+
+At `3580d58685`, two-page released LightOnOCR HTTP again matched the
+serial output and replayed on Spark. The 2,004,992-byte layer bank
+held the 65,792-byte fused recurrent GEMM result, and the recorded
+two-token burst applied 12 attention gates in place. The observed
+workspace had zero allocations, events and bytes. The focused cohort
+passed 35 of 36 checks, with no skips. The separate assigned-projection
+fixture restored the generic test profile before invoking the recurrent
+projection helper and failed its eligibility check.
+
+Spark passed all 37 focused checks at `8d4b13c954` with zero skips,
+including the repaired assigned-recurrent fixture. With the declared
+warmup enabled, the same released HTTP case matched both serial page
+outputs. It completed one warm burst, one recorded burst and seven
+replays, with no separate learning burst. The serving receipt verified
+the declared zero-byte plan and the same 2,004,992-byte layer workspace.
+The new epoch logs measured the two scheduled prefill intervals at
+41.14 and 40.95 ms and emitted both prepared vision intervals. These
+are host durations and can include waits. The paired latency gate
+remains independent of this correctness fixture.
+
+The Spark comparison paired `4a5809a18b` against `8d4b13c954`
+with 40 measured requests per side in AA, ABBA and BB. All 240
+measured outputs matched exactly. Every paired candidate request
+replaced the learning burst with a seventh replay.
+
+| Control or comparison | First side median / p95 (ms) | Second side median / p95 (ms) |
+| --- | ---: | ---: |
+| AA | 466.36 / 473.84 | 469.83 / 498.12 |
+| ABBA | 469.55 / 482.72 | 468.68 / 498.23 |
+| BB | 465.68 / 475.88 | 464.96 / 475.80 |
+
+Paired decoder host submission fell from 6.47/6.61 to 4.15/4.32 ms.
+The 15.51 ms paired HTTP p95 increase was smaller than the 24.28 ms
+AA spread. The comparison therefore leaves the HTTP tail gate open.
+Candidate-only stage logging attributed 83.39/116.87 ms to scheduled
+prefill and 46.46/92.65 ms to the sum of prepared vision spans in
+ABBA. The vision spans can overlap; they cannot be added to a request's
+critical path or compared against unavailable baseline phase timings.
+
+The uninstrumented repeat used the same binaries, requests and
+fixtures with 64 measured requests per side. All 384 outputs had
+the same hash and no request failed.
+
+| Control or comparison | First side median / p95 (ms) | Second side median / p95 (ms) |
+| --- | ---: | ---: |
+| AA | 469.17 / 480.15 | 469.33 / 481.81 |
+| ABBA | 468.07 / 477.63 | 464.26 / 474.90 |
+| BB | 463.65 / 484.28 | 465.47 / 478.98 |
+
+The paired median and p95 improved by 3.81 and 2.73 ms. Candidate-only
+p95 differed by 5.30 ms between controls. One unrelated GPU context
+held 184 MiB before and after the run. The uninstrumented repeat
+shows no HTTP tail increase on this workload. The controls limit
+attribution of the small gain to the declaration change alone.
+
+A same-binary Spark experiment at `8d4b13c954` raised the two-page
+reader's configured vision and packed prefill limits from one to two.
+All 240 outputs matched exactly. The two paired candidate arms each
+ran 26 requests including warmup and executed only eight and nine
+two-item vision groups. Neither arm dispatched a two-item prefill.
+Paired HTTP median/p95 moved from 462.83/471.72 to 465.06/477.76 ms.
+Candidate-only p95 varied by 8.08 ms. The experiment did not
+demonstrate a prefill batching improvement, and serving keeps the
+existing defaults for this workload.
+
+The same binary passed exact two-page output and observed graph replay
+with declared warmup disabled. With the opt-in enabled and recurrent
+fusion disabled, serial output parity passed and the graph correctly
+used its observed workspace. The old fixture expected a declared plan
+solely from the opt-in and failed that assertion. The fixture now
+expects observed learning when the fusion prerequisite is turned off.
+
+### Metal validation of the grouped audio follow-up
+
+The M4 Max production HTTP server built from `78a42df545` served the
+released EmbeddingGemma 2 checkpoint with Metal required. Eight requests
+at each width of two, three, and four unequal-length clips used the
+device batch route, including funded audio arena reuse and replay. The
+largest absolute difference against independent clip requests was below
+`7.4e-7`, within the existing `1e-5` same-backend parity gate. A second
+clip set also exercised the length-bucket split into singleton work.
+
+The 12 focused checks passed without skips. They covered disjoint clamp
+scratch after fused projection declined, audio admission and cancellation,
+Florence cache reuse and token selection, and resident merged ONNX cache
+handoff. The Debug executor microbatch target passed 84 of 86 checks on
+the same Mac, with two skips, after updating its compiler memory bound.
+
+### Native and Metal ownership checks at `c5eee3e0cd`
+
+The focused M4 Max run passed 11 tests with zero skips. It covered
+assigned Metal QKV and attention workspace, audio projection clamp
+storage and segmented audio, the GLiNER workspace fence, resident
+Whisper publication, and the synthetic Inkling decoder visit schedule.
+The installed DECIDE 1B safetensors model returned the expected
+classification through the HTTP handler with Metal required.
+
+The same executable passed three Native checks with zero skips using
+the shared installed models and no rebuild. On both providers, the
+released T5-small merged ONNX decoder retained all 12 self-cache and
+12 cross-cache slots independently at prefixes 1, 8, 32 and 64. The
+released microbatch fixture fused suffixes after encoder retirement.
+Native also passed the DECIDE HTTP classification fixture.
+
+The same executable also passed the released prefill sweep at all 16
+combinations of batch widths 1, 2, 4 and 8 and prefix lengths 1, 8, 32
+and 64 on each provider. Each final vocabulary row matched its
+provider's batch-one reference within `1e-3`. Median of the final three
+calls, including the final-row readback, was 1.87 ms on Native and
+9.95 ms on Metal at batch one and one token. At batch eight and
+64 tokens, the corresponding medians were 166.42 and 16.06 ms.
+These are within-revision shape measurements.
+
+### Spark CUDA ownership checks at `a1a9b7b886`
+
+The broader storage-based warmup revision passed all 40 focused
+checks with zero skips. Released LightOnOCR-3-0.8B served both pages
+with exact serial parity and replayed using its declared zero-byte
+plan. The installed DECIDE 1B safetensors model passed the HTTP
+classification fixture with CUDA required. Released T5-small passed
+the ONNX Runtime reference, kept all 24 cache slots independently
+owned at prefixes 1, 8, 32 and 64, and fused suffixes after encoder
+retirement. CUDA captured and replayed at each of those prefixes.
+
+The same Spark revision completed 256 LightOnOCR-3-4B pages across
+four concurrent 64-page requests with a 128-row registration limit.
+Every output matched the serial reference. The measured round took
+41.30 seconds at 6.20 pages/second, with 16-row head packets and
+separate graph replays at 60 and 98 rows. The benchmark recorded
+replay width but had disabled the verbose reader profile and did
+not identify the workspace origin. The first-replay receipt now
+includes the workspace origin, event count, and bytes under the
+existing benchmark switch.
+
+At `78a166f417`, all 41 focused Spark checks and a separate unfused
+HTTP fallback check passed. The unprofiled and profiled 4B repeats
+each completed 256 pages with exact serial parity, at 6.16 and 6.25
+pages/second. The profiled repeat did not exhaust retirement records.
+Both repeats missed the timed replay requirement. The plain trace
+recorded retirement during foreground work or page cleanup before
+the next captured burst. The profiled trace learned 98 tensors at
+both 56 and 60 rows, with a 10,240-byte peak. Of those allocations,
+66 were 10,240 bytes and 32 were 1,024 bytes. These sizes match the
+decoder's hidden-width and head-width adjusted normalization weights
+with the production cache disabled. This is a targeted remaining
+workspace candidate. Wide capture and replay remain unqualified.
+
+At `e32afca66d`, all 45 focused Spark checks passed with zero skips.
+The cache-disabled two-page fixture matched serial output and replayed
+with a declared zero-byte plan. The separate unfused fixture matched
+serial output with observed replay and zero learned bytes. On 4B,
+two 98-row observed plans recorded zero allocations, events and bytes.
+The profiled run completed all 256 pages with serial parity and replayed
+declared zero-byte plans at 60 and 18 rows. The unprofiled run replayed
+an observed zero-byte plan at 98 rows and a declared plan at 61 rows,
+then returned retryable resource unavailability before finishing all
+pages. The norm-weight migration removes the observed 10,240-byte
+peak. Sustained wide declared replay and progress under retirement
+pressure remain open.
+
+At `a8180efde0`, all 45 focused Spark checks passed again, as did
+the separate cache-disabled and unfused HTTP fixtures. Both wide
+variants completed all 256 pages with exact serial parity and zero
+retirement-capacity retries. The unprofiled run passed the timed
+wide replay gate at 6.32 pages/second. It replayed an observed
+zero-byte plan at 98 rows and declared zero-byte plans at 60 and
+2 rows. The profiled variant reached 6.27 pages/second and replayed
+a declared zero-byte plan at 3 rows, missing its wide replay
+requirement. The enlarged retirement pool preserved progress in
+this pair. Sustained wide replay and declared replay above 64 rows
+remain open.
+
+At `4985997ee6`, all 46 focused Spark checks passed without skips, as
+did separate runs of the cache-disabled and unfused HTTP fixtures. The
+warmup now verifies packet dispatch and in-place attention gating
+independently. Attention may dispatch multiple packets per layer and
+token, while gating runs once on the assembled output.
+
+The unprofiled and profiled workloads each completed 256 released
+LightOnOCR-3-4B pages with exact serial parity and zero retirement-capacity
+retries. Both passed the timed declared replay gate at 65 rows or wider.
+The unprofiled run replayed two declared 98-row graphs at 6.26 pages/s
+overall. The profiled run replayed one at 6.36 pages/s overall. All three
+98-row receipts reported zero learned events and bytes. This qualifies
+declared wide replay in both configurations on Spark. The measurements
+do not establish a throughput gain against a paired frozen baseline.
+
+The paired Spark repeat froze the previously qualified `a8180efde0`
+reader as A and `4985997ee6` as B, verified both binary digests, and
+used the same 256-page workload in every arm. All 2,048 pages matched
+the serial reference, with zero retirement-capacity retries. All four
+candidate arms replayed a declared plan above 64 rows, at widths of
+66 or 98. All four baseline arms replayed above 64 rows with observed
+plans, at widths of 97 or 98. One unrelated GPU context held 184 MiB
+throughout.
+
+| Sequence | Pages/s in run order |
+| --- | ---: |
+| AA | 6.02, 6.30 |
+| ABBA | 6.19, 6.32, 6.29, 6.29 |
+| BB | 6.25, 6.26 |
+
+Pooled paired throughput was 6.24 pages/s for A and 6.31 for B, a
+1.1% increase within the baseline-only control spread. The comparison
+establishes repeatable declared replay and no measured regression on
+this workload. It does not establish a throughput gain outside the
+controls or a comparison against merged main.
+
+At `c519052760`, positioned prefill used one executor-owned chunk
+limit and checked every packed prefix against it before reserving or
+mutating state. All 49 Spark focused checks and the separate unfused
+and cache-disabled HTTP checks passed without skips. All five M4 Max
+Metal checks passed without skips. The released 0.8B Metal HTTP case
+matched both serial pages, and the Metal recurrent check matched Native
+continuation and reset without readbacks.
+
+The two Spark 4B runs explicitly selected a 256-row chunk limit. Each
+completed 256 pages with exact serial parity, 512 packed prefill chunks,
+256 starts, 256 finishes, and zero retirement-capacity retries. The
+unprofiled run reached 6.28 pages/s and replayed declared 107-row graphs
+twice with zero learned events and bytes. The profiled run reached
+6.33 pages/s and passed chunk coverage. Its largest declared replay was
+42 rows, below the 65-row replay gate. The 107-row profiled cohort hit
+scratch and park admission pressure before its captured plan retired
+during page cleanup.
+
+At `3584e01d9f`, mixed prefill charges the shared decode peers once
+per cohort and retains both queued working sets. All 52 focused Spark
+checks passed without skips. In the first profiled and unprofiled
+256-page runs, both matched serial output at 6.28 pages/s, with 512
+packed prefill chunks and zero retirement-capacity retries. Scratch
+denials delayed the largest graphs and both runs replayed at only 29 rows.
+
+The profiled repeat used `c519052760` as A and `3584e01d9f` as B, under
+the same 24 GiB scratch budget and 256-row prefill limit. All eight arms
+completed 256 pages and 512 packed chunks with exact serial parity and
+zero retirement-capacity retries. Reserved decoder workspace fell from
+1,981,939,712 to 1,405,353,984 bytes in every candidate arm, a reduction
+of 550 MiB (29.1%). These numbers are the shared workspace lease sizes.
+
+| Sequence | Pages/s in run order |
+| --- | ---: |
+| AA | 6.28, 6.24 |
+| ABBA | 6.34, 6.31, 6.37, 6.30 |
+| BB | 6.34, 6.33 |
+
+Pooled paired throughput was 6.32 versus 6.34 pages/s. All four baseline
+arms recorded declared replay at 107 rows. Two candidate arms reached
+113 rows and two reached only 30 or 32 rows. The lower reservation
+preserved throughput in this comparison. All eight arms reached the
+128-page registration limit. In one candidate miss, a 113-row graph
+hit park and scratch admission denials, then retired before a replay
+during page cleanup. In the other miss, a 111-row graph recorded
+successfully and foreground vision retired it before replay. That arm
+had no graph scratch-funding denials. Consistent wide replay under
+chunked prefill therefore also depends on graph lifetime across foreground
+work and page transitions.
+
+Dropping independent projected prompt rows no longer clears the CUDA
+decode graph at `3d0ba0620a`. Actual recurrent and KV release still
+invalidates dependent graphs. All 52 focused Spark checks passed.
+The two 256-page runs matched serial output exactly, each with 512
+packed chunks and zero retirement-capacity retries. The unprofiled
+run reached 6.38 pages/s and replayed at 30 rows. The profiled run
+reached 6.27 pages/s without replay. Each run recorded a 113-row graph
+that retired when dependent page state was cleaned up, before the
+first completed replay. The profiled run also retired a recorded
+29-row graph at the same boundary. The maintenance change removes an
+unrelated invalidation, while the wide replay gate remains open under
+chunked prefill.
+
+At `f2f16df5d5`, the graph planner checks whether the shortest
+remaining token budget permits a completed replay after setup. A
+ready graph can still run its final two-token burst. All 53 focused
+Spark checks passed without skips. Both 256-page chunked runs passed
+the wide declared replay gate at 113 rows and matched serial output.
+The unprofiled and profiled rates were 6.29 and 6.26 pages/s,
+respectively. Every recording in these runs had zero model EOS rows
+and a minimum remaining budget of 109 to 118 tokens. The horizon
+guard did not account for the successful 113-row replays.
+
+The profiled paired repeat used `3584e01d9f` as A and `f2f16df5d5` as B.
+All 2,048 pages matched serial output and every arm completed 512
+packed chunks without retirement-capacity retries. Paired throughput
+was 6.38 pages/s for A and 6.28 for B. The candidate ran about 1.6%
+slower, beyond the spread between the same-binary controls in this
+comparison. Baseline replay reached 113 rows in two of four arms.
+Candidate replay reached 113 rows in three of four arms. The other
+candidate arm replayed at only two rows.
+
+No candidate arm declined a graph for insufficient token budget.
+One recorded 30-row graph emitted EOS in 14 rows and retired during
+page-state cleanup before replay. Its shortest remaining budget was
+108 tokens. The 113-row recordings emitted no EOS. These results
+leave both the throughput and consistent wide-replay gates open.
+
+The reversed-order unprofiled repeat used the same two frozen binaries
+and 24 GiB scratch limit. All eight arms again completed 256 pages with
+exact serial parity, 512 packed chunks and zero retirement-capacity
+retries. Pooled paired throughput was 6.37 pages/s for A and 6.20 for B,
+a 2.6% drop. The baseline controls ranged from 6.31 to 6.43 pages/s and
+the candidate controls from 6.33 to 6.40. Two baseline arms replayed at
+113 rows. One candidate arm reached 113 rows and the other three reached
+29 or 30 rows.
+
+The profiled run recorded 75 mixed prefill/decode steps in the paired
+baseline arms and 85 in the candidate arms. Their summed host forward
+and drain spans were 44.80 and 46.62 seconds, respectively. These spans
+include waits. The comparison changes both independent prompt cleanup
+and the replay-horizon check.
+
+The isolated prompt-cleanup comparison used the same baseline
+`3584e01d9f` and the intermediate `3d0ba0620a` runtime. All eight
+unprofiled arms completed 256 pages and 512 packed chunks with exact
+serial parity and zero retirement-capacity retries. Paired throughput
+was 6.31 versus 6.29 pages/s, a 0.4% drop. Both paired sides replayed
+above 64 rows in both arms. In all four arms per side, each runtime
+missed wide replay once. This comparison did not reproduce the
+combined changes' 2.6% slowdown. Direct attribution remains open.
+
+The next unprofiled comparison held prompt cleanup fixed, using
+`3d0ba0620a` as A and `f2f16df5d5` as B. It isolated the combined
+replay-horizon and recording telemetry changes using the same 24 GiB
+scratch limit. All eight arms completed 256 pages with exact serial
+parity and zero retirement-capacity retries. Pooled paired throughput
+was 6.24 versus 6.34 pages/s. The control arms measured 6.26–6.27
+pages/s for A and 6.28–6.29 for B. All four A arms replayed at 113
+rows. Three B arms reached 113 rows and one reached only 30 rows.
+The earlier throughput drop did not reproduce in this comparison.
+In the 30-row candidate arm, dependent page cleanup retired the
+113-row owner in capture phase after its first two tokens, before any
+graph recording. The later 30-row recording reported zero EOS rows
+and replayed. Reliable wide replay through page retirement remains
+open.
+
+At `0cd7a9e823`, all 55 focused Spark checks passed without skips.
+The physical graph fixture preserved the replay after an unrelated
+page moved, retired it for the referenced page, then verified that
+repeated cleanup left the retired snapshot unchanged. Released Whisper
+Small cancelled during cross-cache construction, retained the prepared
+weights, rebuilt the cache, and produced the same English transcript
+on all five calls.
+
+Both 256-page 4B runs matched serial output with 512 packed prefill
+chunks each and zero retirement-capacity retries. The unprofiled run
+replayed declared graphs at 113 rows twice and reached 6.20 pages/s.
+The profiled run reached 6.33 pages/s without replay. Four rows emitted
+EOS in its recorded 31-row burst, and page cleanup retired the graph
+before the first completed replay. The cleanup change passed the
+ownership fixture, while wide replay under profiled chunking remains
+unqualified.
+
+The graph owner now applies the same dependency check to managed
+cleanup and the remaining raw release callbacks. Spark passed all 13
+focused checks without skips. The physical fixture kept a parked and
+restored graph replayable while unrelated sequence and recurrent
+addresses were released. Releasing a referenced sequence retired it.
+Released LightOnOCR-3-0.8B replayed a declared two-row graph with zero
+workspace events. The change was qualified for custody and released
+output behavior. Wide throughput and dependent page churn remain open.
+
+The opt-in CUDA recurrent page table places each layer's history and
+state addresses in the graph metadata allocation before recording.
+Both fused decode steps use the same table and choose opposite history
+orders. The released 0.8B reader confirmed the exact table byte count
+and replayed a declared two-row graph with zero workspace events.
+All three focused Spark checks passed. Pinned SM121 assembly used 162
+registers, 2,120 bytes of shared memory and zero spill bytes for the
+previous kernel, the regenerated inline variant and the device-table
+variant. The graph still checks the full cohort key and retires on a
+referenced page release. Attention still captures its block table by
+value.
+
+The same-binary Spark 4B ABBA comparison at `8b7c115ca8` completed
+1,024 pages with exact serial output and zero retirement-capacity
+retries. Pooled throughput was 6.25 pages/s with the table off and
+6.29 pages/s with it on. The opt-in route recorded and launched a
+113-row graph with 96 recurrent packet dispatches. One row emitted
+EOS, and dependent page cleanup retired that graph before its first
+replay. Candidate replay reached 30 and 19 rows. Baseline replay
+reached 113 and 30 rows. Wide replay remains unqualified.
+
+The opt-in attention table holds each packet's base lengths and block
+IDs in admitted CUDA graph metadata. Warmup and recording refresh the
+table before dispatch, and replay reads it using the graph progress
+counter. The inline route shares the same numerical kernels. With both
+device tables enabled, all four focused Spark checks passed. The
+released reader verified the 17,408-byte attention table and replayed a
+declared two-row graph. Pinned SM121 assembly kept zero spills and the
+same shared-memory usage in every attention kernel. Registers grew
+from 40 to 48 for ungrouped 32-token attention and from 18 to 22 for
+suffix writes. The graph still attests a single exact cohort.
+
+The Spark same-binary 4B ABBA comparison at `8307517db4` kept
+recurrent device tables enabled in every arm and toggled attention.
+All four 256-page arms matched serial output, completed without
+retirement-capacity retries and used 256-row prefill chunks. Paired
+throughput was 6.30 pages/s with attention tables off and 6.32
+pages/s with them on. Both opt-in arms replayed at 113 rows with
+a declared zero-event workspace. Inline attention reached 113 rows
+in one arm and 30 in the other. This comparison exercises wide replay
+inside an unchanged cohort. Replay after rebinding remains open.
+
+The opt-in guarded rebind can suspend a recorded graph when a
+referenced non-leader page departs. It requires the next cohort to
+retain the exact width, packet leaders, immutable weight pointers,
+global KV roots and physical workspace geometry. The new tables and
+positions must be staged before replay can resume. A packet leader
+or incompatible binding still retires the graph. Tests check the
+typed recurrent key and these rejection gates.
+
+With both device tables enabled, the Spark 4B ABBA comparison
+completed 1,024 pages with exact serial output. Paired throughput
+was 6.27 pages/s with rebinding off and 6.31 with it on. All four
+arms replayed at 113 rows. No arm exercised a completed rebind,
+so the timing comparison does not qualify changing-cohort replay.
+All four focused CUDA checks passed.
+
+A deterministic follow-up on Spark captured a graph that reads the
+recurrent and attention tables and positions. After the follower was
+released, a malformed replacement left replay suspended. A valid
+replacement kept the same graph executable and device-table addresses,
+and replay read the new recurrent pointer, block ID, token count and
+positions. All four CUDA checks passed, including the released 0.8B
+model. The fixture qualifies device binding and failure handling.
+Changing-cohort model inference and throughput remain unqualified.
+
+The benchmark now requires a completed rebound replay independently of
+ordinary replay. The runtime records the event only after validating the
+replay readback. Spark completed the three focused CUDA checks, and the
+12 benchmark parser tests passed locally. The first varied-page runs
+hit the serial reference's 128-token limit. At 384 tokens, the 8- and
+16-row LightOnOCR-3-0.8B runs each completed 64 pages with exact serial
+output. Both missed the rebound gate despite ordinary replays at their
+target widths. Their logs showed foreground vision, mixed prefill and
+changed bindings repeatedly retiring the active owner.
+
+The foreground handoff now preserves a suspended graph when both
+page tables are staged, the declared arena is empty and the graph
+borrows no vendor workspace. Admission reserves a bounded host key
+so the replacement can change its number of attention blocks while
+retaining the same captured KV roots. Four focused Spark checks
+passed with zero skips. The physical fixture kept the same executable
+through foreground vision and mixed prefill, rejected a malformed
+replacement, then replayed with a different attention block count.
+
+The released 0.8B runs at target widths 8 and 16 each completed 64
+pages with exact serial output. Both recorded zero rebound replays
+and missed the strict gate. Changed bindings remained the main
+observed retirement reason. These runs establish output parity for
+the exercised workloads. The throughput effect of actual model
+rebinding remains unqualified.
+
+With the same opt-in, foreground work can now suspend an eligible
+recorded graph before a follower departs. A completed replay counts
+toward the changing-cohort gate only if its sequence bindings
+changed. All four focused Spark checks passed with zero skips.
+The released 8- and 16-row runs again each completed 64 pages with
+exact serial parity and zero changed-cohort replays. The logged
+replay resets changed batch width, which still requires a different
+executable.
+
+The M4 Max focused cohort at `061f213135` passed all seven checks
+with zero skips. It exercised the shared installed Whisper Small
+checkpoint with the Metal backend required, verified assigned packed
+prefill, and checked prepared initial rows and decode against ordinary
+execution. Other checks verified the resident publication retirement
+guard, the foreign Metal encoder handoff without host transport, and
+the mixed reader workspace bounds. This cohort qualifies the listed
+paths for correctness and ownership.
+
+### Current HTTP comparison on M4 Max at `e540d5ff64`
+
+The production Metal server was compared with the frozen issue baseline
+`9e4af7f847`. The restored fixture archive and baseline binary matched
+the earlier SHA-256 receipts. Each phase measured 16 requests per side
+after three warmups per arm. The eight workloads below matched output
+hashes across all AA, ABBA and BB controls.
+
+| Workload | Baseline p50 / p95 (ms) | Candidate p50 / p95 (ms) |
+| --- | ---: | ---: |
+| Whisper Small | 492.37 / 494.56 | 373.47 / 377.57 |
+| EmbeddingGemma 2 text | 10.99 / 11.23 | 11.15 / 11.39 |
+| EmbeddingGemma 2 grouped audio | 39.77 / 43.26 | 36.67 / 41.38 |
+| LightOnOCR-3-0.8B | 353.50 / 358.92 | 353.60 / 355.93 |
+| GLiNER 2.5 | 9.79 / 10.08 | 9.73 / 10.33 |
+| DECIDE | 30.37 / 30.91 | 30.76 / 31.39 |
+| Qwen3 | 864.00 / 872.56 | 852.99 / 865.12 |
+| Gemma 4 E4B video | 1,049.55 / 1,051.21 | 709.04 / 711.68 |
+
+The frozen baseline returned retryable capacity errors for Gemma 4 E4B
+text, image and audio in all six baseline arms of the mixed workload.
+The candidate completed those cases. The mixed run provides no paired
+latency for those three modalities.
+
+The isolated Metal E4B comparison used the same two binaries, checkpoint,
+request bytes, scratch limit and sample schedule. The server held only
+E4B during these runs. All four modalities matched across the three
+controls and all requests completed.
+
+| Workload | Baseline p50 / p95 (ms) | Candidate p50 / p95 (ms) |
+| --- | ---: | ---: |
+| Gemma 4 E4B text | 452.87 / 454.63 | 453.35 / 454.52 |
+| Gemma 4 E4B image | 1,087.63 / 1,088.65 | 738.61 / 740.50 |
+| Gemma 4 E4B audio | 290.58 / 292.68 | 290.32 / 291.71 |
+| Gemma 4 E4B video | 1,042.02 / 1,062.67 | 706.72 / 707.68 |
+
+Native CPU used the same `e540d5ff64` server and baseline, with the DFT
+audio frontend pinned on both sides for grouped EmbeddingGemma 2 audio.
+All eleven workloads had 16 measured requests per side per phase and
+matched across all three controls. No request failed.
+
+| Workload | Baseline p50 / p95 (ms) | Candidate p50 / p95 (ms) |
+| --- | ---: | ---: |
+| Whisper Small | 674.70 / 676.87 | 674.24 / 678.57 |
+| EmbeddingGemma 2 text | 17.63 / 17.90 | 17.64 / 17.99 |
+| EmbeddingGemma 2 grouped audio | 242.51 / 265.02 | 241.22 / 247.97 |
+| LightOnOCR-3-0.8B | 6,849.41 / 6,874.63 | 6,830.11 / 6,858.09 |
+| GLiNER 2.5 | 15.49 / 15.77 | 15.59 / 16.07 |
+| DECIDE | 126.76 / 128.54 | 125.06 / 127.84 |
+| Qwen3 | 1,461.09 / 1,467.60 | 1,461.99 / 1,467.42 |
+| Gemma 4 E4B text | 7,916.96 / 7,946.63 | 3,065.42 / 3,099.42 |
+| Gemma 4 E4B image | 5,489.50 / 5,637.09 | 3,695.49 / 3,714.06 |
+| Gemma 4 E4B audio | 1,275.33 / 1,283.04 | 956.91 / 965.35 |
+| Gemma 4 E4B video | 5,103.07 / 5,124.95 | 3,088.03 / 3,105.37 |
+
+The grouped-audio candidate-only p95 controls spread from 242.89 to
+510.30 ms. The paired tail improvement is weak evidence under that
+variation. Native Gemma 4 has complete controls in the mixed run,
+so the subsequent isolated comparison targets the missing Metal cases.
+
+### Current tier-one CUDA HTTP comparison on Spark at `4b17a05de6`
+
+The production CUDA server ran against frozen issue baseline `9e4af7f847`
+with 16 measured requests per side in AA, ABBA and BB. All ten shared
+workloads matched across all controls, with no failures. An unrelated
+GPU context held 184 MiB before and after the run.
+
+| Workload | Baseline p50 / p95 (ms) | Candidate p50 / p95 (ms) |
+| --- | ---: | ---: |
+| Whisper Small | 383.75 / 385.09 | 384.56 / 385.24 |
+| EmbeddingGemma 2 text | 8.78 / 9.39 | 8.74 / 9.47 |
+| EmbeddingGemma 2 grouped audio | 51.05 / 52.40 | 48.51 / 49.45 |
+| LightOnOCR-3-0.8B | 321.26 / 323.54 | 319.35 / 321.42 |
+| GLiNER 2.5 | 12.99 / 14.22 | 10.45 / 11.24 |
+| Qwen3 | 86.40 / 87.75 | 85.92 / 87.95 |
+| Gemma 4 E4B text | 223.06 / 224.95 | 222.01 / 223.95 |
+| Gemma 4 E4B image | 279.78 / 280.90 | 279.77 / 281.60 |
+| Gemma 4 E4B audio | 216.55 / 219.93 | 215.23 / 220.69 |
+| Gemma 4 E4B video | 255.27 / 257.92 | 252.37 / 255.76 |
+
+The separate candidate-only DECIDE CUDA controls also matched outputs
+with no failures. Their p50/p95 were 40.03/41.54 and 40.30/40.78 ms.
+The frozen baseline lacks that route. The LightOnOCR HTTP case uses
+the 0.8B model and a single page. The chunked 4B replay and throughput
+gates remain separate.
+
+### Released Inkling Metal checkpoint at `7f0ff56ff8`
+
+Five focused checks passed on M4 Max with zero skips. The released
+Inkling-2-Mini decoder matched the known greedy sequence for four
+tokens. At 16 prefill rows, grouped execution matched serial logits
+exactly and took 310.25 ms compared with 855.51 ms. The separate
+273-row fixture matched the next token and took 3,398.91 ms with
+grouped execution compared with 5,087.47 ms. These are single-fixture
+timings. The 57-by-62 image produced four projected rows, and the
+33-token image-chat prompt returned the expected answer, “Red.”
+The released grouped vision projections matched the separate
+projections. The same run verified Whisper’s resident publication
+guard and both assigned Metal audio paths. Full-context runtime and
+external-engine comparisons were outside this cohort.

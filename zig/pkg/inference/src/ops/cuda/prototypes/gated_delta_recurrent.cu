@@ -549,31 +549,43 @@ extern "C" __global__ void lighton_ragged_recurrent_prefix_only(const __grid_con
 
 
 // F32 only. One CTA owns a complete head: no inter-block reductions or state aliases.
-__device__ __forceinline__ float decode_conv_one(const RaggedParams& p,int page,int row,int channel,int owns_history){
+__device__ __forceinline__ float decode_conv_one(const RaggedParams& p, const BatchPage& binding,int page,int row,int channel,int owns_history){
     int channels=(2*p.base.key_heads+p.base.value_heads)*128;
-    const float* hist=p.base.pages[page].history+channel*4;
+    const float* hist=binding.history+channel*4;
     const float* weight=p.base.conv_weight+channel*4;
     float sample=p.base.mixed[row*channels+channel],sum=0.f;
     #pragma unroll
     for(int k=0;k<4;++k){float v=k==3?sample:(p.initialized[page]?hist[k+1]:0.f);sum+=v*weight[k];}
     if(owns_history){
-        float* next=p.base.pages[page].next_history+channel*4;
+        float* next=binding.next_history+channel*4;
         #pragma unroll
         for(int k=0;k<4;++k)next[k]=p.initialized[page]?(k==3?sample:hist[k+1]):(k==3?sample:0.f);
     }
     return sum/(1.f+expf(-sum));
 }
-template<int P> __device__ __forceinline__ void fused_decode_head(const RaggedParams& p){
+template<int P, bool Bound = false> __device__ __forceinline__ void fused_decode_head(const RaggedParams& p, const BatchPage* pages = nullptr, int step = 0){
     int page=blockIdx.y/p.base.value_heads,vh=blockIdx.y%p.base.value_heads;
     if(p.lengths[page]!=1)return;
+    BatchPage binding;
+    if constexpr (Bound) {
+        binding = pages[page];
+        if (step != 0) {
+            float* previous = binding.history;
+            binding.history = binding.next_history;
+            binding.next_history = previous;
+        }
+    } else {
+        binding = p.base.pages[page];
+    }
+
     const int tid=threadIdx.x,row=p.offsets[page],kh=vh/(p.base.value_heads/p.base.key_heads);
     const int width=p.base.value_heads*128;
     __shared__ float q[132],k[132],values[128],results[128],sq[4],sk[4],gates[2];
     if(tid<128){
         int owns_qk=vh%(p.base.value_heads/p.base.key_heads)==0;
-        float qv=decode_conv_one(p,page,row,kh*128+tid,owns_qk);
-        float kv=decode_conv_one(p,page,row,(kh+p.base.key_heads)*128+tid,owns_qk);
-        values[tid]=decode_conv_one(p,page,row,2*p.base.key_heads*128+vh*128+tid,1);
+        float qv=decode_conv_one(p,binding,page,row,kh*128+tid,owns_qk);
+        float kv=decode_conv_one(p,binding,page,row,(kh+p.base.key_heads)*128+tid,owns_qk);
+        values[tid]=decode_conv_one(p,binding,page,row,2*p.base.key_heads*128+vh*128+tid,1);
         float qsum=warp_sum(qv*qv),ksum=warp_sum(kv*kv);
         if((tid&31)==0){sq[tid/32]=qsum;sk[tid/32]=ksum;}
         int slot=(tid/32)*33+tid%32;q[slot]=qv;k[slot]=kv;
@@ -592,7 +604,7 @@ template<int P> __device__ __forceinline__ void fused_decode_head(const RaggedPa
     __syncthreads();
     const int lane=tid&31,part=lane/(32/P),col=(tid/32)*(32/P)+lane%(32/P);
     float memory[128/P];
-    float* state=p.base.pages[page].state+vh*128*128;
+    float* state=binding.state+vh*128*128;
     #pragma unroll
     for(int i=0;i<128/P;++i)memory[i]=p.initialized[page]?state[(part*(128/P)+i)*128+col]:0.f;
     float pred[4/P];
@@ -629,6 +641,10 @@ template<int P> __device__ __forceinline__ void fused_decode_head(const RaggedPa
     if(tid<128){int i=row*width+vh*128+tid;float z=p.base.z[i];p.base.out[i]=results[tid]*sq[0]*p.base.norm_weight[tid]*(z/(1.f+expf(-z)));}
 }
 extern "C" __global__ void lighton_decode_fused_p2(const __grid_constant__ RaggedParams p){fused_decode_head<2>(p);}
+extern "C" __global__ void antfly_gdn_decode_p2_device_pages(
+    const __grid_constant__ RaggedParams p, const BatchPage* pages, int step) {
+    fused_decode_head<2, true>(p, pages, step);
+}
 extern "C" __global__ void lighton_ragged_prefix_gated_norm(const __grid_constant__ RaggedParams p){
     int row=blockIdx.x/p.base.value_heads,vh=blockIdx.x%p.base.value_heads;
     int lo=0,hi=p.base.items;while(lo+1<hi){int mid=lo+(hi-lo)/2;if(p.offsets[mid]<=row)lo=mid;else hi=mid;}

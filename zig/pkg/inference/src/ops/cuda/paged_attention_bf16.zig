@@ -133,6 +133,13 @@ pub const Page = extern struct {
     block_count: u32 = 0,
     block_offset: u32 = 0,
 };
+pub const PageTable = extern struct {
+    pages: [max_packet_rows]Page,
+    blocks: [max_blocks]u32,
+};
+comptime {
+    if (@sizeOf(PageTable) != 17408) @compileError("attention device page table ABI changed");
+}
 pub const Params = extern struct {
     q: driver.CUdeviceptr = 0,
     k: driver.CUdeviceptr = 0,
@@ -153,7 +160,7 @@ pub const Params = extern struct {
     blocks: [max_blocks]u32 = @splat(0),
     graph_progress: driver.CUdeviceptr = 0,
     graph_step: u32 = 0,
-    reserved: u32 = 0,
+    page_table_offset: u32 = 0,
 
     /// Snapshot the authoritative physical table before another sequence can
     /// reuse storage's host scratch. The packet has one shared capacity rather
@@ -170,11 +177,74 @@ pub const Params = extern struct {
         return true;
     }
 
+    /// Validate each block once. Shared read-only blocks are legal, but each
+    /// written suffix block must be absent from every other page table,
+    /// including the slots reserved for graph replay.
+    pub fn suffixWritesDisjoint(self: *const Params, capacity_tokens: usize) bool {
+        if (self.items < 2 or self.items > self.pages.len or self.page_size == 0) return false;
+        const pages = self.pages[0..self.items];
+        const capacity_blocks = capacity_tokens / self.page_size;
+        var tails: SuffixBlockIndex = .{};
+        for (pages, 1..) |page, owner| {
+            const blocks = self.blockIds(page);
+            if (page.tokens == 0) return false;
+            const tail = (page.tokens - 1) / self.page_size;
+            if (tail >= blocks.len or !tails.insert(blocks[tail], @intCast(owner))) return false;
+        }
+        for (pages, 1..) |page, owner| {
+            for (self.blockIds(page)) |id| {
+                if (id >= capacity_blocks) return false;
+                const writer = tails.writer(id);
+                if (writer != 0 and writer != owner) return false;
+            }
+        }
+        return true;
+    }
+
     pub fn blockIds(self: *const Params, page: Page) []const u32 {
         return self.blocks[page.block_offset..][0..page.block_count];
     }
 };
+const SuffixBlockIndex = struct {
+    const slots = std.math.ceilPowerOfTwoAssert(usize, 2 * max_packet_rows);
+    const shift: u5 = 32 - std.math.log2_int(usize, slots);
+    ids: [slots]u32 = undefined,
+    owners: [slots]u8 = @splat(0),
+
+    fn slot(self: *const SuffixBlockIndex, id: u32) usize {
+        var index: usize = (id *% @as(u32, 0x9e3779b9)) >> shift;
+        while (self.owners[index] != 0 and self.ids[index] != id)
+            index = (index + 1) & (slots - 1);
+        return index;
+    }
+
+    fn insert(self: *SuffixBlockIndex, id: u32, owner: u8) bool {
+        const index = self.slot(id);
+        if (self.owners[index] != 0) return false;
+        self.ids[index] = id;
+        self.owners[index] = owner;
+        return true;
+    }
+
+    fn writer(self: *const SuffixBlockIndex, id: u32) u8 {
+        return self.owners[self.slot(id)];
+    }
+};
+
+test "CUDA attention suffix validation allows shared reads and rejects aliased writes" {
+    var packet: Params = .{ .items = 2, .page_size = 16 };
+    try std.testing.expect(packet.appendPage(0, 17, 16, &.{ 0, 2, 4 }));
+    try std.testing.expect(packet.appendPage(1, 17, 16, &.{ 0, 3, 5 }));
+    try std.testing.expect(packet.suffixWritesDisjoint(96));
+    try std.testing.expect(!packet.suffixWritesDisjoint(95));
+    try std.testing.expect(packet.appendPage(1, 17, 16, &.{ 0, 2, 5 }));
+    try std.testing.expect(!packet.suffixWritesDisjoint(96));
+    try std.testing.expect(packet.appendPage(1, 17, 16, &.{ 0, 3, 2 }));
+    try std.testing.expect(!packet.suffixWritesDisjoint(96));
+}
+
 comptime {
+    if (max_packet_rows > std.math.maxInt(u8)) @compileError("CUDA suffix owner index overflow");
     if (@sizeOf(Page) != 16 or @sizeOf(Params) != 17520 or @offsetOf(Params, "pages") != 92)
         @compileError("LightOn CUDA attention packet ABI changed");
 }

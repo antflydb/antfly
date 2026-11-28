@@ -53400,6 +53400,7 @@ fn assignedKernelGeometrySupported(descriptor: *const ops.kernel_descriptor.Desc
         // Reduced DOT weights remain on the existing converting compatibility
         // path until their source staging has an exact assigned-workspace route.
         .dot => descriptor.input_shapes[0].dtype == .f32 and descriptor.input_shapes[1].dtype == .f32,
+        .binary => descriptor.hasFlatBinaryOperands(),
         .transpose, .broadcast => false,
         .add_mul_scalar => descriptor.input_count == 3 and
             descriptor.input_shapes[0].eq(descriptor.output_shape) and descriptor.input_shapes[1].eq(descriptor.output_shape) and

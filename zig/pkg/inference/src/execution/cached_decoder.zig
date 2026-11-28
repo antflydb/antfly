@@ -29,6 +29,86 @@ pub fn CachedDecoder(comptime Architecture: type) type {
     return struct {
         const Self = @This();
         pub const Mode = enum { scalar, batched };
+        pub const LogitStorage = enum { full_prefix, incremental };
+
+        /// Cached batched decoding materializes [active_rows, vocab] logits for one
+        /// step. KV capacity and encoder geometry still cover the complete invocation.
+        /// Callers selecting this envelope must unwind before full-prefix fallback.
+        pub fn planRun(
+            cfg: Architecture.Config,
+            batch: usize,
+            pixel_count: usize,
+            prompt_length: usize,
+            max_length: usize,
+            storage: LogitStorage,
+        ) !@import("../backends/session.zig").RunRequest {
+            const Checked = struct {
+                fn add(a: usize, b: usize) !usize {
+                    return std.math.add(usize, a, b) catch error.ResourceLimitExceeded;
+                }
+                fn mul(a: usize, b: usize) !usize {
+                    return std.math.mul(usize, a, b) catch error.ResourceLimitExceeded;
+                }
+            };
+            if (batch == 0) return error.InvalidInputShape;
+            const encoder_length = Architecture.encoderSequenceLength(cfg, prompt_length) catch |err| switch (err) {
+                error.Overflow => return error.ResourceLimitExceeded,
+                else => return err,
+            };
+            const decoder_length = @max(max_length, 1);
+            const encoder_bytes = try Checked.mul(try Checked.mul(batch, encoder_length), try Checked.mul(cfg.d_model, @sizeOf(f32)));
+            const logits_bytes = try Checked.mul(try Checked.mul(batch, if (storage == .incremental) @as(usize, 1) else decoder_length), try Checked.mul(cfg.vocab_size, @sizeOf(f32)));
+            const kv_bytes = Architecture.decoderKvBytes(cfg, batch, encoder_length, decoder_length) catch return error.ResourceLimitExceeded;
+            const prompt_bytes = try Checked.mul(prompt_length, try Checked.add(try Checked.mul(batch, @sizeOf(i64)), @sizeOf(i32)));
+            return .{
+                .batch = batch,
+                .sequence = @max(encoder_length, decoder_length),
+                .input_bytes = try Checked.add(try Checked.mul(pixel_count, @sizeOf(f32)), prompt_bytes),
+                .output_bytes = try Checked.add(try Checked.add(encoder_bytes, logits_bytes), kv_bytes),
+                .output_kv_bytes = kv_bytes,
+            };
+        }
+
+        pub const AdmissionGeometry = struct {
+            batch: usize,
+            pixel_count: usize,
+            prompt_length: usize,
+            max_length: usize,
+        };
+
+        pub const AdmissionPolicy = struct {
+            cache_disabled: bool,
+            prefer_cuda_incremental: bool = false,
+
+            pub fn initialStorage(self: AdmissionPolicy, backend: @import("../backends/backends.zig").BackendType) LogitStorage {
+                return if (backend == .cuda and !self.cache_disabled and self.prefer_cuda_incremental) .incremental else .full_prefix;
+            }
+
+            pub fn canRetryIncrementally(self: AdmissionPolicy, backend: @import("../backends/backends.zig").BackendType, err: anyerror) bool {
+                return err == error.ResourceLimitExceeded and !self.cache_disabled and
+                    (backend == .native or backend == .cuda or backend == .metal);
+            }
+        };
+
+        pub const Admission = struct {
+            permit: @import("../backends/session.zig").RunPermit,
+            storage: LogitStorage,
+        };
+
+        /// Retry an unfittable full-prefix envelope before numerical execution.
+        /// The returned mode determines whether full-prefix fallback is funded.
+        pub fn admitBatchedRun(preparation: anytype, session: @import("../backends/session.zig").Session, cfg: Architecture.Config, geometry: AdmissionGeometry, policy: AdmissionPolicy) !Admission {
+            const backend = session.backend();
+            const initial = policy.initialStorage(backend);
+            const request = try planRun(cfg, geometry.batch, geometry.pixel_count, geometry.prompt_length, geometry.max_length, initial);
+            const permit = preparation.admitInputRun(session, request) catch |err| {
+                if (initial == .incremental or !policy.canRetryIncrementally(backend, err)) return err;
+                const retry = try planRun(cfg, geometry.batch, geometry.pixel_count, geometry.prompt_length, geometry.max_length, .incremental);
+                return .{ .permit = try preparation.admitInputRun(session, retry), .storage = .incremental };
+            };
+            return .{ .permit = permit, .storage = initial };
+        }
+
         pub const Context = struct {
             allocator: std.mem.Allocator,
             backend: *const ComputeBackend,
@@ -68,6 +148,40 @@ pub fn CachedDecoder(comptime Architecture: type) type {
             encoder_mask: []const i64,
             batch: usize,
             encoder_length: usize,
+
+            prefix_storage: []i64 = &.{},
+
+            pub fn deinit(self: *@This()) void {
+                self.context.allocator.free(self.prefix_storage);
+                self.prefix_storage = &.{};
+            }
+
+            pub const HostStep = struct {
+                logits: []f32,
+                row_stride: usize,
+                tail_offset: usize,
+            };
+
+            /// Read each batch row's valid prefix from a fixed-width history.
+            /// Reuse the invocation's packed input storage across decoder steps.
+            pub fn stepHostStrided(self: *@This(), history: []const i64, stride: usize, rows: usize) !HostStep {
+                const count = std.math.mul(usize, self.batch, stride) catch return error.InvalidInputShape;
+                if (self.batch == 0 or rows == 0 or rows > stride or count != history.len) return error.InvalidInputShape;
+                if (self.context.control) |control| try control.check();
+                const vocab = self.context.model.vocab_size;
+                const row_stride = std.math.mul(usize, rows, vocab) catch return error.InvalidInputShape;
+                const tail_offset = row_stride - vocab;
+                const needed = self.batch * rows;
+                if (self.prefix_storage.len < needed) {
+                    const grown = self.prefix_storage.len +| self.prefix_storage.len / 2;
+                    const capacity = @min(count, @max(needed, grown));
+                    self.prefix_storage = try self.context.allocator.realloc(self.prefix_storage, capacity);
+                }
+                const packed_ids = self.prefix_storage[0..needed];
+                for (0..self.batch) |batch|
+                    @memcpy(packed_ids[batch * rows ..][0..rows], history[batch * stride ..][0..rows]);
+                return .{ .logits = try self.stepHost(packed_ids, rows), .row_stride = row_stride, .tail_offset = tail_offset };
+            }
 
             pub const Output = struct {
                 allocator: std.mem.Allocator,
@@ -598,6 +712,37 @@ fn checkActualFullPrefixDecoder(cb_value: ComputeBackend, reference_backend: Com
     cancelled.context.control = .{ .check_fn = Cancel.check };
     try std.testing.expectError(error.Cancelled, cancelled.stepResident(&.{ 1, 2 }, 2));
     try std.testing.expectError(error.Cancelled, cancelled.stepHost(&.{ 1, 2 }, 2));
+    try std.testing.expectError(error.Cancelled, cancelled.stepHostStrided(&.{ 1, 2, 0 }, 3, 2));
+    try std.testing.expectEqual(@as(usize, 0), cancelled.prefix_storage.len);
+
+    const batch_encoder = try cb.fromFloat32Shape(&.{ 1, 2, 3, 4, 5, 6, 7, 8 }, &.{ 2, 1, 4 });
+    defer cb.free(batch_encoder);
+    var batch = TestDecoder.FullPrefix{
+        .context = owner.context,
+        .encoder_hidden = batch_encoder,
+        .encoder_mask = &.{ 1, 1 },
+        .batch = 2,
+        .encoder_length = 1,
+    };
+    defer batch.deinit();
+    const history = [_]i64{ 1, 2, 3, 0, 3, 1, 2, 0 };
+    try std.testing.expectError(error.InvalidInputShape, batch.stepHostStrided(history[0..7], 4, 2));
+    try std.testing.expectError(error.InvalidInputShape, batch.stepHostStrided(&history, 4, 5));
+    const prefixes = [_][]const i64{ &.{ 1, 3 }, &.{ 1, 2, 3, 1 }, &.{ 1, 2, 3, 3, 1, 2 } };
+    for (prefixes, 1..) |packed_ids, rows| {
+        const expected = try batch.stepHost(packed_ids, rows);
+        defer a.free(expected);
+        const step = try batch.stepHostStrided(&history, 4, rows);
+        defer a.free(step.logits);
+        try std.testing.expectEqualSlices(f32, expected, step.logits);
+        try std.testing.expectEqual(rows * config.vocab_size, step.row_stride);
+        try std.testing.expectEqual((rows - 1) * config.vocab_size, step.tail_offset);
+        const backing = batch.prefix_storage.ptr;
+        const repeated = try batch.stepHostStrided(&history, 4, rows);
+        defer a.free(repeated.logits);
+        try std.testing.expectEqual(backing, batch.prefix_storage.ptr);
+        try std.testing.expectEqualSlices(f32, expected, repeated.logits);
+    }
 }
 
 test "full prefix decoder actual Native preserves host resident heads held outputs and cancellation" {

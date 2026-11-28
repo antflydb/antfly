@@ -29,6 +29,17 @@ pub fn subsampledRows(frames: usize) usize {
 pub const GroupedRows = struct {
     pub const max_clips = 4;
 
+    /// An existing compacted bank must be split into nonempty, exhaustive rows.
+    pub fn validatePartition(spans: []const usize, rows: usize) error{InvalidAudioPartition}!void {
+        if (spans.len == 0 or spans.len > max_clips) return error.InvalidAudioPartition;
+        var remaining = rows;
+        for (spans) |span| {
+            if (span == 0 or span > remaining) return error.InvalidAudioPartition;
+            remaining -= span;
+        }
+        if (remaining != 0) return error.InvalidAudioPartition;
+    }
+
     spans: [max_clips]usize = @splat(0),
     offsets: [max_clips]usize = @splat(0),
     total: usize = 0,
@@ -59,13 +70,18 @@ pub fn supportsCudaGroupedGraph(clips: usize, right_context: usize) bool {
 /// Ordered inputs shared by audio projection and workspace admission.
 pub const ExecutionInputs = struct {
     pub const hidden = 0;
-    pub const relative = 1;
-    pub const valid = 2;
-    pub const segment_start = 3;
-    pub const segment_valid = 4;
-    pub const scales = 5;
+    pub const valid = 1;
+    pub const segment_start = 2;
+    pub const segment_valid = 3;
+    pub const scales = segment_valid + 1;
     pub const scale_count = 12;
-    pub const count = scales + scale_count;
+    pub const relative = scales + scale_count;
+    pub const count = relative + 1;
+
+    /// CUDA borrows immutable scales and relative keys. Source BF16 uses
+    /// explicit clip spans, while packed F32 attention needs segment_valid.
+    pub const source_bf16_count = segment_valid;
+    pub const full_f32_count = scales;
 
     pub const Metadata = struct {
         shape: []const i64,
@@ -93,7 +109,7 @@ pub const ExecutionInputs = struct {
         var inputs: [count]Metadata = undefined;
         inputs[hidden] = .{ .shape = &shapes[hidden], .elements = try std.math.mul(usize, rows, width) };
         inputs[relative] = .{ .shape = &shapes[relative], .elements = try std.math.mul(usize, context_left, width) };
-        for (valid..count) |slot| {
+        for (valid..relative) |slot| {
             const elements = if (slot < scales) rows else head_dim;
             shapes[slot][0] = @intCast(elements);
             inputs[slot] = .{ .shape = shapes[slot][0..1], .elements = elements };
@@ -102,9 +118,38 @@ pub const ExecutionInputs = struct {
     }
 };
 
+pub const WorkspaceDeclaration = struct {
+    const Workspace = @import("stream_workspace.zig");
+    const Event = Workspace.Plan.Declaration;
+
+    /// Events remain immutable throughout the synchronous Stage lifetime.
+    events: []const Event,
+    published_slot: u15,
+    fingerprint: u64,
+
+    pub fn init(events: []const Event, published_slot: u15) WorkspaceDeclaration {
+        var hash = std.hash.Wyhash.init(0);
+        hash.update("declared-audio-workspace-v1");
+        std.hash.autoHash(&hash, published_slot);
+        for (events) |event| {
+            std.hash.autoHash(&hash, std.meta.activeTag(event));
+            switch (event) {
+                .allocate, .allocate_scratch => |bytes| std.hash.autoHash(&hash, bytes),
+                .release => |slot| std.hash.autoHash(&hash, slot),
+            }
+        }
+        return .{ .events = events, .published_slot = published_slot, .fingerprint = hash.final() };
+    }
+
+    pub fn cacheKey(self: WorkspaceDeclaration, seed: u64) u64 {
+        return std.hash.Wyhash.hash(seed, std.mem.asBytes(&self.fingerprint));
+    }
+};
+
 /// Copied operation geometry only. The actual Stage certifies the model and
 /// rebuilds mutable backend policy/learned-layout requests after every yield.
 pub const AudioRecipe = struct {
+    workspace: ?WorkspaceDeclaration = null,
     source_bf16: bool = false,
     gradient_clipping_bits: u32 = 0,
     frames: [GroupedRows.max_clips]usize = @splat(0),
@@ -143,6 +188,10 @@ pub const AudioRecipe = struct {
         for ([_]usize{ self.hidden, self.output_hidden, self.intermediate, self.conv_kernel, context, try self.rows() }) |extent|
             if (std.math.cast(i64, extent) == null) return error.InvalidPreparedAudioRecipe;
     }
+    pub fn cudaExecutionInputCount(self: AudioRecipe) usize {
+        return if (self.source_bf16) ExecutionInputs.source_bf16_count else ExecutionInputs.full_f32_count;
+    }
+
     pub fn rows(self: AudioRecipe) !usize {
         return self.rowsAndSegments(null);
     }
@@ -171,6 +220,19 @@ pub const AudioRecipe = struct {
         }
         return hash.final();
     }
+    pub fn allowsCudaGroupedGraph(self: AudioRecipe) bool {
+        return self.graph_allowed and self.host_ops_empty and supportsCudaGroupedGraph(self.count, self.context_right);
+    }
+
+    /// Observed and declared plans both bind the full grouped encoder.
+    pub fn matchesGroupedDispatch(self: AudioRecipe, dispatch_key: u64, segments: []const usize, row_count: usize, start: usize, end: usize) !bool {
+        if (!self.allowsCudaGroupedGraph() or start != 0 or end != self.blocks or self.count != segments.len) return false;
+        var admitted: [GroupedRows.max_clips]usize = undefined;
+        const spans = admitted[0..self.count];
+        return (try self.rowsAndSegments(spans)) == row_count and
+            std.mem.eql(usize, spans, segments) and self.key(spans, start, end) == dispatch_key;
+    }
+
     pub fn frontendKey(buffer: []u8, kind: []const u8, fft: usize, frame: usize, mel: usize) ![]const u8 {
         return std.fmt.bufPrint(buffer, "audio_tower.prepared.frontend.f32.v1.{s}.{d}.{d}.{d}", .{ kind, fft, frame, mel });
     }

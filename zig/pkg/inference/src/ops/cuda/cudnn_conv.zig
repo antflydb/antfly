@@ -243,6 +243,11 @@ pub const Plan = struct {
     workspace_bytes: usize = 0,
     stamp: u64 = 0,
     graph: GraphPlan = .{},
+    source_workspace: ?SourceWorkspace = null,
+
+    fn resolveSourceWorkspace(p: *Plan) !void {
+        if (p.key.storage == .bf16) p.source_workspace = try SourceWorkspace.forKey(p.key, p.workspace_bytes);
+    }
 
     fn deinit(p: *Plan, f: *const Table, api: ?*const backend.Api) void {
         if (api) |owned| p.graph.deinit(owned);
@@ -256,6 +261,40 @@ pub const Plan = struct {
 };
 
 pub const Buffer = struct { ptr: usize = 0, bytes: usize = 0 };
+/// Explicit input, weight, output and bias packs surrounding the SDK workspace.
+pub const SourceWorkspace = struct {
+    const Span = @import("buffer.zig").ByteSpan;
+    const alignment = @import("buffer.zig").DeviceBuffer.allocation_alignment;
+    input: Span,
+    weight: Span,
+    output: Span,
+    bias: Span,
+    vendor: Span,
+    bytes: usize,
+
+    pub fn forKey(key: Key, vendor_bytes: usize) !SourceWorkspace {
+        if (key.storage != .bf16 or !key.eligible()) return error.UnsupportedSourceArithmeticGeometry;
+        const mul = std.math.mul;
+        const scalar = @sizeOf(u16);
+        const input = try mul(usize, try mul(usize, key.batch, key.inputs), try mul(usize, key.height, key.width));
+        const weights = try mul(usize, try mul(usize, key.outputs, key.inputs), key.kernel * key.kernel);
+        const output = try mul(usize, try mul(usize, key.batch, key.outputs), try mul(usize, key.outHeight(), key.outWidth()));
+        return resolve(try mul(usize, input, scalar), try mul(usize, weights, scalar), try mul(usize, output, scalar), if (key.bias == .add) key.outputs * scalar else 0, vendor_bytes);
+    }
+
+    pub fn resolve(input: usize, weight: usize, output: usize, bias: usize, vendor: usize) !SourceWorkspace {
+        var cursor: usize = 0;
+        return .{
+            .input = try Span.append(&cursor, input, alignment),
+            .weight = try Span.append(&cursor, weight, alignment),
+            .output = try Span.append(&cursor, output, alignment),
+            .bias = try Span.append(&cursor, bias, alignment),
+            .vendor = try Span.append(&cursor, vendor, alignment),
+            .bytes = try Span.alignedEnd(cursor, alignment),
+        };
+    }
+};
+
 pub const Bindings = struct {
     input: Buffer,
     weight: Buffer,
@@ -268,12 +307,20 @@ pub const Bindings = struct {
         return .{ .begin = buffer.ptr, .end = std.math.add(usize, buffer.ptr, bytes) catch return error.InvalidCudnnBuffer };
     }
     pub fn validate(b: Bindings, key: Key, workspace_bytes: usize) !void {
+        return b.validateExtents(key, workspace_bytes, null);
+    }
+
+    fn validatePlan(b: Bindings, plan: *const Plan) !void {
+        return b.validateExtents(plan.key, plan.workspace_bytes, plan.source_workspace);
+    }
+
+    fn validateExtents(b: Bindings, key: Key, workspace_bytes: usize, source: ?SourceWorkspace) !void {
         if (!key.eligible() or workspace_bytes > Module.workspace_limit) return error.InvalidCudnnBuffer;
         const alignment = if (key.route == .backend_graph) key.alignment else 2;
-        const input = try checked(b.input, try product(&.{ key.batch, key.inputs, key.height, key.width, 2 }), alignment);
-        const weight = try checked(b.weight, try product(&.{ key.outputs, key.inputs, key.kernel, key.kernel, 2 }), alignment);
-        const output = try checked(b.output, try product(&.{ key.batch, key.outputs, key.outHeight(), key.outWidth(), 2 }), alignment);
-        const bias = try checked(b.bias, if (key.bias == .add) try product(&.{ key.outputs, 2 }) else 0, 2);
+        const input = try checked(b.input, if (source) |layout| layout.input.bytes else try product(&.{ key.batch, key.inputs, key.height, key.width, 2 }), alignment);
+        const weight = try checked(b.weight, if (source) |layout| layout.weight.bytes else try product(&.{ key.outputs, key.inputs, key.kernel, key.kernel, 2 }), alignment);
+        const output = try checked(b.output, if (source) |layout| layout.output.bytes else try product(&.{ key.batch, key.outputs, key.outHeight(), key.outWidth(), 2 }), alignment);
+        const bias = try checked(b.bias, if (source) |layout| layout.bias.bytes else if (key.bias == .add) try product(&.{ key.outputs, 2 }) else 0, 2);
         const workspace = try checked(b.workspace, workspace_bytes, 256);
         for ([_]@TypeOf(input){ input, weight, bias }) |operand| {
             if (operand.begin < output.end and output.begin < operand.end) return error.InvalidCudnnBuffer;
@@ -370,7 +417,7 @@ pub const Module = struct {
     /// or numerical submission. No SDK allocation occurs for a prepared replay.
     /// This method never guesses stream-capture state or retires queued owners.
     pub fn prepareBindings(m: *Module, p: *const Plan, bindings: Bindings, actual_capture: bool) !void {
-        try bindings.validate(p.key, p.workspace_bytes);
+        try bindings.validatePlan(p);
         if (p.key.route != .backend_graph or p.graph.matches(bindings)) return;
         if (actual_capture) return error.CudaGraphCaptureUnsafeTempAlloc;
         if (p.graph.variant != null) return error.CudnnVariantPackNeedsRetirement;
@@ -415,6 +462,7 @@ pub const Module = struct {
                 try check(m.f.cudnnSetTensor4dDescriptor(p.y, 0, 9, @intCast(key.batch), @intCast(key.outputs), @intCast(key.outHeight()), @intCast(key.outWidth())));
                 try check(m.f.cudnnSetTensor4dDescriptor(p.bias, 0, 9, 1, @intCast(key.outputs), 1, 1));
             }
+            try p.resolveSourceWorkspace();
             m.plans[m.count] = p;
             m.count += 1;
             return &m.plans[m.count - 1];
@@ -449,12 +497,13 @@ pub const Module = struct {
             p.deinit(&m.f, null);
             return null;
         }
+        try p.resolveSourceWorkspace();
         m.plans[m.count] = p;
         m.count += 1;
         return &m.plans[m.count - 1];
     }
     pub fn run(m: *Module, p: *const Plan, bindings: Bindings) !void {
-        try bindings.validate(p.key, p.workspace_bytes);
+        try bindings.validatePlan(p);
         const x = bindings.input.ptr;
         const weight = bindings.weight.ptr;
         const bias = bindings.bias.ptr;
@@ -476,9 +525,12 @@ pub const Module = struct {
             .bf16 => m.bf16_calls += 1,
         }
         m.workspace_peak_bytes = @max(m.workspace_peak_bytes, p.workspace_bytes);
+        const observation = @import("../../execution/runtime_observation.zig").CudaVendorConvolution;
+        observation.record(p.workspace_bytes, if (p.source_workspace) |source| source.bytes else 0, false);
         if (p.key.bias == .add) {
             try check(m.f.cudnnAddTensor(m.handle, &one, p.bias, @ptrFromInt(bias), &one, p.y, @ptrFromInt(output)));
             m.bias_calls += 1;
+            observation.record(0, 0, true);
         }
     }
 };
@@ -592,8 +644,16 @@ test "vendor convolution reports actual successful SDK submissions and explicit 
     var module = Module{ .lib = undefined, .f = undefined, .handle = null };
     module.f.cudnnConvolutionForward = Fake.forward;
     module.f.cudnnAddTensor = Fake.bias;
-    const plan = Plan{ .key = .{ .storage = .bf16, .bias = .add, .batch = 1, .inputs = 1, .outputs = 2, .height = 3, .width = 3, .kernel = 3, .stride = 2, .padding = 1 }, .workspace_bytes = 256 };
+    var plan = Plan{ .key = .{ .storage = .bf16, .bias = .add, .batch = 1, .inputs = 1, .outputs = 2, .height = 3, .width = 3, .kernel = 3, .stride = 2, .padding = 1 }, .workspace_bytes = 256 };
     const buffers = Bindings{ .input = .{ .ptr = 0x1000, .bytes = 18 }, .weight = .{ .ptr = 0x2000, .bytes = 36 }, .bias = .{ .ptr = 0x2800, .bytes = 4 }, .output = .{ .ptr = 0x3000, .bytes = 16 }, .workspace = .{ .ptr = 0x4000, .bytes = 256 } };
+    var scope: @import("../../execution/runtime_observation.zig").KernelScope = undefined;
+    scope.begin();
+    defer _ = scope.finish();
+    try plan.resolveSourceWorkspace();
+    var short = buffers;
+    short.output.bytes -= 1;
+    try std.testing.expectError(error.InvalidCudnnBuffer, module.run(&plan, short));
+    try std.testing.expectEqual(@as(usize, 0), module.calls);
     try module.run(&plan, buffers);
     try std.testing.expectEqual(@as(usize, 1), module.calls);
     try std.testing.expectEqual(@as(usize, 1), module.bf16_calls);
@@ -605,6 +665,11 @@ test "vendor convolution reports actual successful SDK submissions and explicit 
     try std.testing.expectError(error.CudnnFailure, module.run(&plan, buffers));
     try std.testing.expectEqual(@as(usize, 2), module.calls);
     try std.testing.expectEqual(@as(usize, 2), module.bf16_calls);
+    const receipt = scope.cuda_vendor_convolution.?;
+    try std.testing.expectEqual(@as(u64, 2), receipt.forward_calls);
+    try std.testing.expectEqual(@as(u64, 1), receipt.bias_calls);
+    try std.testing.expectEqual(plan.workspace_bytes, receipt.max_explicit_workspace_bytes);
+    try std.testing.expectEqual(plan.source_workspace.?.bytes, receipt.max_source_bank_bytes);
     try std.testing.expectEqual(@as(usize, 1), module.bias_calls);
     Fake.forward_status = 1;
     try std.testing.expectError(error.CudnnFailure, module.run(&plan, buffers));
@@ -859,4 +924,21 @@ test "CUDA backend convolution BF16 NCHW primitive preserves center filters tail
     try std.testing.expectEqual(@as(usize, 1), module.graph_calls);
     try std.testing.expectEqual(@as(usize, 1), module.bf16_calls);
     try std.testing.expectEqual(@as(usize, 1), module.bias_calls);
+}
+
+test "source convolution separates pack storage and SDK workspace at CUDA alignment" {
+    const layout = try SourceWorkspace.resolve(18, 36, 24, 0, 513);
+    try std.testing.expectEqual(@as(usize, 0), layout.input.offset);
+    try std.testing.expectEqual(@as(usize, 256), layout.weight.offset);
+    try std.testing.expectEqual(@as(usize, 512), layout.output.offset);
+    try std.testing.expectEqual(@as(usize, 0), layout.bias.bytes);
+    try std.testing.expectEqual(@as(usize, 768), layout.vendor.offset);
+    try std.testing.expectEqual(@as(usize, 1536), layout.bytes);
+    try std.testing.expectError(error.Overflow, SourceWorkspace.resolve(std.math.maxInt(usize), 1, 1, 0, 0));
+    const key: Key = .{ .storage = .bf16, .batch = 1, .inputs = 1, .outputs = 2, .height = 3, .width = 3, .kernel = 3, .stride = 2, .padding = 1 };
+    const source = try SourceWorkspace.forKey(key, 513);
+    try std.testing.expectEqualDeep(try SourceWorkspace.resolve(18, 36, 16, 4, 513), source);
+    var plan: Plan = .{ .key = key, .workspace_bytes = 513 };
+    try plan.resolveSourceWorkspace();
+    try std.testing.expectEqualDeep(source, plan.source_workspace.?);
 }

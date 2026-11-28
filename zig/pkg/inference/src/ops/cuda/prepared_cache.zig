@@ -120,7 +120,7 @@ pub const CapturedArena = struct {
 };
 
 pub const Request = union(enum) {
-    audio_learning: struct { key: u64 },
+    audio_learning: struct { key: u64, declared_cold: bool = false },
     external_prefill: @import("prefill_workspace.zig").Request,
     derived_weight: DerivedWeight,
     captured_storage: CapturedStorage,
@@ -695,6 +695,18 @@ pub const Lease = struct {
         try self.fundAudioLearning(owner);
         entry.audio_learning = null;
         return owner;
+    }
+
+    pub fn publishAudioDeclaration(self: *Lease, bindings: @import("audio_execution_plan.zig").Bindings, events: []const @import("audio_execution_plan.zig").Plan.Declaration, published_slot: u15) !*@import("audio_execution_plan.zig").Owner {
+        const entry = self.entry orelse return error.InvalidPreparedCacheState;
+        if (entry.request != .audio_learning or entry.request.audio_learning.key != bindings.key) return error.InvalidPreparedCacheState;
+        const backing = entry.audio_learning orelse return error.MissingPreparedAudioPlan;
+        try backing.declare(bindings, events, published_slot);
+        errdefer {
+            backing.plan = .{};
+            backing.executable = null;
+        }
+        return self.publishAudioLearning();
     }
 
     /// Adopt the existing plan in place. Its address remains stable and its
@@ -1501,7 +1513,8 @@ fn qualifyAudioMetadataRetirement(comptime adopt_warm_plan: bool) !void {
     defer pin.release();
     const plan_mod = @import("audio_execution_plan.zig");
     const bytes = @sizeOf(plan_mod.Owner);
-    var funding: ?*Funding = try Funding.createWithAllocator(std.testing.allocator, .{ .requests = &.{.{ .audio_learning = .{ .key = 93 } }} });
+    const request: Request = .{ .audio_learning = .{ .key = 93, .declared_cold = !adopt_warm_plan } };
+    var funding: ?*Funding = try Funding.createWithAllocator(std.testing.allocator, .{ .requests = &.{request} });
     defer if (funding) |value| {
         if (value.state == .bound) value.unbind();
         value.finishOutsideExecution();
@@ -1526,7 +1539,7 @@ fn qualifyAudioMetadataRetirement(comptime adopt_warm_plan: bool) !void {
     var epoch = try guard.retainEpoch();
     defer epoch.release();
     try funding.?.bind(&publication_epoch);
-    var token = try funding.?.take(.{ .audio_learning = .{ .key = 93 } }, .{ .host_scratch_bytes = bytes });
+    var token = try funding.?.take(request, .{ .host_scratch_bytes = bytes });
     const owner = if (adopt_warm_plan) warm: {
         const raw = try plan_mod.Owner.create(std.testing.allocator);
         errdefer raw.destroyUnusedOutsideExecution();
@@ -1534,7 +1547,17 @@ fn qualifyAudioMetadataRetirement(comptime adopt_warm_plan: bool) !void {
         try std.testing.expect(raw.plan.finish(0x1000));
         try token.fundAudioLearning(raw);
         break :warm raw;
-    } else try token.publishAudioLearning();
+    } else declared: {
+        const bindings: plan_mod.Bindings = .{ .key = 93, .input_bytes = 256, .output_bytes = 256 };
+        const events: []const plan_mod.Plan.Declaration = &.{.{ .allocate = 256 }};
+        var mismatched = bindings;
+        mismatched.key += 1;
+        try std.testing.expectError(error.InvalidPreparedCacheState, token.publishAudioDeclaration(mismatched, events, 0));
+        try std.testing.expectError(error.InvalidExecutionPlan, token.publishAudioDeclaration(bindings, events, 1));
+        const declared = try token.publishAudioDeclaration(bindings, events, 0);
+        try std.testing.expect(declared.executableFor(bindings) != null);
+        break :declared declared;
+    };
     var cache: plan_mod.Cache = .{};
     defer cache.clearWithCleanup(.{ .outside_execution = true }) catch unreachable;
     cache.entries[0] = .{ .key = 93, .stamp = 1, .warmed = true, .owner = owner };

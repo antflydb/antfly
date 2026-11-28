@@ -590,7 +590,7 @@ pub const ReadingPipeline = struct {
 
     fn florenceIncrementalRetryEligible(self: *ReadingPipeline, err: anyerror) bool {
         if (session_factory.getFlorenceConfig(self.vision_encoder) == null or nativeFlorenceReadBatchSize() <= 1) return false;
-        return florenceIncrementalAdmissionRetryEligible(self.vision_encoder.backend(), florenceKvCacheDisabled(), err);
+        return (FlorenceDecoder.AdmissionPolicy{ .cache_disabled = florenceKvCacheDisabled() }).canRetryIncrementally(self.vision_encoder.backend(), err);
     }
 
     fn readBatchNativeFlorenceChunked(self: *ReadingPipeline, image_datas: []const []const u8) ![]ReadResult {
@@ -700,29 +700,17 @@ pub const ReadingPipeline = struct {
 
         // Direct compute bypasses Session.run, so retain its admission permit
         // through both encoder/decoder execution and backend cleanup.
-        var incremental_admission = cudaFlorenceIncrementalAdmissionEligible(self.vision_encoder.backend(), florenceKvCacheDisabled());
-        run_permit = preparation.admitInputRun(self.vision_encoder.withAdmissionControl(self.execution_control), try nativeFlorenceRunRequestWithLogitMode(
-            florence_cfg,
-            batch,
-            pixel_values.len,
-            prompt_i32.len,
-            self.config.max_length,
-            incremental_admission,
-        )) catch |err| permit: {
-            // The full-prefix envelope only funds a fallback the KV-cached
-            // decoder rarely needs. If it can never fit the run budget, admit
-            // the incremental envelope and give up that fallback for this run.
-            if (incremental_admission or !florenceIncrementalAdmissionRetryEligible(self.vision_encoder.backend(), florenceKvCacheDisabled(), err)) return err;
-            incremental_admission = true;
-            break :permit try preparation.admitInputRun(self.vision_encoder.withAdmissionControl(self.execution_control), try nativeFlorenceRunRequestWithLogitMode(
-                florence_cfg,
-                batch,
-                pixel_values.len,
-                prompt_i32.len,
-                self.config.max_length,
-                true,
-            ));
-        };
+        const admitted = try FlorenceDecoder.admitBatchedRun(preparation, self.vision_encoder.withAdmissionControl(self.execution_control), florence_cfg, .{
+            .batch = batch,
+            .pixel_count = pixel_values.len,
+            .prompt_length = prompt_i32.len,
+            .max_length = self.config.max_length,
+        }, .{
+            .cache_disabled = florenceKvCacheDisabled(),
+            .prefer_cuda_incremental = platform.env.getenvBool("ANTFLY_CUDA_ENABLE_FLORENCE_INCREMENTAL_ADMISSION"),
+        });
+        run_permit = admitted.permit;
+        const incremental_admission = admitted.storage == .incremental;
         if (incremental_admission and platform.env.getenvBool("ANTFLY_FLORENCE2_TRACE_NO_REPEAT_ARGMAX"))
             std.debug.print("FLORENCE2 cuda_incremental_admission_items={d}\n", .{batch});
 
@@ -1089,29 +1077,25 @@ pub const ReadingPipeline = struct {
         var decoder_run_total_ns: u64 = 0;
         var decoder_steps: usize = 0;
         var finished_count: usize = 0;
-        const decoder = FlorenceDecoder.FullPrefix{
+        var decoder = FlorenceDecoder.FullPrefix{
             .context = .{ .allocator = allocator, .backend = cb, .model = &florence_cfg, .control = self.execution_control },
             .encoder_hidden = encoder_hidden,
             .encoder_mask = encoder_attention_mask,
             .batch = batch,
             .encoder_length = enc_seq_len,
         };
+        defer decoder.deinit();
         while (dec_len < max_len and finished_count < batch) {
             if (self.execution_control) |control| try control.update(.executing, dec_len, max_len);
             {
-                const decoder_input_ids = try compactDecoderInputIds(allocator, dec_ids, batch, max_len, dec_len);
-                defer allocator.free(decoder_input_ids);
-
                 const decoder_run_start = nowNs();
-                const logits = try decoder.stepHost(decoder_input_ids, dec_len);
+                const step = try decoder.stepHostStrided(dec_ids, max_len, dec_len);
                 const decoder_run_ns = nowNs() - decoder_run_start;
                 decoder_run_total_ns += decoder_run_ns;
                 decoder_steps += 1;
                 logReadProfileStep("batch_decoder_run", decoder_steps, dec_len, decoder_run_ns);
-                defer allocator.free(logits);
+                defer allocator.free(step.logits);
 
-                const logits_row_stride = std.math.mul(usize, dec_len, florence_cfg.vocab_size) catch return error.InvalidInputShape;
-                const logits_tail_offset = std.math.mul(usize, dec_len - 1, florence_cfg.vocab_size) catch return error.InvalidInputShape;
                 finished_count += try applyFlorenceBatchGreedyStep(
                     dec_ids,
                     batch,
@@ -1119,9 +1103,9 @@ pub const ReadingPipeline = struct {
                     dec_len,
                     finished,
                     lengths,
-                    logits,
-                    logits_row_stride,
-                    logits_tail_offset,
+                    step.logits,
+                    step.row_stride,
+                    step.tail_offset,
                     florence_cfg.vocab_size,
                     self.config.eos_token_id,
                     self.config.pad_token_id,
@@ -1291,12 +1275,13 @@ pub const ReadingPipeline = struct {
 
         // Direct compute bypasses Session.run, so retain its admission permit
         // through both encoder/decoder execution and backend cleanup.
-        run_permit = try preparation.admitInputRun(self.vision_encoder.withAdmissionControl(self.execution_control), try nativeFlorenceRunRequest(
+        run_permit = try preparation.admitInputRun(self.vision_encoder.withAdmissionControl(self.execution_control), try FlorenceDecoder.planRun(
             florence_cfg,
             1,
             pixel_values.len,
             prompt_i32.len,
             self.config.max_length,
+            .full_prefix,
         ));
 
         if (backend == .native and !florenceKvCacheDisabled() and self.config.max_length > 0) {
@@ -1751,89 +1736,8 @@ pub const ReadingPipeline = struct {
     }
 };
 
-/// Reserve the complete native reader invocation, including the encoder
-/// output, full-prefix decoder fallback, and self/cross KV retained across steps.
-/// Use checked scalar geometry before constructing any compute backend.
-fn nativeFlorenceRunRequest(
-    cfg: florence_arch.Config,
-    batch: usize,
-    pixel_count: usize,
-    prompt_length: usize,
-    max_length: usize,
-) !session_mod.RunRequest {
-    return nativeFlorenceRunRequestWithLogitMode(cfg, batch, pixel_count, prompt_length, max_length, false);
-}
-
-fn cudaFlorenceIncrementalAdmissionEligible(backend: backends.BackendType, cache_disabled: bool) bool {
-    return backend == .cuda and !cache_disabled and
-        platform.env.getenvBool("ANTFLY_CUDA_ENABLE_FLORENCE_INCREMENTAL_ADMISSION");
-}
-
-/// A full-prefix admission that can never fit may retry with the incremental
-/// envelope on backends whose default batched decoder uses a KV cache.
-fn florenceIncrementalAdmissionRetryEligible(backend: backends.BackendType, cache_disabled: bool, err: anyerror) bool {
-    return err == error.ResourceLimitExceeded and !cache_disabled and
-        (backend == .native or backend == .cuda or backend == .metal);
-}
-
 fn florenceIncrementalFallbackAdmitted(backend: backends.BackendType, incremental_admission: bool, err: anyerror) bool {
     return !incremental_admission and shouldFallbackFlorenceIncremental(backend, err);
-}
-
-/// Cached batched decoding materializes [active_rows, vocab] logits for one
-/// step. KV capacity and encoder geometry still cover the complete invocation.
-/// Callers selecting this envelope must unwind before full-prefix fallback.
-fn nativeFlorenceRunRequestWithLogitMode(
-    cfg: florence_arch.Config,
-    batch: usize,
-    pixel_count: usize,
-    prompt_length: usize,
-    max_length: usize,
-    incremental: bool,
-) !session_mod.RunRequest {
-    const Checked = struct {
-        fn add(a: usize, b: usize) !usize {
-            return std.math.add(usize, a, b) catch error.ResourceLimitExceeded;
-        }
-        fn mul(a: usize, b: usize) !usize {
-            return std.math.mul(usize, a, b) catch error.ResourceLimitExceeded;
-        }
-    };
-    if (batch == 0) return error.InvalidInputShape;
-    const encoder_length = florence_arch.encoderSequenceLength(cfg, prompt_length) catch |err| switch (err) {
-        error.Overflow => return error.ResourceLimitExceeded,
-        else => return err,
-    };
-    const decoder_length = @max(max_length, 1);
-    const encoder_bytes = try Checked.mul(try Checked.mul(batch, encoder_length), try Checked.mul(cfg.d_model, @sizeOf(f32)));
-    const logits_bytes = try Checked.mul(try Checked.mul(batch, if (incremental) @as(usize, 1) else decoder_length), try Checked.mul(cfg.vocab_size, @sizeOf(f32)));
-    const kv_bytes = florence_arch.decoderKvBytes(cfg, batch, encoder_length, decoder_length) catch return error.ResourceLimitExceeded;
-    const prompt_bytes = try Checked.mul(prompt_length, try Checked.add(try Checked.mul(batch, @sizeOf(i64)), @sizeOf(i32)));
-    return .{
-        .batch = batch,
-        .sequence = @max(encoder_length, decoder_length),
-        .input_bytes = try Checked.add(try Checked.mul(pixel_count, @sizeOf(f32)), prompt_bytes),
-        .output_bytes = try Checked.add(try Checked.add(encoder_bytes, logits_bytes), kv_bytes),
-        .output_kv_bytes = kv_bytes,
-    };
-}
-
-fn compactDecoderInputIds(
-    allocator: std.mem.Allocator,
-    dec_ids: []const i64,
-    batch: usize,
-    max_len: usize,
-    dec_len: usize,
-) ![]i64 {
-    const total = std.math.mul(usize, batch, dec_len) catch return error.InvalidInputShape;
-    const out = try allocator.alloc(i64, total);
-    errdefer allocator.free(out);
-    for (0..batch) |b| {
-        const dst = std.math.mul(usize, b, dec_len) catch return error.InvalidInputShape;
-        const src = std.math.mul(usize, b, max_len) catch return error.InvalidInputShape;
-        @memcpy(out[dst..][0..dec_len], dec_ids[src..][0..dec_len]);
-    }
-    return out;
 }
 
 /// Effective native reader microbatch ceiling for this process. Capability
@@ -2094,10 +1998,10 @@ fn normalizeFlorencePrompt(prompt: []const u8) []const u8 {
 }
 
 test "Florence retries an unfittable full-prefix admission only with a KV-cached decoder" {
-    try std.testing.expect(florenceIncrementalAdmissionRetryEligible(.metal, false, error.ResourceLimitExceeded));
-    try std.testing.expect(florenceIncrementalAdmissionRetryEligible(.native, false, error.ResourceLimitExceeded));
-    try std.testing.expect(!florenceIncrementalAdmissionRetryEligible(.metal, true, error.ResourceLimitExceeded));
-    try std.testing.expect(!florenceIncrementalAdmissionRetryEligible(.metal, false, error.ResourceTemporarilyUnavailable));
+    try std.testing.expect((FlorenceDecoder.AdmissionPolicy{ .cache_disabled = false }).canRetryIncrementally(.metal, error.ResourceLimitExceeded));
+    try std.testing.expect((FlorenceDecoder.AdmissionPolicy{ .cache_disabled = false }).canRetryIncrementally(.native, error.ResourceLimitExceeded));
+    try std.testing.expect(!(FlorenceDecoder.AdmissionPolicy{ .cache_disabled = true }).canRetryIncrementally(.metal, error.ResourceLimitExceeded));
+    try std.testing.expect(!(FlorenceDecoder.AdmissionPolicy{ .cache_disabled = false }).canRetryIncrementally(.metal, error.ResourceTemporarilyUnavailable));
     // The incremental envelope admits one logits row per step, so it fits
     // where the full-prefix one cannot.
     const cfg = florence_arch.Config{
@@ -2109,9 +2013,37 @@ test "Florence retries an unfittable full-prefix admission only with a KV-cached
         .vocab_size = 8,
         .decoder_layers = 2,
     };
-    const full = try nativeFlorenceRunRequestWithLogitMode(cfg, 1, 384, 3, 1024, false);
-    const incremental = try nativeFlorenceRunRequestWithLogitMode(cfg, 1, 384, 3, 1024, true);
+    const full = try FlorenceDecoder.planRun(cfg, 1, 384, 3, 1024, .full_prefix);
+    const incremental = try FlorenceDecoder.planRun(cfg, 1, 384, 3, 1024, .incremental);
     try std.testing.expect(incremental.output_bytes.? < full.output_bytes.?);
+
+    const Probe = struct {
+        denial: anyerror,
+        submissions: [2]session_mod.RunRequest = undefined,
+        count: usize = 0,
+
+        pub fn admitInputRun(self: *@This(), session: backends.Session, request: session_mod.RunRequest) !session_mod.RunPermit {
+            self.submissions[self.count] = request;
+            self.count += 1;
+            if (self.count == 1) return self.denial;
+            return session.admit(request);
+        }
+    };
+    var fake = AdmissionDenyingFlorenceSession{};
+    const geometry: FlorenceDecoder.AdmissionGeometry = .{ .batch = 1, .pixel_count = 384, .prompt_length = 3, .max_length = 1024 };
+    var probe = Probe{ .denial = error.ResourceLimitExceeded };
+    const admitted = try FlorenceDecoder.admitBatchedRun(&probe, fake.session(), cfg, geometry, .{ .cache_disabled = false });
+    var permit = admitted.permit;
+    defer permit.deinit();
+    try std.testing.expectEqual(FlorenceDecoder.LogitStorage.incremental, admitted.storage);
+    try std.testing.expectEqual(@as(usize, 2), probe.count);
+    try std.testing.expectEqualDeep(full, probe.submissions[0]);
+    try std.testing.expectEqualDeep(incremental, probe.submissions[1]);
+    try std.testing.expect(!fake.run_called);
+
+    probe = .{ .denial = error.ResourceTemporarilyUnavailable };
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, FlorenceDecoder.admitBatchedRun(&probe, fake.session(), cfg, geometry, .{ .cache_disabled = false }));
+    try std.testing.expectEqual(@as(usize, 1), probe.count);
 }
 
 test "Florence defaults an empty read prompt to OCR" {
@@ -2956,16 +2888,16 @@ test "native Florence admission covers batched encoder logits and retained KV" {
         .vocab_size = 8,
         .decoder_layers = 2,
     };
-    const request = try nativeFlorenceRunRequest(cfg, 2, 384, 3, 6);
+    const request = try FlorenceDecoder.planRun(cfg, 2, 384, 3, 6, .full_prefix);
     try std.testing.expectEqual(@as(usize, 8), request.sequence);
     try std.testing.expectEqual(@as(usize, 1596), request.input_bytes);
     try std.testing.expectEqual(@as(usize, 1792), request.output_kv_bytes);
     try std.testing.expectEqual(@as(usize, 2432), request.output_bytes.?);
-    try std.testing.expectError(error.ResourceLimitExceeded, nativeFlorenceRunRequest(cfg, 2, std.math.maxInt(usize), 3, 6));
-    try std.testing.expectError(error.ResourceLimitExceeded, nativeFlorenceRunRequest(cfg, 2, 384, 3, std.math.maxInt(usize)));
+    try std.testing.expectError(error.ResourceLimitExceeded, FlorenceDecoder.planRun(cfg, 2, std.math.maxInt(usize), 3, 6, .full_prefix));
+    try std.testing.expectError(error.ResourceLimitExceeded, FlorenceDecoder.planRun(cfg, 2, 384, 3, std.math.maxInt(usize), .full_prefix));
     var invalid = cfg;
     invalid.patch_stride[1] = 0;
-    try std.testing.expectError(error.InvalidInputShape, nativeFlorenceRunRequest(invalid, 2, 384, 3, 6));
+    try std.testing.expectError(error.InvalidInputShape, FlorenceDecoder.planRun(invalid, 2, 384, 3, 6, .full_prefix));
 }
 
 test "native Florence direct admission denies before execution and recovers without leaked leases" {
@@ -2983,7 +2915,7 @@ test "native Florence direct admission denies before execution and recovers with
             .static_workspace_bytes = 4096,
             .check_live_memory = false,
         };
-        const request = try nativeFlorenceRunRequest(.{}, 1, 3 * 768 * 768, 3, 1);
+        const request = try FlorenceDecoder.planRun(.{}, 1, 3 * 768 * 768, 3, 1, .full_prefix);
         for (0..3) |_| {
             try std.testing.expectError(error.ResourceTemporarilyUnavailable, session.admit(request));
             try std.testing.expect(std.meta.eql(memory.AdmissionAmounts{}, controller.admitted));
@@ -3184,15 +3116,15 @@ test "LightOnOCR3 CUDA Florence incremental admission preserves complete KV capa
         .vocab_size = 8,
         .decoder_layers = 2,
     };
-    const full = try nativeFlorenceRunRequest(cfg, 2, 384, 3, 6);
-    const incremental = try nativeFlorenceRunRequestWithLogitMode(cfg, 2, 384, 3, 6, true);
+    const full = try FlorenceDecoder.planRun(cfg, 2, 384, 3, 6, .full_prefix);
+    const incremental = try FlorenceDecoder.planRun(cfg, 2, 384, 3, 6, .incremental);
     try std.testing.expectEqual(@as(usize, 2112), incremental.output_bytes.?);
     try std.testing.expectEqual(full.input_bytes, incremental.input_bytes);
     try std.testing.expectEqual(full.output_kv_bytes, incremental.output_kv_bytes);
     try std.testing.expectEqual(full.sequence, incremental.sequence);
-    try std.testing.expect(!cudaFlorenceIncrementalAdmissionEligible(.metal, false));
-    try std.testing.expect(!cudaFlorenceIncrementalAdmissionEligible(.native, false));
-    try std.testing.expect(!cudaFlorenceIncrementalAdmissionEligible(.cuda, true));
+    try std.testing.expect((FlorenceDecoder.AdmissionPolicy{ .cache_disabled = false, .prefer_cuda_incremental = true }).initialStorage(.metal) == .full_prefix);
+    try std.testing.expect((FlorenceDecoder.AdmissionPolicy{ .cache_disabled = false, .prefer_cuda_incremental = true }).initialStorage(.native) == .full_prefix);
+    try std.testing.expect((FlorenceDecoder.AdmissionPolicy{ .cache_disabled = true, .prefer_cuda_incremental = true }).initialStorage(.cuda) == .full_prefix);
     try std.testing.expect(!florenceIncrementalFallbackAdmitted(.cuda, true, error.UnsupportedOperation));
     try std.testing.expect(!florenceIncrementalFallbackAdmitted(.cuda, true, error.UnsupportedShape));
     try std.testing.expect(florenceIncrementalFallbackAdmitted(.cuda, false, error.UnsupportedOperation));
@@ -3369,7 +3301,7 @@ fn nativeFlorencePublicScheduleCase(a: std.mem.Allocator, cold_only: bool, tight
         // produced by the public preparation path.
         const prompt = try buildFlorencePromptIds(a, hf.tokenizer(), Fixture.config, "one");
         defer a.free(prompt);
-        var request = try nativeFlorenceRunRequest(Fixture.config, 1, 12, prompt.len, cfg.max_length);
+        var request = try FlorenceDecoder.planRun(Fixture.config, 1, 12, prompt.len, cfg.max_length, .full_prefix);
         request.pre_admitted_host_bytes = request.input_bytes;
         const base = try session.run_admission.?.estimateRequest(request, session.outputInfo());
         candidate.vision_encoder.run_admission.?.limits.host_limit_bytes = base.hostTotalBytes();

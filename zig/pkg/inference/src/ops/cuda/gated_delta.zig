@@ -33,7 +33,7 @@ pub const State = struct {
     // Its ordinary admitted cache can retain exact persistent allocations.
     release_context: ?*anyopaque = null,
     release_buffer: ?*const fn (*anyopaque, *buffer.DeviceBuffer) void = null,
-    prepare_release_with_cleanup: ?*const fn (*anyopaque, Cleanup) anyerror!void = null,
+    prepare_release_with_cleanup: ?*const fn (*anyopaque, *const State, Cleanup) anyerror!void = null,
     release_buffer_with_cleanup: ?*const fn (*anyopaque, *buffer.DeviceBuffer, bool, Cleanup) anyerror!void = null,
     weight_sources: [4]driver.CUdeviceptr = @splat(0),
     key_heads: usize = 0,
@@ -73,7 +73,7 @@ pub const State = struct {
     }
     pub fn deinitWithCleanup(self: *State, current: Cleanup) !void {
         try self.validateCleanup(current);
-        if (self.prepare_release_with_cleanup) |prepare| try prepare(self.release_context.?, current);
+        if (self.prepare_release_with_cleanup) |prepare| try prepare(self.release_context.?, self, current);
         if (self.ctx) |ctx| {
             for (&self.history) |*value| try self.releaseOwnedWithCleanup(ctx, value, current);
             try self.releaseOwnedWithCleanup(ctx, &self.recurrent, current);
@@ -260,6 +260,18 @@ pub const Module = struct {
         self.cached_batch_calls += 1;
     }
 
+    pub fn runFusedDecodeWithDevicePages(self: *Module, ctx: *context.CudaContext, params: *RaggedParams, pages: buffer.DeviceBuffer, step: u32) !void {
+        if (params.base.items == 0 or params.base.items > max_packet_rows or step > 1) return error.InvalidExecutionPlan;
+        _ = try buffer.validateRegion(pages, @as(usize, params.base.items) * @sizeOf(BatchPage), @alignOf(BatchPage));
+        var address = pages.ptr;
+        var history_step = step;
+        var packet = [_]?*anyopaque{ @ptrCast(params), &address, &history_step };
+        try self.program.launch(ctx, .decode_fused_p2_device_pages, 1, params.base.items * params.base.value_heads, 256, &packet);
+        self.fused_decode_calls += 1;
+        self.fused_decode_pages += params.base.items;
+        self.cached_batch_calls += 1;
+    }
+
     fn launchFusedDecode(self: *Module, ctx: *context.CudaContext, params: *RaggedParams, packet: []?*anyopaque, pages: usize) !void {
         try self.program.launch(ctx, .decode_fused_p2, 1, params.base.items * params.base.value_heads, 256, packet);
         self.fused_decode_calls += 1;
@@ -403,7 +415,7 @@ test "typed recurrent state cleanup prepares actual current B once and releases 
         expected: *const Sink.Epoch,
         prepares: usize = 0,
         roots: usize = 0,
-        fn prepare(raw: *anyopaque, cleanup: Cleanup) !void {
+        fn prepare(raw: *anyopaque, _: *const State, cleanup: Cleanup) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             const actual = cleanup.boundary orelse return error.MissingCurrentCleanupEpoch;
             if (try actual.isSealed()) return error.RetirementEpochSealed;

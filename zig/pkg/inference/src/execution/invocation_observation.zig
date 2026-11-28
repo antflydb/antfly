@@ -348,7 +348,7 @@ const Invocation = struct {
         snapshot.pending_interval = if (self.binding.pending_interval) |interval| interval.* else null;
         if (snapshot.pending_interval) |*interval| if (self.binding.pending_counters) |counters| {
             const calls = if (comptime build_options.enable_cuda) snapshot.runtime.resolved_project_cuda_launches.?.total_calls else null;
-            counters.join(snapshot.runtime.transfers.?, snapshot.runtime.submission.?, calls, interval.callback_wall_ns);
+            counters.join(snapshot.runtime.transfers.?, snapshot.runtime.submission.?, calls, interval.callback_wall_ns, snapshot.runtime.cuda_vendor_convolution);
             interval.observed_phases = counters.*;
         };
         self.scope.deinit();

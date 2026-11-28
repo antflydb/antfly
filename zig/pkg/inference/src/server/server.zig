@@ -7071,7 +7071,7 @@ pub const Node = struct {
         defer if (comptime build_options.enable_cuda) if (vision_publication) |*publication| publication.deinit();
         var prepared_ocr: ?*PreparedOcrRequest = null;
         if (comptime build_options.enable_cuda) if (admission_lease.resources) |*primary| {
-            const publication_bytes = if (model.session.backend() == .cuda) generation.nativeCudaVisionPublicationBytes(allocator, model_path, gpt_config, messages, @intCast(@max(max_tokens, 1)), 1) catch 0 else 0;
+            const publication_bytes = if (model.session.backend() == .cuda) generation.nativeCudaVisionPublicationBytes(allocator, model_path, gpt_config, messages, @intCast(@max(max_tokens, 1))) catch 0 else 0;
             vision_publication = try VisionPublication.prepareVisionPublication(model.session, primary, publication_bytes, 1, budget_limits, execution_control);
             const upload_bytes = if (backend_kind == .cuda)
                 generation.nativeCudaPinnedPatchUploadBytesAtMost(allocator, model_path, gpt_config, messages, @intCast(@max(max_tokens, 1)), PreparedOcrRequest.pinned_input_upload_capacity) catch 0
@@ -9883,7 +9883,7 @@ pub const Node = struct {
             try request.control.check();
             if (comptime build_options.enable_cuda) if (request.ctx.model.session.backend() == .cuda)
                 try request.ctx.preparePinnedInputUpload(try qwen3vl_projector.planResidentCudaPatchUploadBytesAtMost(request.ctx.cfg, images, limits, LightOnStreamContext.pinnedInputUploadCapacity()), request.control);
-            try request.ctx.lockStep(request.control);
+            try request.ctx.lockStep(request.control, .foreground_vision);
             defer request.ctx.unlockStep();
             var cb = request.pageBackend();
             return request.encodeResident(&cb, allocator, images, limits);
@@ -9899,7 +9899,7 @@ pub const Node = struct {
             if (images.len != 1) {
                 if (comptime build_options.enable_cuda) if (ctx.model.session.backend() == .cuda)
                     try ctx.preparePinnedInputUpload(try qwen3vl_projector.planResidentCudaPatchUploadBytesAtMost(ctx.cfg, images, limits, LightOnStreamContext.pinnedInputUploadCapacity()), request.control);
-                try ctx.lockStep(request.control);
+                try ctx.lockStep(request.control, .foreground_vision);
                 defer ctx.unlockStep();
                 var cb = request.pageBackend();
                 return qwen3vl_projector.encodeProjectedImagesResident(&cb, allocator, ctx.cfg, images, limits);
@@ -9908,6 +9908,14 @@ pub const Node = struct {
             var prepared = try qwen3vl_projector.prepareProjectedImageResident(allocator, ctx.cfg, images[0], limits, request.control.imageWorkControl());
             defer prepared.deinit();
             const elapsed = platform.time.monotonicNs() -| started;
+            const profile = ctx.model.session.backend() == .cuda and platform.env.getenvBool("ANTFLY_INFERENCE_READ_PROFILE");
+            const vision_started = if (profile) platform.time.monotonicNs() else 0;
+            defer if (profile) {
+                std.log.info("CUDA reader prepared vision epoch={d} post_preprocess_host_ns={d}", .{
+                    ctx.execution_id, platform.time.monotonicNs() -| vision_started,
+                });
+            };
+
             if (comptime build_options.enable_cuda) if (ctx.model.session.backend() == .cuda)
                 try ctx.preparePinnedInputUpload(try prepared.cudaPatchUploadBytes(ctx.cfg, limits), request.control);
             try request.control.check();
@@ -9936,7 +9944,7 @@ pub const Node = struct {
                 try request.control.check();
                 return projected;
             }
-            try ctx.lockStep(request.control);
+            try ctx.lockStep(request.control, .foreground_vision);
             defer ctx.unlockStep();
             ctx.cpu_preprocess_items += 1;
             ctx.cpu_preprocess_ns +|= elapsed;
@@ -9975,7 +9983,7 @@ pub const Node = struct {
                 null;
             const batch_items = if (geometry) |shape| @min(ctx.features.vision_batch_items, shape.max_items) else 1;
             if (batch_items <= 1) {
-                try ctx.lockStep(request.control);
+                try ctx.lockStep(request.control, .foreground_vision);
                 defer ctx.unlockStep();
                 var cb = request.pageBackend();
                 return request.encodeResident(&cb, allocator, images, limits);
@@ -10083,7 +10091,7 @@ pub const Node = struct {
         // Published results may let a follower retire before our defers run.
         var completed_turn = leader.*;
         defer ctx.coordinator.finishTurn(&completed_turn, .prefill);
-        ctx.lockStep(control) catch |err| {
+        ctx.lockStep(control, .foreground_prefill) catch |err| {
             for (items) |item| item.slot.fail(err);
             return;
         };
@@ -10122,7 +10130,7 @@ pub const Node = struct {
         }
         var group = executor_microbatch.ExecutionControl{ .items = items };
         const control = lightOnMicrobatchExecutionControl(&group);
-        ctx.lockStep(control) catch |err| {
+        ctx.lockStep(control, .foreground_vision) catch |err| {
             for (items) |item| item.slot.fail(err);
             return;
         };
@@ -10173,7 +10181,7 @@ pub const Node = struct {
         }
         var group = executor_microbatch.ExecutionControl{ .items = items };
         const control = lightOnMicrobatchExecutionControl(&group);
-        ctx.lockStep(control) catch |err| {
+        ctx.lockStep(control, .foreground_vision) catch |err| {
             for (items) |item| item.slot.fail(err);
             return;
         };
@@ -10374,7 +10382,7 @@ pub const Node = struct {
             // Each PAGE funds its own one-image publication outside the lane.
             // A broker group later borrows N distinct Sets; it does not ask one
             // request to fund the group's output or bind before the real step.
-            const publication_bytes = if (backend == .cuda) generation.nativeCudaVisionPublicationBytes(a, model_path, cfg, &messages, @intCast(@max(max_tokens, 1)), 1) catch 0 else 0;
+            const publication_bytes = if (backend == .cuda) generation.nativeCudaVisionPublicationBytes(a, model_path, cfg, &messages, @intCast(@max(max_tokens, 1))) catch 0 else 0;
             if (publication_bytes != 0) {
                 const Prepare = struct {
                     fn run(bytes: usize, selected: @import("../backends/session.zig").Session, primary: *runtime.tier.memory.AdmissionLease, active: InferenceExecutionControl) !?VisionPublication {
@@ -10391,7 +10399,7 @@ pub const Node = struct {
         // unwind follows the same page/pool lifetime and never reserves twice.
         try control.check();
         try admission.prepareDenseFfn(factory.limits, control);
-        try ctx.lockStep(control);
+        try ctx.lockPageSetup(control);
         const before = ctx.budget;
         const chunk = runtime.tier.memory.reserveGptGenerationAtLargestChunk(&ctx.budget, &components, estimate.token_count, @intCast(max_tokens), ceiling) catch |err| {
             ctx.unlockStep();
@@ -10437,7 +10445,7 @@ pub const Node = struct {
         state.kv_storage = &ctx.storage;
         state.kv_lock = &ctx.kv_mutex;
         defer {
-            ctx.lockStepForCleanup(.page_state_cleanup);
+            ctx.lockStepForCleanup();
             if (state.qwen35_linear_cache) |cache| {
                 ctx.recurrent_cache_pages += 1;
                 for (cache.layers) |layer| ctx.host_recurrent_bytes_total +|= (layer.conv.len + layer.recurrent.len) * @sizeOf(f32);
@@ -18830,7 +18838,7 @@ pub const Node = struct {
         defer if (comptime build_options.enable_cuda) if (vision_publication) |*publication| publication.deinit();
         var prepared_generation: ?*PreparedGeneration = null;
         if (comptime build_options.enable_cuda) if (admission_lease.resources) |*primary| {
-            const publication_bytes = if (backend_kind == .cuda and !cooperative_cuda and draft_model_for_generation == null) generation.nativeCudaVisionPublicationBytes(ctx.allocator, model_path, gpt_config, effective_messages, @intCast(@max(config.max_tokens, 1)), 1) catch 0 else 0;
+            const publication_bytes = if (backend_kind == .cuda and !cooperative_cuda and draft_model_for_generation == null) generation.nativeCudaVisionPublicationBytes(ctx.allocator, model_path, gpt_config, effective_messages, @intCast(@max(config.max_tokens, 1))) catch 0 else 0;
             vision_publication = VisionPublication.prepareVisionPublication(model.session, primary, publication_bytes, 1, budget_limits, execution_control) catch |err| return inferenceFailureResponse(ctx, err);
             const upload_bytes = if (backend_kind == .cuda)
                 generation.nativeCudaPinnedPatchUploadBytesAtMost(ctx.allocator, model_path, gpt_config, effective_messages, @intCast(@max(config.max_tokens, 1)), PreparedGeneration.pinned_input_upload_capacity) catch 0
@@ -48795,12 +48803,111 @@ test "LightOnOCR3 real checkpoint transcribes the invoice fixture" {
             // At two rows the position plane starts on the first 16-byte boundary.
             try std.testing.expectEqual(@as(usize, 44), report.readback_bytes);
             try std.testing.expectEqual(report.planned_scratch_bytes, report.bound_scratch_bytes);
-            try std.testing.expect(report.planned_events != 0 and report.metadata_bytes != 0 and report.attention_scratch_bytes != 0);
+            try std.testing.expect(report.plan_origin != null and report.metadata_bytes != 0 and report.attention_scratch_bytes != 0);
+            try std.testing.expectEqual(report.planned_events == 0, report.planned_scratch_bytes == 0);
+            if (platform.env.getenvBool("ANTFLY_CUDA_LIGHTON_GRAPH_DECLARED_WARMUP") and
+                platform.env.getenv("ANTFLY_CUDA_ENABLE_LIGHTON_FUSED_PROJECTIONS") != null)
+            {
+                const fused_projections = platform.env.getenvBool("ANTFLY_CUDA_ENABLE_LIGHTON_FUSED_PROJECTIONS");
+                const expected_origin: @import("../execution/stream_workspace.zig").Origin = if (fused_projections) .declared else .observed;
+                try std.testing.expectEqual(expected_origin, report.plan_origin.?);
+                if (fused_projections) {
+                    try std.testing.expectEqual(@as(usize, 0), report.planned_events);
+                    try std.testing.expect(report.eager_bursts <= 1);
+                }
+            }
+            try std.testing.expect(report.replayed_bursts > 0);
+            try std.testing.expectEqual(report.completed_bursts, report.eager_bursts + report.recorded_bursts + report.replayed_bursts);
             if (platform.env.getenvBool("ANTFLY_TEST_LIGHTONOCR3_CUDA_UNFUSED_RECURRENT"))
                 try std.testing.expect(report.recurrent_scratch_bytes != 0);
-            const shared_bytes = @max(report.attention_scratch_bytes, report.recurrent_scratch_bytes, report.fused_head_scratch_bytes, report.shared_head_scratch_bytes);
+            const alignment = @import("../execution/stream_workspace.zig").alignment;
+            const geometry = session_factory.getGptConfig(observed_model.?.get().session) orelse return error.UnsupportedGeneratorProvider;
+            const attention_output = report.rows * geometry.num_attention_heads * geometry.headDim() * @sizeOf(f32);
+            const recurrent_output = report.rows * geometry.qwen35_linear_num_value_heads * geometry.qwen35_linear_value_head_dim * @sizeOf(f32);
+            try std.testing.expectEqual(attention_output, report.declared_attention_output_bytes);
+            try std.testing.expectEqual(recurrent_output, report.declared_recurrent_output_bytes);
+            if (platform.env.getenvBool("ANTFLY_CUDA_LIGHTON_GRAPH_DEVICE_ATTENTION_PAGES")) {
+                const packet = @import("../ops/cuda/paged_attention_bf16.zig");
+                const packets = try std.math.divCeil(usize, report.rows, packet.max_packet_rows);
+                try std.testing.expectEqual(packets * @sizeOf(packet.PageTable), report.attention_page_table_bytes);
+            }
+            if (platform.env.getenvBool("ANTFLY_CUDA_LIGHTON_GRAPH_DEVICE_RECURRENT_PAGES")) {
+                var recurrent_layers: usize = 0;
+                for (0..geometry.num_hidden_layers) |layer| {
+                    recurrent_layers += @intFromBool(geometry.layerUsesQwen35LinearAttention(layer));
+                }
+                const row_bytes = @sizeOf(@import("../ops/cuda/gated_delta.zig").BatchPage);
+                try std.testing.expectEqual(report.rows * recurrent_layers * row_bytes, report.recurrent_page_table_bytes);
+                try std.testing.expect(report.recurrent_page_table_bytes != 0);
+            }
+
+            const attention_bytes = std.mem.alignForward(usize, report.attention_scratch_bytes, alignment) + report.declared_attention_output_bytes;
+            const recurrent_bytes = std.mem.alignForward(usize, report.recurrent_scratch_bytes, alignment) + report.declared_recurrent_output_bytes;
+            if (report.declared_ffn_scratch_bytes != 0) {
+                var intermediate: usize = 0;
+                for (0..geometry.num_hidden_layers) |layer| intermediate = @max(intermediate, geometry.intermediateSize(layer));
+                const Ffn = @import("../ops/cuda/dense_ffn_workspace.zig").Layout;
+                const ffn = if (platform.env.getenvBool("ANTFLY_CUDA_ENABLE_LIGHTON_BF16_PROJECTION_OUTPUTS"))
+                    try Ffn.initCompact(report.rows, geometry.hidden_size, intermediate)
+                else
+                    try Ffn.init(report.rows, geometry.hidden_size, intermediate, 0);
+                try std.testing.expectEqual(ffn.scratch_bytes, report.declared_ffn_scratch_bytes);
+                try std.testing.expectEqual(2 * ffn.output_bytes, report.declared_ffn_output_bank_bytes);
+            }
+            const recurrent_key_width = @as(usize, geometry.qwen35_linear_num_key_heads) * geometry.qwen35_linear_key_head_dim;
+            const recurrent_value_width = @as(usize, geometry.qwen35_linear_num_value_heads) * geometry.qwen35_linear_value_head_dim;
+            const recurrent_projection_bytes = 2 * report.rows * (recurrent_key_width + recurrent_value_width + geometry.qwen35_linear_num_value_heads) * @sizeOf(f32);
+            if (report.declared_recurrent_joined_projection_bytes != 0 or platform.env.getenvBool("ANTFLY_CUDA_ENABLE_LIGHTON_FUSED_PROJECTIONS"))
+                try std.testing.expectEqual(recurrent_projection_bytes, report.declared_recurrent_joined_projection_bytes);
+            try std.testing.expect(report.bound_recurrent_joined_projection_bytes <= report.declared_recurrent_joined_projection_bytes);
+            if (platform.env.getenvBool("ANTFLY_CUDA_ENABLE_LIGHTON_FUSED_PROJECTIONS"))
+                try std.testing.expectEqual(recurrent_projection_bytes, report.bound_recurrent_joined_projection_bytes);
+            const serial_bytes = @max(attention_bytes, recurrent_bytes, report.declared_ffn_scratch_bytes, report.declared_recurrent_joined_projection_bytes, report.declared_norm_weight_bytes);
+            const layer_and_outputs_bytes = if (report.declared_ffn_output_bank_bytes != 0) std.mem.alignForward(usize, serial_bytes, alignment) + report.declared_ffn_output_bank_bytes else serial_bytes;
+            if (report.declared_norm_weight_bytes != 0)
+                try std.testing.expectEqual(@as(usize, @max(geometry.hidden_size, 2 * geometry.headDim())) * @sizeOf(f32), report.declared_norm_weight_bytes);
+            const norm_bytes = report.rows * geometry.hidden_size * @sizeOf(f32);
+            try std.testing.expectEqual(norm_bytes, report.declared_layer_norm_bytes);
+            try std.testing.expectEqual(2 * norm_bytes, report.declared_ffn_output_bank_bytes);
+            const attention_mirror_bytes = report.declared_layer_norm_mirror_bytes;
+            if (attention_mirror_bytes != 0) try std.testing.expectEqual(norm_bytes / 2, attention_mirror_bytes);
+            const layer_and_norm_bytes = std.mem.alignForward(usize, layer_and_outputs_bytes, alignment) + norm_bytes;
+            const layer_and_mirror_bytes = if (attention_mirror_bytes != 0) std.mem.alignForward(usize, layer_and_norm_bytes, alignment) + attention_mirror_bytes else layer_and_norm_bytes;
+            try std.testing.expectEqual(norm_bytes, report.declared_attention_residual_bytes);
+            const layer_and_residual_bytes = std.mem.alignForward(usize, layer_and_mirror_bytes, alignment) + report.declared_attention_residual_bytes;
+            const inputs_bytes = report.declared_attention_inputs_bytes;
+            if (inputs_bytes != 0) {
+                const key_bytes = report.rows * geometry.effectiveKVHeads() * geometry.headDim() * @sizeOf(f32);
+                try std.testing.expectEqual(2 * attention_output + key_bytes, inputs_bytes);
+            }
+            const layer_and_inputs_bytes = if (inputs_bytes != 0)
+                std.mem.alignForward(usize, layer_and_residual_bytes, alignment) + inputs_bytes
+            else
+                layer_and_residual_bytes;
+            const projections = report.declared_attention_projection_bytes;
+            const kv_projection_bytes = report.rows * geometry.effectiveKVHeads() * geometry.headDim() * @sizeOf(f32);
+            const q_projection_bytes = attention_output * @as(usize, if (geometry.qwen35_attn_output_gate) 2 else 1);
+            try std.testing.expectEqualDeep([3]usize{ q_projection_bytes, kv_projection_bytes, kv_projection_bytes }, projections);
+            const layer_and_projections_bytes = std.mem.alignForward(usize, layer_and_inputs_bytes, alignment) + @max(q_projection_bytes + 2 * kv_projection_bytes, recurrent_projection_bytes);
+            const layer_and_staging_bytes = if (report.declared_projection_staging_bytes != 0)
+                std.mem.alignForward(usize, @max(layer_and_projections_bytes, report.shared_head_scratch_bytes), alignment) + report.declared_projection_staging_bytes
+            else
+                layer_and_projections_bytes;
+            const through_head_bytes = @max(layer_and_staging_bytes, report.shared_head_scratch_bytes, report.fused_head_scratch_bytes);
+            const mirror_bytes = report.declared_final_norm_mirror_bytes;
+            if (mirror_bytes != 0) try std.testing.expectEqual(report.rows * geometry.hidden_size * @sizeOf(u16), mirror_bytes);
+            const mirror_offset = report.declared_final_norm_mirror_offset;
+            if (mirror_bytes != 0) {
+                try std.testing.expectEqual(@as(usize, 0), mirror_offset % alignment);
+                try std.testing.expect(mirror_offset >= @max(report.shared_head_scratch_bytes, report.fused_head_scratch_bytes, report.declared_norm_weight_bytes));
+                if (report.declared_projection_staging_bytes != 0) {
+                    const staging_start = layer_and_staging_bytes - report.declared_projection_staging_bytes;
+                    try std.testing.expect(mirror_offset + mirror_bytes <= staging_start or mirror_offset >= layer_and_staging_bytes);
+                }
+            }
+            const shared_bytes = @max(through_head_bytes, mirror_offset + mirror_bytes);
             try std.testing.expectEqual(shared_bytes, report.shared_layer_workspace_bytes);
-            std.debug.print("LIGHTONOCR3 observed_cuda_workspace rows={d} readback_bytes={d} backing={s} route={s} attention_scratch_bytes={d} recurrent_scratch_bytes={d} shared_layer_workspace_bytes={d}\n", .{ report.rows, report.readback_bytes, @tagName(report.readback_backing), @tagName(report.route), report.attention_scratch_bytes, report.recurrent_scratch_bytes, report.shared_layer_workspace_bytes });
+            std.debug.print("LIGHTONOCR3 observed_cuda_workspace rows={d} readback_bytes={d} backing={s} route={s} attention_scratch_bytes={d} recurrent_scratch_bytes={d} shared_layer_workspace_bytes={d} attention_output_bytes={d} recurrent_output_bytes={d} recurrent_joined_bytes={d} attention_gates_in_place={d} learned_events={d} learned_bytes={d}\n", .{ report.rows, report.readback_bytes, @tagName(report.readback_backing), @tagName(report.route), report.attention_scratch_bytes, report.recurrent_scratch_bytes, report.shared_layer_workspace_bytes, report.declared_attention_output_bytes, report.declared_recurrent_output_bytes, report.bound_recurrent_joined_projection_bytes, report.attention_gates_in_place, report.planned_events, report.planned_scratch_bytes });
         }
         std.debug.print("LIGHTONOCR3 http_batch_pages=2 parity=true\n", .{});
     }
@@ -51855,7 +51962,9 @@ test "LightOnOCR3 mixed decoder envelope admits the prefill and physical decode 
     var grouped = Node.LightOnCohortMemory{ .share_decoder_scratch = true, .decoder_rows = 64, .packed_mixed = true, .max_prefill_batch_items = 2 };
     try grouped.add(cfg, 432, 256, decoder, .{});
     try std.testing.expectEqualDeep(mixed.amounts, grouped.amounts);
-    try std.testing.expect(grouped.decoder_backend_peak >= 2 * required + 64 * cfg.vocab_size * @sizeOf(f32));
+    const grouped_required = required + 2 * decoder.backend_scratch_bytes + 64 * cfg.vocab_size * @sizeOf(f32);
+    try std.testing.expectEqual(grouped_required, try grouped.decoder_workspace.requiredBytes(2));
+    try std.testing.expect(grouped.decoder_backend_peak >= grouped_required);
     var invalid = Node.LightOnCohortMemory{ .share_decoder_scratch = true, .decoder_rows = 64, .packed_mixed = true, .max_prefill_batch_items = 9 };
     try std.testing.expectError(error.ResourceLimitExceeded, invalid.add(cfg, 432, 256, decoder, .{}));
 }
@@ -51876,7 +51985,7 @@ test "LightOnOCR3 chunk groups retain complete pages and admit both bounded work
             var grouped = Node.LightOnCohortMemory{ .share_decoder_scratch = true, .packed_mixed = true, .decoder_rows = 64, .max_prefill_batch_items = 4, .prefill_query_chunk_rows = chunk };
             try grouped.add(cfg, prompt, 256, decoder, vision);
             try std.testing.expectEqualDeep(whole.amounts, grouped.amounts);
-            const two_sets = try std.math.divCeil(usize, bounded.scratch_bytes * 8 * (rows + 63), rows);
+            const two_sets = bounded.scratch_bytes * 8 + try std.math.divCeil(usize, bounded.scratch_bytes * 2 * 63, rows);
             try std.testing.expect(grouped.decoder_backend_peak >= two_sets + 64 * 248320 * @sizeOf(f32));
             try std.testing.expect(grouped.decoder_backend_peak <= whole.decoder_backend_peak);
             const complete = try grouped.finish();
@@ -57058,7 +57167,7 @@ test "LightOn reader actual public CUDA loader prepares immutable norm caches be
         const uploads = compute.ocr_pinned_input_uploads;
         for (0..2) |_| {
             try ctx.preparePinnedInputUpload(bytes, factory.control); // warm metadata no supplier
-            try ctx.lockStep(factory.control);
+            try ctx.lockStep(factory.control, .foreground_step);
             defer ctx.unlockStep();
             const actual_input = try cb.fromFloat32(temporal);
             defer cb.free(actual_input);
@@ -57124,7 +57233,7 @@ test "LightOn reader actual public CUDA loader prepares immutable norm caches be
         try std.testing.expect(probe.failure == null);
         // Retire an actual per-page state under NOW's step/cohort and B;
         // an old origin or another page's pause cannot license this refund.
-        try ctx.lockStep(factory.control);
+        try ctx.lockStep(factory.control, .foreground_step);
         owned_page.beginState();
         var peer_state = generation.NativeDecodeState.initPaged(a, &ctx.manager, ctx.pool, null);
         peer_state.kv_storage = &ctx.storage;
@@ -57900,7 +58009,7 @@ test "LightOn public CUDA Reader Executor H1024 captures and replays exact two-p
                 probe.ctx = null;
                 if (ctx) |actual| {
                     if (state_count != 0) {
-                        actual.lockStepForCleanup(.page_state_cleanup);
+                        actual.lockStepForCleanup();
                         for (0..state_count) |row| if (state_live[row]) {
                             state[row].deinitWithCleanup(.{ .boundary = actual.cleanup_owner.epoch(), .operation = if (actual.cb) |*cb| cb.operationToken() else null }) catch platform.inference_process_supervisor.restartWorker();
                             state_live[row] = false;
@@ -57933,7 +58042,7 @@ test "LightOn public CUDA Reader Executor H1024 captures and replays exact two-p
             // The unchanged production recipe requires actual immutable BF16
             // embedding/head storage; an F32 checkpoint must still decline.
             {
-                try actual.lockStep(factory.control);
+                try actual.lockStep(factory.control, .foreground_step);
                 defer actual.unlockStep();
                 const profile = try page[0].cudaProfileSnapshot(actual);
                 try std.testing.expectEqual(compute.stats.profile_collection_failures, profile.profile_collection_failures);
@@ -58007,7 +58116,7 @@ test "LightOn public CUDA Reader Executor H1024 captures and replays exact two-p
                 }
                 var embeddings: ?ops.CT = null;
                 defer if (embeddings) |value| {
-                    actual.lockStepForCleanup(.projected_image_cleanup);
+                    actual.lockStepForCleanup();
                     cb.freeWithCleanup(value, .{ .boundary = actual.cleanup_owner.epoch(), .operation = cb.operationToken() });
                     actual.unlockStep();
                 };
@@ -58015,7 +58124,7 @@ test "LightOn public CUDA Reader Executor H1024 captures and replays exact two-p
                     // Same actual checkpoint embedding operation used by the
                     // maintained prompt adapter. No image tensors, fake source
                     // pointers, eager model execution or route flags are used.
-                    try actual.lockStep(factory.control);
+                    try actual.lockStep(factory.control, .foreground_step);
                     defer actual.unlockStep();
                     const current = @import("../execution/cleanup_context.zig").Context{ .boundary = actual.cleanup_owner.epoch(), .operation = cb.operationToken() };
                     const weight = try @import("../architectures/gpt.zig").getEmbeddingWeight(cb, cfg);
@@ -58118,7 +58227,7 @@ test "LightOn public CUDA Reader Executor H1024 captures and replays exact two-p
                     const arena = compute.bounded_decode_graph.arena.ptr;
                     const metadata = compute.bounded_decode_graph.metadata.ptr;
                     const plan = compute.bounded_decode_graph.plan;
-                    const workspace = C.peekLightOnGraphWorkspacePointer(cb) orelse return error.MissingActualGraphWorkspace;
+                    const workspace = C.lightOnGraphVendorWorkspace(cb, false) orelse return error.MissingActualGraphWorkspace;
                     probe.phase = .peer;
                     probe.row = null;
                     var peer_pool = try model.native_reader_stream.joinBoundedMatching(factory.control, 4, 8, &factory, Context.create, Context.destroy, Context.compatible);
@@ -58131,6 +58240,12 @@ test "LightOn public CUDA Reader Executor H1024 captures and replays exact two-p
                     var peer_page = actual.bindPageLease(raw);
                     actual.unregister(peer_index);
                     peer_registered = false;
+                    {
+                        try actual.lockPageSetup(factory.control);
+                        defer actual.unlockStep();
+                        try std.testing.expectEqual(graph, compute.bounded_decode_graph.graph);
+                        try std.testing.expectEqual(plan, compute.bounded_decode_graph.plan);
+                    }
                     peer_page.release(&peer_pool);
                     peer_owned = false;
                     try std.testing.expect(graph != null and arena != 0 and metadata != 0 and plan != null);
@@ -58138,7 +58253,7 @@ test "LightOn public CUDA Reader Executor H1024 captures and replays exact two-p
                     try std.testing.expectEqual(arena, compute.bounded_decode_graph.arena.ptr);
                     try std.testing.expectEqual(metadata, compute.bounded_decode_graph.metadata.ptr);
                     try std.testing.expectEqual(plan, compute.bounded_decode_graph.plan);
-                    try std.testing.expectEqual(workspace, C.peekLightOnGraphWorkspacePointer(cb).?);
+                    try std.testing.expectEqualDeep(workspace, C.lightOnGraphVendorWorkspace(cb, false).?);
                     replay_before_peer = compute.bounded_decode_graph.replays;
                     if (resident_text_prefix) std.debug.print("UNIFIED_READER_MIXED_PEER count={d} remaining={d} replay_before_peer={d}\n", .{ count, tokens_per_page - count, replay_before_peer });
                     result.peer_replay = true;
@@ -58171,7 +58286,7 @@ test "LightOn public CUDA Reader Executor H1024 captures and replays exact two-p
             for (0..state_count) |row| try std.testing.expectEqual(@as(usize, prefix_tokens + tokens_per_page - 1), state[row].total_tokens);
             probe.phase = .cleanup;
             probe.row = null;
-            actual.lockStepForCleanup(.page_state_cleanup);
+            actual.lockStepForCleanup();
             for (0..state_count) |row| {
                 state[row].deinitWithCleanup(.{ .boundary = actual.cleanup_owner.epoch(), .operation = cb.operationToken() }) catch platform.inference_process_supervisor.restartWorker();
                 state_live[row] = false;

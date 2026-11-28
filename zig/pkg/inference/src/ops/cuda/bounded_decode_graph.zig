@@ -24,6 +24,7 @@ const memory = @import("../../runtime/tier/memory.zig");
 const plan_mod = @import("../../execution/stream_workspace.zig");
 const paged_attention = @import("paged_attention_bf16.zig");
 const DecodeScratch = paged_attention.DecodeScratch;
+const recurrent_value_dim = 128;
 const recurrent_packet_rows = @import("gated_delta.zig").max_packet_rows;
 const quota_mod = @import("cache_quota.zig");
 const funding_mod = @import("prepared_cache.zig");
@@ -51,6 +52,31 @@ test "bounded CUDA decoder row eligibility follows attention packet boundaries" 
     try std.testing.expect(!supportsRows(max_rows + 1, true));
 }
 
+pub const AttentionInputs = struct {
+    query_bytes: usize,
+    key_bytes: usize,
+    bytes: usize,
+
+    pub fn supports(heads: usize, kv_heads: usize, dim: usize) bool {
+        return dim == 256 and ((heads == 8 and kv_heads == 2) or (heads == 16 and kv_heads == 4));
+    }
+
+    pub fn init(rows: usize, heads: usize, kv_heads: usize, dim: usize) !AttentionInputs {
+        const row_bytes = try std.math.mul(usize, try std.math.mul(usize, rows, dim), @sizeOf(f32));
+        const q = try std.math.mul(usize, row_bytes, heads);
+        const k = try std.math.mul(usize, row_bytes, kv_heads);
+        return .{ .query_bytes = q, .key_bytes = k, .bytes = try std.math.add(usize, try std.math.mul(usize, q, 2), k) };
+    }
+
+    pub fn bind(self: AttentionInputs, backing: buffer.DeviceBuffer) ![3]buffer.DeviceBuffer {
+        return .{
+            try backing.borrowRange(0, self.query_bytes),
+            try backing.borrowRange(self.query_bytes, self.key_bytes),
+            try backing.borrowRange(self.query_bytes + self.key_bytes, self.query_bytes),
+        };
+    }
+};
+
 /// Exact independently retained buffers for a captured two-column sequence.
 /// Pure geometry is available to cold admission before any SDK teardown or
 /// allocation. It contains no page/key/weight pointer and grants no byte credit.
@@ -59,8 +85,26 @@ pub const StorageLayout = struct {
     tokens: Span,
     positions: Span,
     counter: Span,
+    recurrent_page_table: ?Span = null,
+    attention_page_tables: ?Span = null,
     attention_workspace: ?Span = null,
+    attention_output: ?Span = null,
     recurrent_workspace: ?Span = null,
+    recurrent_projection_joined: ?Span = null,
+    recurrent_output: ?Span = null,
+    ffn_workspace: ?Span = null,
+    ffn_outputs: ?Span = null,
+    projection_staging: ?Span = null,
+    attention_residual: ?Span = null,
+    attention_inputs: ?Span = null,
+    input_projections: ?Span = null,
+    attention_projection_bytes: [3]usize = @splat(0),
+    recurrent_projection_bytes: [4]usize = @splat(0),
+    norm_weight_workspace: ?Span = null,
+    norm_weight_head_bytes: usize = 0,
+    layer_norm: ?Span = null,
+    layer_norm_mirror: ?Span = null,
+    final_norm_mirror: ?Span = null,
     fused_head_workspace: ?Span = null,
     recurrent_scratch: ?@import("gated_delta.zig").PacketScratch = null,
     metadata_bytes: usize,
@@ -152,8 +196,12 @@ pub const StorageLayout = struct {
     }
 
     fn declareLayerWorkspace(self: *StorageLayout, bytes: usize) !Span {
-        if (bytes == 0 or bytes > plan_mod.limit) return error.InvalidShape;
-        const offset = try self.layerWorkspaceOffset();
+        return self.declareLayerRegion(0, bytes);
+    }
+
+    fn declareLayerRegion(self: *StorageLayout, relative_offset: usize, bytes: usize) !Span {
+        if (bytes == 0 or relative_offset > plan_mod.limit or bytes > plan_mod.limit - relative_offset) return error.InvalidShape;
+        const offset = try std.math.add(usize, try self.layerWorkspaceOffset(), relative_offset);
         self.metadata_bytes = @max(self.metadata_bytes, try std.math.add(usize, offset, bytes));
         return .{ .offset = offset, .bytes = bytes };
     }
@@ -162,8 +210,42 @@ pub const StorageLayout = struct {
         return self.metadata_bytes - (self.layerWorkspaceOffset() catch unreachable);
     }
 
+    /// Physical prerequisites for observing a declared warm burst at any
+    /// supported graph width. The actual dispatch still proves coverage.
+    pub fn supportsDeclaredWarmup(self: StorageLayout, has_head_destination: bool) bool {
+        return (has_head_destination or self.fused_head_workspace != null) and
+            self.layer_norm != null and self.ffn_workspace != null and
+            self.recurrent_projection_joined != null and self.attention_inputs != null;
+    }
+
+    /// The terminal head runs after the final normalization publishes a
+    /// separate tensor. Its bank can alias the layer-live spans.
+    fn layerLiveBytes(self: StorageLayout) !usize {
+        const start = try self.layerWorkspaceOffset();
+        var end = start;
+        for ([_]?Span{
+            self.attention_workspace,
+            self.attention_output,
+            self.recurrent_workspace,
+            self.recurrent_projection_joined,
+            self.recurrent_output,
+            self.ffn_workspace,
+            self.ffn_outputs,
+            self.attention_residual,
+            self.attention_inputs,
+            self.input_projections,
+            self.norm_weight_workspace,
+            self.layer_norm,
+            self.layer_norm_mirror,
+        }) |slot| if (slot) |span| {
+            end = @max(end, try std.math.add(usize, span.offset, span.bytes));
+        };
+        return end - start;
+    }
+
     fn layerWorkspaceOffset(self: StorageLayout) !usize {
-        return aligned(try std.math.add(usize, self.counter.offset, self.counter.bytes));
+        const final = self.attention_page_tables orelse self.recurrent_page_table orelse self.counter;
+        return aligned(try std.math.add(usize, final.offset, final.bytes));
     }
 
     fn aligned(bytes: usize) !usize {
@@ -211,22 +293,110 @@ test "LightOnOCR3 CUDA graph canonical cohorts restore both token columns after 
     try std.testing.expectError(error.InvalidPagedKvBatch, canonicalOrder(&.{ 7, 29, 7, 43 }, &order));
     try std.testing.expectError(error.InvalidPagedKvBatch, canonicalOrder(&.{ 7, 0, 29, 43 }, &order));
 }
-pub const Phase = enum { warm, learn, capture, replay, disabled };
+pub const Phase = enum {
+    warm,
+    learn,
+    capture,
+    replay,
+    disabled,
+
+    pub fn canReachReplay(self: Phase, remaining_tokens: usize) bool {
+        // Warmup can declare a plan directly or require a separate learning
+        // burst. Each completed burst consumes two output tokens.
+        return switch (self) {
+            .warm, .learn => remaining_tokens >= 6,
+            .capture => remaining_tokens >= 4,
+            .replay => remaining_tokens >= 2,
+            .disabled => false,
+        };
+    }
+};
+/// View of the recurrent section of a captured decoder key.
+pub const RecurrentPageKey = struct {
+    words: []const u64,
+    rows: usize,
+    layers: usize,
+    layer_words: usize,
+
+    const gdn = @import("gated_delta.zig");
+    const weight_words = 4;
+    const page_words = 3;
+
+    pub fn init(key: []const u64, start: usize, rows: usize, layers: usize) !RecurrentPageKey {
+        if (rows == 0 or layers == 0 or start > key.len) return error.InvalidShape;
+        const packets = (rows - 1) / gdn.max_packet_rows + 1;
+        const layer_words = try std.math.add(usize, try std.math.mul(usize, packets, weight_words), try std.math.mul(usize, rows, page_words));
+        const count = try std.math.mul(usize, layers, layer_words);
+        if (count > key.len - start) return error.InvalidShape;
+        return .{ .words = key[start..][0..count], .rows = rows, .layers = layers, .layer_words = layer_words };
+    }
+
+    pub fn page(self: RecurrentPageKey, layer: usize, row: usize) gdn.BatchPage {
+        std.debug.assert(layer < self.layers and row < self.rows);
+        const offset = layer * self.layer_words + row * page_words +
+            (row / gdn.max_packet_rows + 1) * weight_words;
+        const words = self.words[offset..][0..page_words];
+        return .{ .state = words[0], .history = words[1], .next_history = words[2] };
+    }
+
+    fn samePacketWeights(self: RecurrentPageKey, candidate: RecurrentPageKey) bool {
+        if (self.rows != candidate.rows or self.layers != candidate.layers) return false;
+        const packets = (self.rows - 1) / gdn.max_packet_rows + 1;
+        for (0..self.layers) |layer| {
+            for (0..packets) |packet| {
+                const offset = layer * self.layer_words + packet * (gdn.max_packet_rows * page_words + weight_words);
+                if (!std.mem.eql(u64, self.words[offset..][0..weight_words], candidate.words[offset..][0..weight_words])) return false;
+            }
+        }
+        return true;
+    }
+
+    fn packetLeaderState(self: RecurrentPageKey, address: u64) bool {
+        const packets = (self.rows - 1) / gdn.max_packet_rows + 1;
+        for (0..self.layers) |layer| {
+            for (0..packets) |packet| {
+                if (self.page(layer, packet * gdn.max_packet_rows).state == address) return true;
+            }
+        }
+        return false;
+    }
+
+    fn referencesState(self: RecurrentPageKey, address: u64) bool {
+        for (0..self.layers) |layer| {
+            for (0..self.rows) |row| {
+                if (self.page(layer, row).state == address) return true;
+            }
+        }
+        return false;
+    }
+};
+
 /// Borrowed only through one final-address Executor phase. Full key/positions
 /// remain synchronous under the held worker step; no such borrow enters Module.
 pub const Descriptor = struct {
     epoch: u64,
     key: []const u64,
+    sequences: []const u64 = &.{},
     positions: []const u32,
     rows: usize,
     hidden: usize,
     vocab: usize,
     future_tokens: usize,
+    minimum_remaining_tokens: usize = std.math.maxInt(usize),
     head_storage: HeadStorage = .full_bank,
     attention_geometry: ?DecodeScratch.Geometry = null,
+    attention_q_gate: bool = false,
+    norm_weight_offset: f32 = 0,
     recurrent_heads: ?struct { key: usize, value: usize } = null,
+    recurrent_projection_widths: ?[4]usize = null,
+    recurrent_page_key_start: ?usize = null,
+    attention_page_key_start: ?usize = null,
+    reserve_rebind_key: bool = false,
+    attention_tokens: []const u32 = &.{},
+    attention_page_size: u32 = 0,
     attention_layers: usize,
     recurrent_layers: usize,
+    ffn_intermediate: usize = 0,
     pub const HeadStorage = union(enum) {
         full_bank,
         adaptive_bank: usize,
@@ -234,13 +404,43 @@ pub const Descriptor = struct {
         fused_top1,
     };
 
+    fn keyCapacity(self: Descriptor) !usize {
+        if (!self.reserve_rebind_key) return self.key.len;
+        const start = self.attention_page_key_start orelse return error.InvalidShape;
+        if (self.rows == 0 or self.recurrent_page_key_start == null or start > self.key.len) return error.InvalidShape;
+        const packets = (self.rows - 1) / paged_attention.max_packet_rows + 1;
+        const blocks = try std.math.mul(usize, packets, paged_attention.max_blocks);
+        const row_words = try std.math.mul(usize, self.rows, 3);
+        const kv_words = try std.math.add(usize, try std.math.mul(usize, self.attention_layers, 3), 1);
+        const capacity = try std.math.add(usize, try std.math.add(usize, start, row_words), try std.math.add(usize, blocks, kv_words));
+        if (capacity < self.key.len) return error.InvalidShape;
+        return capacity;
+    }
+
     pub fn layout(self: Descriptor) !StorageLayout {
         if (self.epoch == 0 or self.rows > max_rows or self.positions.len != self.rows * 3) return error.InvalidShape;
+        if (self.sequences.len != 0 and self.sequences.len != self.rows) return error.InvalidShape;
         const packet_rows = switch (self.head_storage) {
             .full_bank, .fused_top1 => self.rows,
             .adaptive_bank, .shared_layer_packets => |rows| rows,
         };
-        var storage = try StorageLayout.initWithHeadLimit(self.rows, self.hidden, self.vocab, self.key.len, packet_rows);
+        var storage = try StorageLayout.initWithHeadLimit(self.rows, self.hidden, self.vocab, try self.keyCapacity(), packet_rows);
+        if (self.recurrent_page_key_start) |start| {
+            _ = try RecurrentPageKey.init(self.key, start, self.rows, self.recurrent_layers);
+            const count = try std.math.mul(usize, self.rows, self.recurrent_layers);
+            const bytes = try std.math.mul(usize, count, @sizeOf(@import("gated_delta.zig").BatchPage));
+            if (bytes == 0 or bytes > plan_mod.limit) return error.InvalidShape;
+            storage.recurrent_page_table = .{ .offset = storage.metadata_bytes, .bytes = bytes };
+            storage.metadata_bytes = try storage.layerWorkspaceOffset();
+        }
+
+        if (self.attention_page_key_start != null) {
+            if (self.attention_tokens.len != self.rows or self.attention_layers == 0 or self.attention_page_size == 0 or self.rows == 0) return error.InvalidShape;
+            const packets = (self.rows - 1) / paged_attention.max_packet_rows + 1;
+            const bytes = try std.math.mul(usize, packets, @sizeOf(paged_attention.PageTable));
+            storage.attention_page_tables = .{ .offset = storage.metadata_bytes, .bytes = bytes };
+            storage.metadata_bytes = try storage.layerWorkspaceOffset();
+        }
         if (self.head_storage == .shared_layer_packets) {
             const elements = try std.math.mul(usize, @min(self.rows, packet_rows), self.vocab);
             const bytes = try std.math.mul(usize, elements, @sizeOf(f32));
@@ -254,14 +454,17 @@ pub const Descriptor = struct {
         }
         return storage;
     }
-    pub const DispatchCounts = struct { attention: usize, ragged_recurrent: usize };
+    pub const DispatchCounts = struct { attention: usize, attention_gates: usize, ragged_recurrent: usize };
 
     pub fn dispatchCounts(self: Descriptor) !DispatchCounts {
         if (self.rows < 2 or self.rows > max_rows) return error.InvalidShape;
         const attention_packets = (self.rows - 1) / paged_attention.max_packet_rows + 1;
         const recurrent_packets = (self.rows - 1) / recurrent_packet_rows + 1;
+        // Each token gates the assembled attention output once per layer.
+        const attention_gates = try std.math.mul(usize, self.attention_layers, 2);
         return .{
-            .attention = try std.math.mul(usize, self.attention_layers, 2 * attention_packets),
+            .attention = try std.math.mul(usize, attention_gates, attention_packets),
+            .attention_gates = attention_gates,
             .ragged_recurrent = if (recurrent_packets > 1) try std.math.mul(usize, self.recurrent_layers, 2 * recurrent_packets) else 0,
         };
     }
@@ -272,6 +475,7 @@ pub const Descriptor = struct {
 };
 
 pub const Snapshot = struct {
+    rebind_required: bool,
     invalidations: u64,
     epoch: u64,
     phase: Phase,
@@ -313,11 +517,13 @@ const ColdPhase = struct {
 pub const GraphPhase = struct {
     descriptor: Descriptor,
     storage_layout: StorageLayout = undefined,
+    vendor_workspace: buffer.DeviceBuffer = .{},
     attention_scratch: ?DecodeScratch = null,
     mode: enum { none, storage, arena } = .none,
     expected_compute: usize = 0,
     old: Snapshot = undefined,
     admission_pressure: ?memory.AdmissionPressure = null,
+    insufficient_replay_horizon: bool = false,
     admission: ?@import("video_cache_budget.zig").Admission = null,
     cold: ?*ColdPhase = null,
     bound: bool = false,
@@ -326,6 +532,125 @@ pub const GraphPhase = struct {
         _ = try descriptor.dispatchCounts();
         self.* = .{ .descriptor = descriptor, .storage_layout = layout };
     }
+    pub const WorkspacePolicy = struct {
+        attention_chunk128: ?bool = null,
+        recurrent_scratch: bool,
+        compact_ffn: ?bool,
+        projection_staging: bool,
+        final_norm_mirror: bool = false,
+        layer_norm: bool = false,
+        fused_attention_inputs: bool = false,
+        fused_recurrent_projections: bool = false,
+        adjust_norm_weights: bool = false,
+    };
+
+    /// Resolve layer lifetimes in submission order from the descriptor. A
+    /// repeated inspection starts from the same prefix and head reservation.
+    pub fn prepareWorkspace(self: *GraphPhase, policy: WorkspacePolicy) !void {
+        self.storage_layout = try self.descriptor.layout();
+        self.attention_scratch = null;
+        try self.declareAttentionScratch(policy.attention_chunk128);
+        try self.declareAttentionOutput();
+        if (policy.recurrent_scratch) try self.declareRecurrentScratch();
+        try self.declareRecurrentOutput();
+        var recurrent_projection_total: usize = 0;
+        if (self.descriptor.recurrent_layers != 0) {
+            if (self.descriptor.recurrent_projection_widths) |widths| {
+                const row_bytes = try std.math.mul(usize, self.descriptor.rows, @sizeOf(f32));
+                for (widths, &self.storage_layout.recurrent_projection_bytes) |width, *bytes| {
+                    if (width == 0) return error.InvalidShape;
+                    bytes.* = try std.math.mul(usize, row_bytes, width);
+                    recurrent_projection_total = try std.math.add(usize, recurrent_projection_total, bytes.*);
+                }
+            }
+            // The joined GEMM result dies at the split, before the
+            // recurrent core or the FFN enters the serial scratch bank.
+            if (policy.fused_recurrent_projections) {
+                if (!policy.layer_norm) return error.InvalidShape;
+                self.storage_layout.recurrent_projection_joined = try self.storage_layout.declareLayerWorkspace(recurrent_projection_total);
+            }
+        }
+        if (policy.adjust_norm_weights) {
+            // Hidden norm and Q/K norm preparation run before the other
+            // serial scratch. The Q and K vectors may be live together.
+            const hidden_bytes = try std.math.mul(usize, self.descriptor.hidden, @sizeOf(f32));
+            const head_bytes = if (self.descriptor.attention_geometry) |geometry|
+                try std.math.mul(usize, geometry.dim, @sizeOf(f32))
+            else
+                0;
+            self.storage_layout.norm_weight_head_bytes = head_bytes;
+            self.storage_layout.norm_weight_workspace = try self.storage_layout.declareLayerWorkspace(@max(hidden_bytes, try std.math.mul(usize, head_bytes, 2)));
+        }
+        if (policy.compact_ffn) |compact| try self.declareFfnScratch(compact);
+        if (policy.layer_norm and self.storage_layout.ffn_outputs == null) {
+            const elements = try std.math.mul(usize, self.descriptor.rows, self.descriptor.hidden);
+            try self.declareLayerOutputs(try std.math.mul(usize, elements, @sizeOf(f32)));
+        }
+        if (policy.layer_norm) {
+            const elements = try std.math.mul(usize, self.descriptor.rows, self.descriptor.hidden);
+            const norm_bytes = try std.math.mul(usize, elements, @sizeOf(f32));
+            const offset = try StorageLayout.aligned(try self.storage_layout.layerLiveBytes());
+            self.storage_layout.layer_norm = try self.storage_layout.declareLayerRegion(offset, norm_bytes);
+            if (policy.final_norm_mirror) {
+                const mirror_offset = try StorageLayout.aligned(try self.storage_layout.layerLiveBytes());
+                self.storage_layout.layer_norm_mirror = try self.storage_layout.declareLayerRegion(mirror_offset, try std.math.mul(usize, elements, @sizeOf(u16)));
+            }
+        }
+        if (policy.layer_norm) {
+            const bytes = self.storage_layout.layer_norm.?.bytes;
+            const offset = try StorageLayout.aligned(try self.storage_layout.layerLiveBytes());
+            self.storage_layout.attention_residual = try self.storage_layout.declareLayerRegion(offset, bytes);
+        }
+        if (self.descriptor.attention_layers != 0 and
+            (policy.fused_attention_inputs or (policy.layer_norm and self.descriptor.attention_q_gate)))
+        {
+            const geometry = self.descriptor.attention_geometry orelse return error.InvalidShape;
+            const fused = policy.fused_attention_inputs and AttentionInputs.supports(geometry.heads, geometry.kv_heads, geometry.dim);
+            if (fused or self.descriptor.attention_q_gate) {
+                const inputs = try AttentionInputs.init(self.descriptor.rows, geometry.heads, geometry.kv_heads, geometry.dim);
+                const offset = try StorageLayout.aligned(try self.storage_layout.layerLiveBytes());
+                self.storage_layout.attention_inputs = try self.storage_layout.declareLayerRegion(offset, inputs.bytes);
+            }
+        }
+        var projection_bytes: usize = 0;
+        if (policy.layer_norm and self.descriptor.attention_layers != 0) {
+            const geometry = self.descriptor.attention_geometry orelse return error.InvalidShape;
+            const inputs = try AttentionInputs.init(self.descriptor.rows, geometry.heads, geometry.kv_heads, geometry.dim);
+            const query_bytes = if (self.descriptor.attention_q_gate) try std.math.mul(usize, inputs.query_bytes, 2) else inputs.query_bytes;
+            projection_bytes = try std.math.add(usize, query_bytes, try std.math.mul(usize, inputs.key_bytes, 2));
+            self.storage_layout.attention_projection_bytes = .{ query_bytes, inputs.key_bytes, inputs.key_bytes };
+        }
+        if (policy.layer_norm) projection_bytes = @max(projection_bytes, recurrent_projection_total);
+        if (projection_bytes != 0) {
+            const offset = try StorageLayout.aligned(try self.storage_layout.layerLiveBytes());
+            self.storage_layout.input_projections = try self.storage_layout.declareLayerRegion(offset, projection_bytes);
+        }
+        if (policy.projection_staging) try self.declareProjectionStaging();
+        if (policy.final_norm_mirror) try self.declareFinalNormMirror();
+    }
+
+    fn declareFinalNormMirror(self: *GraphPhase) !void {
+        const layout = &self.storage_layout;
+        const elements = try std.math.mul(usize, self.descriptor.rows, self.descriptor.hidden);
+        const bytes = try std.math.mul(usize, elements, @sizeOf(u16));
+        const prefix = try layout.layerWorkspaceOffset();
+        const head_bytes = @max(
+            if (layout.shared_head_workspace) |span| span.bytes else 0,
+            if (layout.fused_head_workspace) |span| span.bytes else 0,
+        );
+        // Layer outputs are dead when the final norm runs. Only the terminal
+        // head bank and any projection staging remain concurrent with its mirror.
+        const norm_weight_bytes = if (layout.norm_weight_workspace) |span| span.bytes else 0;
+        var offset = try StorageLayout.aligned(@max(head_bytes, norm_weight_bytes));
+        if (layout.projection_staging) |span| {
+            const staging_start = span.offset - prefix;
+            const staging_end = try std.math.add(usize, staging_start, span.bytes);
+            if (offset < staging_end and try std.math.add(usize, offset, bytes) > staging_start)
+                offset = try StorageLayout.aligned(staging_end);
+        }
+        layout.final_norm_mirror = try layout.declareLayerRegion(offset, bytes);
+    }
+
     pub fn declareAttentionScratch(self: *GraphPhase, chunk128_override: ?bool) !void {
         const descriptor = self.descriptor;
         if (descriptor.attention_layers == 0) return;
@@ -345,8 +670,69 @@ pub const GraphPhase = struct {
         self.storage_layout.recurrent_scratch = scratch;
     }
 
+    pub fn declareAttentionOutput(self: *GraphPhase) !void {
+        if (self.descriptor.attention_layers == 0) return;
+        const geometry = self.descriptor.attention_geometry orelse return error.InvalidShape;
+        const width = try std.math.mul(usize, geometry.heads, geometry.dim);
+        const bytes = try std.math.mul(usize, self.descriptor.rows * @sizeOf(f32), width);
+        const scratch = self.storage_layout.attention_workspace orelse return error.InvalidShape;
+        self.storage_layout.attention_output = try self.storage_layout.declareLayerRegion(try StorageLayout.aligned(scratch.bytes), bytes);
+    }
+
+    pub fn declareRecurrentOutput(self: *GraphPhase) !void {
+        const descriptor = self.descriptor;
+        if (descriptor.recurrent_layers == 0) return;
+        const heads = descriptor.recurrent_heads orelse return error.InvalidShape;
+        const width = try std.math.mul(usize, heads.value, recurrent_value_dim);
+        const bytes = try std.math.mul(usize, descriptor.rows * @sizeOf(f32), width);
+        const scratch_bytes = if (self.storage_layout.recurrent_workspace) |span| span.bytes else 0;
+        self.storage_layout.recurrent_output = try self.storage_layout.declareLayerRegion(try StorageLayout.aligned(scratch_bytes), bytes);
+    }
+
+    pub fn declareFfnScratch(self: *GraphPhase, compact: bool) !void {
+        const descriptor = self.descriptor;
+        if (descriptor.ffn_intermediate == 0) return;
+        const Ffn = @import("dense_ffn_workspace.zig").Layout;
+        const layout = if (compact)
+            try Ffn.initCompact(descriptor.rows, descriptor.hidden, descriptor.ffn_intermediate)
+        else
+            try Ffn.init(descriptor.rows, descriptor.hidden, descriptor.ffn_intermediate, 0);
+        self.storage_layout.ffn_workspace = try self.storage_layout.declareLayerWorkspace(layout.scratch_bytes);
+        try self.declareLayerOutputs(layout.output_bytes);
+    }
+
+    fn declareLayerOutputs(self: *GraphPhase, bytes: usize) !void {
+        // Residuals can cross a layer boundary while layer scratch is reused.
+        // Place both alternating publication slots after all serial scratch.
+        const scratch_end = try StorageLayout.aligned(try self.storage_layout.layerLiveBytes());
+        self.storage_layout.ffn_outputs = try self.storage_layout.declareLayerRegion(scratch_end, try std.math.mul(usize, bytes, 2));
+    }
+
+    pub fn declareProjectionStaging(self: *GraphPhase) !void {
+        const descriptor = self.descriptor;
+        var width = @max(descriptor.hidden, descriptor.ffn_intermediate);
+        if (descriptor.attention_geometry) |geometry|
+            width = @max(width, try std.math.mul(usize, geometry.heads, geometry.dim));
+        if (descriptor.recurrent_heads) |heads|
+            width = @max(width, try std.math.mul(usize, heads.value, recurrent_value_dim));
+        const bytes = try std.math.mul(usize, descriptor.rows * @sizeOf(u16), width);
+        // The ordinary head GEMM also uses projection staging.
+        const layer_bytes = try self.storage_layout.layerLiveBytes();
+        const head_bytes = if (self.storage_layout.shared_head_workspace) |head| head.bytes else 0;
+        const occupied = try StorageLayout.aligned(@max(layer_bytes, head_bytes));
+        self.storage_layout.projection_staging = try self.storage_layout.declareLayerRegion(occupied, bytes);
+    }
+
     pub fn matchesOwner(self: *const GraphPhase, owner: *const Module) bool {
         if (!owner.matches(self.descriptor)) return false;
+        return self.matchesStorage(owner);
+    }
+
+    pub fn canRebind(self: *const GraphPhase, owner: *const Module) bool {
+        return owner.admitsRebind(self.descriptor) and self.matchesStorage(owner);
+    }
+
+    fn matchesStorage(self: *const GraphPhase, owner: *const Module) bool {
         var storage = owner.storage_layout orelse return false;
         const expected = self.storage_layout;
         if (self.descriptor.head_storage == .adaptive_bank and storage.head_bytes < expected.head_bytes) {
@@ -354,7 +740,7 @@ pub const GraphPhase = struct {
             if (storage.head_bytes < 8 * row_bytes or storage.head_bytes % row_bytes != 0) return false;
             storage.head_bytes = expected.head_bytes;
         }
-        return std.meta.eql(storage, expected) and std.meta.eql(owner.attention_scratch, self.attention_scratch);
+        return std.meta.eql(storage, expected) and std.meta.eql(owner.attention_scratch, self.attention_scratch) and std.meta.eql(owner.vendor_workspace, self.vendor_workspace);
     }
 
     /// Only the optional packet bank changes. Input, token and attention spans
@@ -426,7 +812,8 @@ pub const GraphPhase = struct {
             return err;
         };
         if (self.mode == .storage) {
-            cold.key = try allocator.dupe(u64, self.descriptor.key);
+            cold.key = try allocator.alloc(u64, try self.descriptor.keyCapacity());
+            @memcpy(cold.key[0..self.descriptor.key.len], self.descriptor.key);
             cold.plan = try allocator.create(plan_mod.Plan);
             cold.plan.?.* = .{};
         }
@@ -468,13 +855,18 @@ pub const GraphPhase = struct {
 };
 
 pub const Module = struct {
+    rebind_required: bool = false,
     mutex: std.atomic.Mutex = .unlocked,
     epoch_id: u64 = 0,
+    sequences: [max_rows]u64 = undefined,
+    sequence_count: usize = 0,
     captured_roots_identity: usize = 0,
     disabled_epoch: u64 = 0,
     key: []u64 = &.{},
+    key_backing: []u64 = &.{},
     plan: ?*plan_mod.Plan = null,
     phase: Phase = .warm,
+    vendor_workspace: buffer.DeviceBuffer = .{},
     metadata: buffer.DeviceBuffer = .{},
     arena: buffer.DeviceBuffer = .{},
     admitted_arena_layout: ?plan_mod.Layout = null,
@@ -494,13 +886,23 @@ pub const Module = struct {
     attention_layers: usize = 0,
     recurrent_layers: usize = 0,
     expected_attention_calls: usize = 0,
+    expected_attention_gates: usize = 0,
     expected_ragged_packets: usize = 0,
     bound_recurrent_scratch_bytes: usize = 0,
+    bound_recurrent_joined_projection_bytes: usize = 0,
+    attention_gates_in_place: usize = 0,
+    next_ffn_output: u1 = 0,
     storage_layout: ?StorageLayout = null,
     base_positions: [3 * max_rows]u32 = @splat(0),
     next_positions: [3 * max_rows]u32 = @splat(0),
     progress: u32 = 0,
     capture_step: u32 = 0,
+    recurrent_page_layer: usize = 0,
+    recurrent_page_table_staged: bool = false,
+    recurrent_page_key_start: ?usize = null,
+    attention_page_tables_staged: bool = false,
+    attention_page_packet: usize = 0,
+    attention_page_size: u32 = 0,
     active: bool = false,
     captures: u64 = 0,
     replays: u64 = 0,
@@ -519,6 +921,14 @@ pub const Module = struct {
         try self.arena_quota.validateLegacyRaw();
         return self.clearWithCleanup(ctx, .{ .outside_execution = true });
     }
+    pub fn retirementPending(self: *const Module) bool {
+        return self.phase != .disabled or self.active or self.graph != null or self.pending_graph != null or
+            self.metadata.ptr != 0 or self.arena.ptr != 0 or self.head.ptr != 0 or
+            self.plan != null or self.key.len != 0 or self.sequence_count != 0 or self.captured_roots_identity != 0 or
+            self.storage_layout != null or self.admitted_arena_layout != null or
+            self.metadata_quota != .none or self.arena_quota != .none;
+    }
+
     pub fn validateCleanup(self: *const Module, current: Cleanup) !void {
         try self.metadata_quota.validateCleanup(current);
         try self.arena_quota.validateCleanup(current);
@@ -529,6 +939,7 @@ pub const Module = struct {
         const live = self.head.ptr != 0 or self.metadata.ptr != 0 or self.arena.ptr != 0 or self.graph != null or self.pending_graph != null;
         if (live and (ctx.driver.fns.cuStreamIsCapturing == null or try ctx.streamCaptureActive())) return error.CapturedGraphActive;
         self.phase = .disabled;
+        self.rebind_required = false;
         self.active = false;
         if (self.head.ptr != 0 or self.metadata.ptr != 0 or self.arena.ptr != 0 or self.graph != null or self.pending_graph != null) try ctx.synchronize();
         // Every failed SDK handle remains in this actual owner. Neither quota
@@ -542,14 +953,19 @@ pub const Module = struct {
         _ = try self.metadata.freeChecked(ctx);
         if (self.plan) |plan| self.host_allocator.destroy(plan);
         self.plan = null;
-        if (self.key.len != 0) self.host_allocator.free(self.key);
+        if (self.key_backing.len != 0) self.host_allocator.free(self.key_backing) else if (self.key.len != 0) self.host_allocator.free(self.key);
         self.key = &.{};
+        self.key_backing = &.{};
+        self.sequence_count = 0;
         try self.arena_quota.releaseAfterSdkDeath(current);
         try self.metadata_quota.releaseAfterSdkDeath(current);
         self.captured_roots_identity = 0;
         self.storage_layout = null;
         self.attention_scratch = null;
+        self.vendor_workspace = .{};
         self.bound_recurrent_scratch_bytes = 0;
+        self.bound_recurrent_joined_projection_bytes = 0;
+        self.attention_gates_in_place = 0;
         self.rows = 0;
         self.hidden = 0;
         self.vocab = 0;
@@ -562,6 +978,7 @@ pub const Module = struct {
         else
             null;
         return .{
+            .rebind_required = self.rebind_required,
             .invalidations = self.invalidations,
             .epoch = self.epoch_id,
             .phase = self.phase,
@@ -578,16 +995,144 @@ pub const Module = struct {
             .arena_quota = self.arena_quota,
         };
     }
+    pub const Dependency = union(enum) { recurrent: u64, sequence: u64 };
+
+    pub fn attentionPageTables(self: *const Module) ?buffer.DeviceBuffer {
+        const layout = self.storage_layout orelse return null;
+        return if (layout.attention_page_tables) |span| span.bind(self.metadata) else null;
+    }
+
+    pub fn nextAttentionPageTableOffset(self: *Module, rows: usize) !u32 {
+        const table = self.attentionPageTables() orelse return 0;
+        if (!self.active or !self.attention_page_tables_staged or self.attention_page_packet >= self.expected_attention_calls / 2)
+            return error.InvalidExecutionPlan;
+        const packets = table.len / @sizeOf(paged_attention.PageTable);
+        const packet = self.attention_page_packet % packets;
+        const expected_rows = @min(paged_attention.max_packet_rows, self.rows - packet * paged_attention.max_packet_rows);
+        if (rows != expected_rows) return error.InvalidExecutionPlan;
+        const offset = table.ptr - self.counter().ptr + packet * @sizeOf(paged_attention.PageTable);
+        self.attention_page_packet += 1;
+        return std.math.cast(u32, offset) orelse error.InvalidExecutionPlan;
+    }
+
+    pub fn nextRecurrentPageLayer(self: *Module, rows: usize) !?buffer.DeviceBuffer {
+        const layout = self.storage_layout orelse return error.InvalidExecutionPlan;
+        const table = layout.recurrent_page_table orelse return null;
+        if (!self.active or !self.recurrent_page_table_staged or rows != self.rows or self.recurrent_page_layer >= self.recurrent_layers) return error.InvalidExecutionPlan;
+        const row_bytes = try std.math.mul(usize, rows, @sizeOf(@import("gated_delta.zig").BatchPage));
+        const offset = try std.math.mul(usize, self.recurrent_page_layer, row_bytes);
+        const result = try table.bind(self.metadata).borrowRange(offset, row_bytes);
+        self.recurrent_page_layer += 1;
+        return result;
+    }
+
+    pub fn recurrentPageTable(self: *const Module) ?buffer.DeviceBuffer {
+        const layout = self.storage_layout orelse return null;
+        return if (layout.recurrent_page_table) |span| span.bind(self.metadata) else null;
+    }
+
     pub fn invalidate(self: *Module, ctx: *context.CudaContext) void {
+        self.invalidateMatching(ctx, null);
+    }
+
+    pub fn invalidateMatching(self: *Module, ctx: *context.CudaContext, dependency: ?Dependency) void {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
         defer self.mutex.unlock();
+        if (!self.retirementPending() or !self.references(dependency)) return;
         self.clear(ctx) catch @import("antfly_platform").inference_process_supervisor.restartWorker();
     }
+
+    pub fn references(self: *const Module, dependency: ?Dependency) bool {
+        return if (dependency) |value| switch (value) {
+            .recurrent => |address| self.referencesRecurrentAddress(address),
+            .sequence => |sequence| self.referencesSequence(sequence),
+        } else true;
+    }
+
+    pub fn referencesSequence(self: *const Module, sequence: u64) bool {
+        return self.sequence_count == 0 or std.mem.indexOfScalar(u64, self.sequences[0..self.sequence_count], sequence) != null;
+    }
+
+    /// The device-table route distinguishes state addresses from packet weights.
+    /// Legacy keys use conservative membership when their layout is unavailable.
+    pub fn referencesRecurrentAddress(self: *const Module, address: u64) bool {
+        if (self.sequence_count == 0) return true;
+        if (address == 0) return false;
+        if (self.recurrent_page_key_start) |start| {
+            const bindings = RecurrentPageKey.init(self.key, start, self.rows, self.recurrent_layers) catch return true;
+            return bindings.referencesState(address);
+        }
+        return std.mem.indexOfScalar(u64, self.key, address) != null;
+    }
+
+    /// Foreground work may replace provider scratch. Suspension requires a
+    /// declared plan with independently owned metadata and zero scratch.
+    pub fn canSuspendForForeground(self: *const Module) bool {
+        if (self.active or self.phase != .replay or self.graph == null or
+            !self.recurrent_page_table_staged or !self.attention_page_tables_staged or
+            self.vendor_workspace.ptr != 0 or self.vendor_workspace.len != 0 or self.arena.ptr != 0) return false;
+        const plan = self.plan orelse return false;
+        const layout = self.admitted_arena_layout orelse return false;
+        return plan.origin == .declared and plan.event_count == 0 and layout.events == 0 and layout.bytes == 0;
+    }
+
+    pub fn canSuspendBinding(self: *const Module, dependency: Dependency) bool {
+        if (self.active or self.phase != .replay or self.graph == null or !self.recurrent_page_table_staged or
+            !self.attention_page_tables_staged or self.sequence_count != self.rows) return false;
+        const start = self.recurrent_page_key_start orelse return false;
+        const pages = RecurrentPageKey.init(self.key, start, self.rows, self.recurrent_layers) catch return false;
+        return switch (dependency) {
+            .recurrent => |address| address != 0 and pages.referencesState(address) and !pages.packetLeaderState(address),
+            .sequence => |sequence| blk: {
+                const row = std.mem.indexOfScalar(u64, self.sequences[0..self.sequence_count], sequence) orelse break :blk false;
+                break :blk row % RecurrentPageKey.gdn.max_packet_rows != 0;
+            },
+        };
+    }
+
+    fn admitsRebind(self: *const Module, descriptor: Descriptor) bool {
+        if (!self.rebind_required or self.active or self.phase != .replay or self.graph == null or
+            self.epoch_id != descriptor.epoch or self.rows != descriptor.rows or self.hidden != descriptor.hidden or
+            self.vocab != descriptor.vocab or self.attention_layers != descriptor.attention_layers or
+            self.recurrent_layers != descriptor.recurrent_layers or (if (self.key_backing.len == 0) descriptor.key.len != self.key.len else descriptor.key.len > self.key_backing.len) or
+            self.sequence_count != self.rows or descriptor.sequences.len != self.rows or
+            descriptor.attention_page_key_start == null or descriptor.attention_tokens.len != self.rows or
+            self.attention_page_size == 0 or self.attention_page_size != descriptor.attention_page_size) return false;
+        const start = self.recurrent_page_key_start orelse return false;
+        if (descriptor.recurrent_page_key_start != start) return false;
+        const old = RecurrentPageKey.init(self.key, start, self.rows, self.recurrent_layers) catch return false;
+        const next = RecurrentPageKey.init(descriptor.key, start, descriptor.rows, descriptor.recurrent_layers) catch return false;
+        const kv_words = self.attention_layers * 3 + 1;
+        if (kv_words > self.key.len or kv_words > descriptor.key.len) return false;
+        const kv_start = self.key.len - kv_words;
+        const next_kv_start = descriptor.key.len - kv_words;
+        if (kv_start < start + old.words.len or next_kv_start < start + next.words.len or descriptor.attention_page_key_start != start + old.words.len) return false;
+        if (!std.mem.eql(u64, self.key[0..start], descriptor.key[0..start]) or
+            !std.mem.eql(u64, self.key[kv_start..], descriptor.key[next_kv_start..]) or
+            !old.samePacketWeights(next)) return false;
+        const packets = (self.rows - 1) / RecurrentPageKey.gdn.max_packet_rows + 1;
+        for (0..packets) |packet| {
+            const leader = packet * RecurrentPageKey.gdn.max_packet_rows;
+            if (self.sequences[leader] != descriptor.sequences[leader]) return false;
+        }
+        return true;
+    }
+
+    pub fn publishRebind(self: *Module, descriptor: Descriptor) void {
+        std.debug.assert(self.admitsRebind(descriptor));
+        const backing = if (self.key_backing.len != 0) self.key_backing else self.key;
+        self.key = backing[0..descriptor.key.len];
+        @memcpy(self.key, descriptor.key);
+        @memcpy(self.sequences[0..self.sequence_count], descriptor.sequences);
+        self.rebind_required = false;
+    }
+
     pub fn matches(self: *const Module, descriptor: Descriptor) bool {
-        return self.epoch_id == descriptor.epoch and self.rows == descriptor.rows and
+        return !self.rebind_required and self.epoch_id == descriptor.epoch and self.rows == descriptor.rows and
             self.hidden == descriptor.hidden and self.vocab == descriptor.vocab and
             self.attention_layers == descriptor.attention_layers and self.recurrent_layers == descriptor.recurrent_layers and
             self.key.len != 0 and std.mem.eql(u64, self.key, descriptor.key) and
+            std.mem.eql(u64, self.sequences[0..self.sequence_count], descriptor.sequences) and
             descriptor.positions.len == 3 * self.rows and
             std.mem.eql(u32, self.next_positions[0..descriptor.positions.len], descriptor.positions);
     }
@@ -596,9 +1141,24 @@ pub const Module = struct {
         self.hidden = hidden;
         self.vocab = vocab;
         self.storage_layout = layout;
+        self.recurrent_page_table_staged = false;
+        self.recurrent_page_key_start = null;
+        self.attention_page_tables_staged = false;
+        self.attention_page_size = 0;
         @memcpy(self.base_positions[0..positions_.len], positions_);
         @memcpy(self.next_positions[0..positions_.len], positions_);
         self.phase = .warm;
+    }
+
+    /// The warmed path may prove that every temporary used a declared span.
+    /// Discard any partial trace so compatibility learning starts from scratch.
+    pub fn finishDeclaredWarmup(plan: *plan_mod.Plan, matches_dispatch: bool) !bool {
+        if (matches_dispatch and plan.valid and plan.count == 0 and plan.event_count == 0) {
+            try plan.declare(&.{}, null);
+            return true;
+        }
+        plan.* = .{};
+        return false;
     }
 
     pub fn arenaLayout(self: *const Module) !plan_mod.Layout {
@@ -614,7 +1174,7 @@ pub const Module = struct {
         const dispatch = try descriptor.dispatchCounts();
         if (!phase.bound or phase.mode != .storage or self.metadata.ptr != 0 or self.head.ptr != 0 or self.arena.ptr != 0 or self.graph != null or self.pending_graph != null or self.plan != null or self.key.len != 0) return error.InvalidPreparedCacheState;
         const cold = phase.cold orelse return error.InvalidPreparedCacheState;
-        if (cold.plan == null or !std.mem.eql(u64, cold.key, descriptor.key)) return error.PreparedCachePlanChanged;
+        if (cold.plan == null or cold.key.len != (try descriptor.keyCapacity()) or !std.mem.eql(u64, cold.key[0..descriptor.key.len], descriptor.key)) return error.PreparedCachePlanChanged;
         const request = descriptor.storageRequestFor(layout);
         var lease = try cold.funding.?.take(request, try request.captured_storage.amounts());
         errdefer lease.releaseAfterSdkDeath();
@@ -627,7 +1187,10 @@ pub const Module = struct {
         self.head = head;
         self.metadata_quota = lease.publishQuota(); // SAME preallocated cold shell
         self.host_allocator = cold.allocator;
-        self.key = cold.key;
+        self.key_backing = cold.key;
+        self.key = self.key_backing[0..descriptor.key.len];
+        self.sequence_count = descriptor.sequences.len;
+        @memcpy(self.sequences[0..self.sequence_count], descriptor.sequences);
         cold.key = &.{};
         self.plan = cold.plan;
         cold.plan = null;
@@ -635,8 +1198,12 @@ pub const Module = struct {
         self.epoch_id = descriptor.epoch;
         self.attention_layers = descriptor.attention_layers;
         self.recurrent_layers = descriptor.recurrent_layers;
+        self.recurrent_page_key_start = descriptor.recurrent_page_key_start;
+        self.attention_page_size = descriptor.attention_page_size;
         self.attention_scratch = phase.attention_scratch;
+        self.vendor_workspace = phase.vendor_workspace;
         self.expected_attention_calls = dispatch.attention;
+        self.expected_attention_gates = dispatch.attention_gates;
         self.expected_ragged_packets = dispatch.ragged_recurrent;
     }
     pub fn reserveArenaPrepared(self: *Module, ctx: *context.CudaContext, phase: *GraphPhase) !void {
@@ -704,10 +1271,151 @@ pub const Module = struct {
         return bound;
     }
 
+    pub const LayerOutput = enum { attention, recurrent };
+
+    pub fn bindLayerOutput(self: *const Module, kind: LayerOutput, rows: usize, width: usize) !buffer.DeviceBuffer {
+        const layout = self.storage_layout orelse return error.InvalidExecutionPlan;
+        const span = (switch (kind) {
+            .attention => layout.attention_output,
+            .recurrent => layout.recurrent_output,
+        }) orelse return error.InvalidExecutionPlan;
+        const bytes = try std.math.mul(usize, try std.math.mul(usize, rows, width), @sizeOf(f32));
+        if (rows != self.rows or bytes != span.bytes) return error.InvalidExecutionPlan;
+        const workspace = switch (kind) {
+            .attention => layout.attention_workspace,
+            .recurrent => layout.recurrent_workspace,
+        };
+        if (workspace) |scratch| {
+            if (span.offset < try std.math.add(usize, scratch.offset, scratch.bytes)) return error.InvalidExecutionPlan;
+        }
+        return self.bindLayerWorkspace(layout, span, bytes);
+    }
+
+    pub fn bindFfnScratch(self: *const Module, ffn: @import("dense_ffn_workspace.zig").Layout) !buffer.DeviceBuffer {
+        const layout = self.storage_layout orelse return error.InvalidExecutionPlan;
+        const span = layout.ffn_workspace orelse return error.InvalidExecutionPlan;
+        if (ffn.rows != self.rows or ffn.hidden != self.hidden or ffn.vendor_bytes != 0 or ffn.scratch_bytes != span.bytes) return error.InvalidExecutionPlan;
+        return try self.bindLayerWorkspace(layout, span, ffn.scratch_bytes);
+    }
+
+    pub fn bindFfnOutput(self: *Module, ffn: @import("dense_ffn_workspace.zig").Layout, sources: []const buffer.DeviceBuffer) !buffer.DeviceBuffer {
+        if (ffn.rows != self.rows or ffn.hidden != self.hidden) return error.InvalidExecutionPlan;
+        return try self.bindLayerResidualOutput(ffn.output_bytes, sources);
+    }
+
+    pub fn bindLayerResidualOutput(self: *Module, bytes: usize, sources: []const buffer.DeviceBuffer) !buffer.DeviceBuffer {
+        const layout = self.storage_layout orelse return error.InvalidExecutionPlan;
+        const span = layout.ffn_outputs orelse return error.InvalidExecutionPlan;
+        if (bytes != span.bytes / 2) return error.InvalidExecutionPlan;
+        const output_bank = try self.bindLayerWorkspace(layout, span, span.bytes);
+        const slot = try output_bank.borrowRange(@as(usize, self.next_ffn_output) * bytes, bytes);
+        const end = try std.math.add(u64, slot.ptr, slot.len);
+        for (sources) |source| {
+            const source_end = try std.math.add(u64, source.ptr, source.len);
+            if (slot.ptr < source_end and source.ptr < end) return error.InvalidExecutionPlan;
+        }
+        self.next_ffn_output ^= 1;
+        return slot;
+    }
+
+    pub fn bindProjectionStaging(self: *const Module, bytes: usize) !?buffer.DeviceBuffer {
+        const layout = self.storage_layout orelse return error.InvalidExecutionPlan;
+        const span = layout.projection_staging orelse return null;
+        return try self.bindLayerWorkspace(layout, span, bytes);
+    }
+
     pub fn bindFusedHeadWorkspace(self: *const Module) !buffer.DeviceBuffer {
         const layout = self.storage_layout orelse return error.InvalidExecutionPlan;
         const span = layout.fused_head_workspace orelse return error.InvalidExecutionPlan;
         return self.bindLayerWorkspace(layout, span, span.bytes);
+    }
+
+    pub const AttentionProjection = enum { query, key, value };
+
+    pub fn bindAttentionProjection(self: *const Module, kind: AttentionProjection, bytes: usize) !?buffer.DeviceBuffer {
+        const layout = self.storage_layout orelse return error.InvalidExecutionPlan;
+        return self.bindInputProjection(layout, &layout.attention_projection_bytes, @backingInt(kind), bytes);
+    }
+
+    pub fn bindJoinedRecurrentProjection(self: *const Module, bytes: usize) !?buffer.DeviceBuffer {
+        const layout = self.storage_layout orelse return error.InvalidExecutionPlan;
+        const span = layout.recurrent_projection_joined orelse return null;
+        if (bytes != span.bytes) return error.InvalidExecutionPlan;
+        return try self.bindLayerWorkspace(layout, span, bytes);
+    }
+
+    pub const RecurrentProjection = enum { mixed, gate, beta, decay };
+
+    pub fn bindRecurrentProjection(self: *const Module, kind: RecurrentProjection, bytes: usize) !?buffer.DeviceBuffer {
+        const layout = self.storage_layout orelse return error.InvalidExecutionPlan;
+        return self.bindInputProjection(layout, &layout.recurrent_projection_bytes, @backingInt(kind), bytes);
+    }
+
+    fn bindInputProjection(self: *const Module, layout: StorageLayout, sizes: []const usize, index: usize, bytes: usize) !?buffer.DeviceBuffer {
+        const span = layout.input_projections orelse return null;
+        if (sizes[index] == 0) return null;
+        if (sizes[index] != bytes) return error.InvalidExecutionPlan;
+        var offset: usize = 0;
+        for (sizes[0..index]) |size| offset = try std.math.add(usize, offset, size);
+        const backing = try self.bindLayerWorkspace(layout, span, span.bytes);
+        return try backing.borrowRange(offset, bytes);
+    }
+
+    pub fn bindSplitQueryGate(self: *const Module, bytes: usize) !?[2]buffer.DeviceBuffer {
+        const layout = self.storage_layout orelse return error.InvalidExecutionPlan;
+        const span = layout.attention_inputs orelse return null;
+        if (layout.attention_projection_bytes[0] != try std.math.mul(usize, bytes, 2)) return error.InvalidExecutionPlan;
+        const key_bytes = layout.attention_projection_bytes[1];
+        const backing = try self.bindLayerWorkspace(layout, span, span.bytes);
+        return .{
+            try backing.borrowRange(0, bytes),
+            try backing.borrowRange(try std.math.add(usize, bytes, key_bytes), bytes),
+        };
+    }
+
+    pub fn bindAttentionInputs(self: *const Module, inputs: AttentionInputs) !?[3]buffer.DeviceBuffer {
+        const layout = self.storage_layout orelse return error.InvalidExecutionPlan;
+        const span = layout.attention_inputs orelse return null;
+        if (span.bytes != inputs.bytes) return error.InvalidExecutionPlan;
+        return try inputs.bind(try self.bindLayerWorkspace(layout, span, inputs.bytes));
+    }
+
+    pub fn bindAttentionResidual(self: *const Module, bytes: usize) !?buffer.DeviceBuffer {
+        const layout = self.storage_layout orelse return error.InvalidExecutionPlan;
+        const span = layout.attention_residual orelse return null;
+        if (span.bytes != bytes) return error.InvalidExecutionPlan;
+        return try self.bindLayerWorkspace(layout, span, bytes);
+    }
+
+    pub const NormStorage = struct { output: buffer.DeviceBuffer, mirror: ?buffer.DeviceBuffer };
+
+    pub fn bindLayerNorm(self: *const Module, bytes: usize) !?NormStorage {
+        const layout = self.storage_layout orelse return error.InvalidExecutionPlan;
+        const output = layout.layer_norm orelse return null;
+        if (output.bytes != bytes) return error.InvalidExecutionPlan;
+        const mirror = if (layout.layer_norm_mirror) |span| blk: {
+            if (span.bytes != bytes / 2) return error.InvalidExecutionPlan;
+            break :blk try self.bindLayerWorkspace(layout, span, span.bytes);
+        } else null;
+        return .{ .output = try self.bindLayerWorkspace(layout, output, bytes), .mirror = mirror };
+    }
+
+    pub const NormWeight = enum { hidden, query, key };
+
+    pub fn bindNormWeight(self: *const Module, kind: NormWeight, bytes: usize) !?buffer.DeviceBuffer {
+        const layout = self.storage_layout orelse return error.InvalidExecutionPlan;
+        const span = layout.norm_weight_workspace orelse return null;
+        const expected = if (kind == .hidden) try std.math.mul(usize, self.hidden, @sizeOf(f32)) else layout.norm_weight_head_bytes;
+        if (bytes == 0 or bytes != expected) return error.InvalidExecutionPlan;
+        const backing = try self.bindLayerWorkspace(layout, span, span.bytes);
+        return try backing.borrowRange(if (kind == .key) expected else 0, bytes);
+    }
+
+    pub fn bindFinalNormMirror(self: *const Module, bytes: usize) !?buffer.DeviceBuffer {
+        const layout = self.storage_layout orelse return error.InvalidExecutionPlan;
+        const span = layout.final_norm_mirror orelse return null;
+        if (span.bytes != bytes) return error.InvalidExecutionPlan;
+        return try self.bindLayerWorkspace(layout, span, bytes);
     }
 
     fn bindLayerWorkspace(self: *const Module, layout: StorageLayout, span: StorageLayout.Span, bytes: usize) !buffer.DeviceBuffer {
@@ -774,6 +1482,7 @@ test "bounded CUDA decoder shares declared attention and recurrent workspace" {
         .recurrent_heads = .{ .key = 16, .value = 32 },
         .attention_layers = 1,
         .recurrent_layers = 1,
+        .ffn_intermediate = 9216,
     };
     const base = try descriptor.layout();
     var phase: GraphPhase = undefined;
@@ -799,6 +1508,177 @@ test "bounded CUDA decoder shares declared attention and recurrent workspace" {
     changed.core_offset -= @sizeOf(f32);
     try std.testing.expectError(error.InvalidExecutionPlan, owner.bindRecurrentWorkspace(changed));
 
+    try phase.declareRecurrentOutput();
+    const with_output = phase.storage_layout;
+    const output = with_output.recurrent_output.?;
+    var output_owner: Module = .{
+        .rows = rows,
+        .storage_layout = with_output,
+        .metadata = .{ .ptr = 0x20000, .len = with_output.metadata_bytes },
+    };
+    const destination = try output_owner.bindLayerOutput(.recurrent, rows, 32 * recurrent_value_dim);
+    try std.testing.expectEqual(@as(usize, rows * 32 * recurrent_value_dim * @sizeOf(f32)), destination.len);
+    try std.testing.expect(output.offset >= recurrent.offset + recurrent.bytes);
+    try std.testing.expectEqual(base.metadata_bytes + @max(attention.bytes, output.offset - base.metadata_bytes + output.bytes), with_output.metadata_bytes);
+    try std.testing.expectError(error.InvalidExecutionPlan, output_owner.bindLayerOutput(.recurrent, rows - 1, 32 * recurrent_value_dim));
+    try std.testing.expectError(error.InvalidExecutionPlan, output_owner.bindLayerOutput(.recurrent, rows, 16 * recurrent_value_dim));
+    output_owner.storage_layout.?.recurrent_output.?.offset = recurrent.offset;
+    try std.testing.expectError(error.InvalidExecutionPlan, output_owner.bindLayerOutput(.recurrent, rows, 32 * recurrent_value_dim));
+
+    try phase.declareAttentionOutput();
+    output_owner.storage_layout = phase.storage_layout;
+    output_owner.metadata.len = phase.storage_layout.metadata_bytes;
+    const attention_output = try output_owner.bindLayerOutput(.attention, rows, 8 * 256);
+    try std.testing.expectEqual(@as(usize, rows * 8 * 256 * @sizeOf(f32)), attention_output.len);
+    try std.testing.expect(attention_output.ptr >= output_owner.metadata.ptr + attention.offset + attention.bytes);
+
+    try phase.declareFfnScratch(false);
+    output_owner.hidden = descriptor.hidden;
+    output_owner.storage_layout = phase.storage_layout;
+    output_owner.metadata.len = phase.storage_layout.metadata_bytes;
+    const Ffn = @import("dense_ffn_workspace.zig").Layout;
+    const ffn = try Ffn.init(rows, descriptor.hidden, descriptor.ffn_intermediate, 0);
+    try std.testing.expectEqual(output_owner.metadata.ptr + attention.offset, (try output_owner.bindFfnScratch(ffn)).ptr);
+    try std.testing.expectError(error.InvalidExecutionPlan, output_owner.bindFfnScratch(try Ffn.init(rows, descriptor.hidden, descriptor.ffn_intermediate + 128, 0)));
+
+    try std.testing.expectError(error.InvalidExecutionPlan, output_owner.bindFfnScratch(try Ffn.initCompact(rows, descriptor.hidden, descriptor.ffn_intermediate)));
+    var missing_ffn = output_owner;
+    missing_ffn.storage_layout.?.ffn_workspace = null;
+    try std.testing.expectError(error.InvalidExecutionPlan, missing_ffn.bindFfnScratch(ffn));
+
+    const first_output = try output_owner.bindFfnOutput(ffn, &.{});
+    const second_output = try output_owner.bindFfnOutput(ffn, &.{first_output});
+    try std.testing.expectEqual(first_output.ptr + first_output.len, second_output.ptr);
+    try std.testing.expect(first_output.ptr >= output_owner.metadata.ptr + attention.offset + attention.bytes);
+    try std.testing.expectError(error.InvalidExecutionPlan, output_owner.bindFfnOutput(ffn, &.{first_output}));
+    try std.testing.expectEqual(first_output.ptr, (try output_owner.bindFfnOutput(ffn, &.{second_output})).ptr);
+
+    try phase.declareProjectionStaging();
+    output_owner.storage_layout = phase.storage_layout;
+    output_owner.metadata.len = phase.storage_layout.metadata_bytes;
+    const staging_bytes = rows * descriptor.ffn_intermediate * @sizeOf(u16);
+    const staging = (try output_owner.bindProjectionStaging(staging_bytes)).?;
+    try std.testing.expect(staging.ptr >= second_output.ptr + second_output.len);
+    try std.testing.expectError(error.InvalidExecutionPlan, output_owner.bindProjectionStaging(staging_bytes + 1));
+
+    const policy: GraphPhase.WorkspacePolicy = .{
+        .attention_chunk128 = false,
+        .recurrent_scratch = true,
+        .compact_ffn = false,
+        .projection_staging = true,
+    };
+    const composed = phase.storage_layout;
+    try phase.prepareWorkspace(policy);
+    try std.testing.expectEqualDeep(composed, phase.storage_layout);
+    try phase.prepareWorkspace(policy);
+    try std.testing.expectEqualDeep(composed, phase.storage_layout);
+    try phase.prepareWorkspace(.{ .recurrent_scratch = false, .compact_ffn = null, .projection_staging = false });
+    try std.testing.expect(phase.storage_layout.recurrent_workspace == null and phase.storage_layout.ffn_outputs == null and phase.storage_layout.projection_staging == null);
+
+    var shared = descriptor;
+    shared.head_storage = .{ .shared_layer_packets = 16 };
+    try phase.initInto(shared);
+    try phase.prepareWorkspace(policy);
+    const shared_layout = phase.storage_layout;
+    const shared_head = shared_layout.shared_head_workspace.?;
+    try std.testing.expectEqualDeep(composed.ffn_outputs, shared_layout.ffn_outputs);
+    const shared_staging = shared_layout.projection_staging.?;
+    try std.testing.expectEqual(composed.projection_staging.?.bytes, shared_staging.bytes);
+    try std.testing.expect(shared_staging.offset >= shared_head.offset + shared_head.bytes);
+    try std.testing.expectEqual(shared_staging.offset + shared_staging.bytes, shared_layout.metadata_bytes);
+
+    var mirror_policy = policy;
+    mirror_policy.final_norm_mirror = true;
+    try phase.prepareWorkspace(mirror_policy);
+    const mirror_layout = phase.storage_layout;
+    const mirror = mirror_layout.final_norm_mirror.?;
+    try std.testing.expectEqual(rows * descriptor.hidden * @sizeOf(u16), mirror.bytes);
+    try std.testing.expect(mirror.offset >= shared_head.offset + shared_head.bytes);
+    try std.testing.expect(mirror.offset + mirror.bytes <= shared_staging.offset or mirror.offset >= shared_staging.offset + shared_staging.bytes);
+    var mirror_owner = output_owner;
+    mirror_owner.storage_layout = mirror_layout;
+    mirror_owner.metadata.len = mirror_layout.metadata_bytes;
+    try std.testing.expectEqual(mirror_owner.metadata.ptr + mirror.offset, (try mirror_owner.bindFinalNormMirror(mirror.bytes)).?.ptr);
+    try std.testing.expectError(error.InvalidExecutionPlan, mirror_owner.bindFinalNormMirror(mirror.bytes - 2));
+
+    try phase.initInto(descriptor);
+    try phase.prepareWorkspace(mirror_policy);
+    const reused = phase.storage_layout;
+    try std.testing.expectEqual(reused.attention_workspace.?.offset, reused.final_norm_mirror.?.offset);
+    try std.testing.expectEqual(composed.metadata_bytes, reused.metadata_bytes);
+
+    for ([_]bool{ false, true }) |gated| {
+        var projected = descriptor;
+        projected.attention_q_gate = gated;
+        const recurrent_widths: [4]usize = .{ 8192, 4096, 32, 32 };
+        projected.recurrent_projection_widths = recurrent_widths;
+        try phase.initInto(projected);
+        var projection_policy = mirror_policy;
+        projection_policy.layer_norm = true;
+        projection_policy.fused_recurrent_projections = true;
+        projection_policy.adjust_norm_weights = true;
+        try phase.prepareWorkspace(projection_policy);
+        const projection_layout = phase.storage_layout;
+        try std.testing.expectEqual(gated, projection_layout.supportsDeclaredWarmup(true));
+        try std.testing.expect(!projection_layout.supportsDeclaredWarmup(false));
+        const projection_owner: Module = .{
+            .storage_layout = projection_layout,
+            .hidden = projected.hidden,
+            .metadata = .{ .ptr = 0x20000, .len = projection_layout.metadata_bytes },
+        };
+        const q_bytes = attention_output.len * @as(usize, if (gated) 2 else 1);
+        const kv_bytes = rows * 2 * 256 * @sizeOf(f32);
+        const q_dst = (try projection_owner.bindAttentionProjection(.query, q_bytes)).?;
+        const k_dst = (try projection_owner.bindAttentionProjection(.key, kv_bytes)).?;
+        const v_dst = (try projection_owner.bindAttentionProjection(.value, kv_bytes)).?;
+        try std.testing.expectEqual(q_dst.ptr + q_dst.len, k_dst.ptr);
+        try std.testing.expectEqual(k_dst.ptr + k_dst.len, v_dst.ptr);
+        try std.testing.expect(v_dst.ptr + v_dst.len <= projection_owner.metadata.ptr + projection_layout.projection_staging.?.offset);
+        try std.testing.expectError(error.InvalidExecutionPlan, projection_owner.bindAttentionProjection(.query, q_bytes - @sizeOf(f32)));
+        const head_norm_bytes = 256 * @sizeOf(f32);
+        const hidden_norm = (try projection_owner.bindNormWeight(.hidden, projected.hidden * @sizeOf(f32))).?;
+        const query_norm = (try projection_owner.bindNormWeight(.query, head_norm_bytes)).?;
+        const key_norm = (try projection_owner.bindNormWeight(.key, head_norm_bytes)).?;
+        try std.testing.expectEqual(hidden_norm.ptr, query_norm.ptr);
+        try std.testing.expectEqual(query_norm.ptr + query_norm.len, key_norm.ptr);
+        try std.testing.expect(projection_owner.metadata.ptr + projection_layout.final_norm_mirror.?.offset >= hidden_norm.ptr + hidden_norm.len);
+        try std.testing.expectError(error.InvalidExecutionPlan, projection_owner.bindNormWeight(.key, head_norm_bytes - 4));
+        const joined_bytes = rows * (recurrent_widths[0] + recurrent_widths[1] + recurrent_widths[2] + recurrent_widths[3]) * @sizeOf(f32);
+        const joined = (try projection_owner.bindJoinedRecurrentProjection(joined_bytes)).?;
+        try std.testing.expectEqual(projection_owner.metadata.ptr + projection_layout.attention_workspace.?.offset, joined.ptr);
+        try std.testing.expect(joined.ptr + joined.len <= projection_owner.metadata.ptr + projection_layout.ffn_outputs.?.offset);
+        try std.testing.expect(joined.ptr + joined.len <= q_dst.ptr);
+        try std.testing.expectError(error.InvalidExecutionPlan, projection_owner.bindJoinedRecurrentProjection(joined_bytes - 4));
+        var next_ptr = q_dst.ptr;
+        for (recurrent_widths, 0..) |width, index| {
+            const bytes = rows * width * @sizeOf(f32);
+            const slot = (try projection_owner.bindRecurrentProjection(@fromBackingInt(@intCast(index)), bytes)).?;
+            try std.testing.expectEqual(next_ptr, slot.ptr);
+            try std.testing.expectEqual(bytes, slot.len);
+            next_ptr += slot.len;
+        }
+        try std.testing.expect(next_ptr <= projection_owner.metadata.ptr + projection_layout.projection_staging.?.offset);
+        try std.testing.expectError(error.InvalidExecutionPlan, projection_owner.bindRecurrentProjection(.gate, 4));
+        if (gated) {
+            const split = (try projection_owner.bindSplitQueryGate(q_bytes / 2)).?;
+            try std.testing.expectEqual(q_bytes / 2, split[0].len);
+            try std.testing.expectEqual(q_bytes / 2, split[1].len);
+            try std.testing.expect(split[1].ptr + split[1].len <= q_dst.ptr);
+        } else {
+            try std.testing.expect((try projection_owner.bindSplitQueryGate(q_bytes)) == null);
+        }
+    }
+
+    var invalid = descriptor;
+    invalid.recurrent_projection_widths = .{ 8192, 4096, 0, 32 };
+    try phase.initInto(invalid);
+    var invalid_policy = mirror_policy;
+    invalid_policy.layer_norm = true;
+    invalid_policy.fused_recurrent_projections = true;
+    try std.testing.expectError(error.InvalidShape, phase.prepareWorkspace(invalid_policy));
+    try phase.initInto(descriptor);
+    try std.testing.expectError(error.InvalidShape, phase.prepareWorkspace(invalid_policy));
+
     var fused = descriptor;
     fused.hidden = 1024;
     fused.head_storage = .fused_top1;
@@ -814,6 +1694,22 @@ test "bounded CUDA decoder shares declared attention and recurrent workspace" {
     owner.storage_layout = fused_layout;
     owner.metadata.len = fused_layout.metadata_bytes;
     try std.testing.expectEqual(owner.metadata.ptr + head.offset, (try owner.bindFusedHeadWorkspace()).ptr);
+}
+
+test "bounded CUDA decoder seals an empty declaration only after a complete warm burst" {
+    var plan: plan_mod.Plan = .{};
+    plan.allocate(256, 0x10000);
+    try std.testing.expect(!try Module.finishDeclaredWarmup(&plan, true));
+    try std.testing.expectEqual(@as(usize, 0), plan.count);
+    try std.testing.expectEqual(plan_mod.Origin.observed, plan.origin);
+    try std.testing.expect(!try Module.finishDeclaredWarmup(&plan, false));
+    try std.testing.expect(try Module.finishDeclaredWarmup(&plan, true));
+    const declared = try plan.layout(0);
+    try std.testing.expectEqual(plan_mod.Origin.declared, plan.origin);
+    try std.testing.expectEqual(@as(usize, 0), declared.bytes);
+    var scope = try plan_mod.Scope.bind(&plan, declared, 0, 0);
+    try std.testing.expect(scope.complete());
+    try std.testing.expectError(error.InvalidExecutionPlan, scope.allocate(4));
 }
 
 test "captured graph head packets fund the exact smaller bank and invalidate a full-width binding" {
@@ -1323,16 +2219,122 @@ test "CUDA bounded decoder binds zero scratch without reserving a device arena" 
     try std.testing.expect((try owner.bindArena()).complete());
 }
 
+test "bounded CUDA decoder skips recording without a remaining replay burst" {
+    try std.testing.expect(!Phase.warm.canReachReplay(5));
+    try std.testing.expect(Phase.warm.canReachReplay(6));
+    try std.testing.expect(!Phase.learn.canReachReplay(5));
+    try std.testing.expect(Phase.learn.canReachReplay(6));
+    try std.testing.expect(!Phase.capture.canReachReplay(3));
+    try std.testing.expect(Phase.capture.canReachReplay(4));
+    try std.testing.expect(Phase.replay.canReachReplay(2));
+    try std.testing.expect(!Phase.replay.canReachReplay(1));
+}
+
 test "CUDA bounded decoder validates dispatch geometry before preparing storage" {
     const positions: [384]u32 = @splat(0);
     var descriptor: Descriptor = .{ .epoch = 1, .key = &.{1}, .positions = positions[0 .. 64 * 3], .rows = 64, .hidden = 1024, .vocab = 8, .future_tokens = 16, .attention_layers = 3, .recurrent_layers = 5 };
-    try std.testing.expectEqual(Descriptor.DispatchCounts{ .attention = 6, .ragged_recurrent = 0 }, try descriptor.dispatchCounts());
+    try std.testing.expectEqual(Descriptor.DispatchCounts{ .attention = 6, .attention_gates = 6, .ragged_recurrent = 0 }, try descriptor.dispatchCounts());
+    for ([_]usize{ 65, 98 }) |rows| {
+        descriptor.rows = rows;
+        descriptor.positions = positions[0 .. rows * 3];
+        try std.testing.expectEqual(Descriptor.DispatchCounts{ .attention = 12, .attention_gates = 6, .ragged_recurrent = 20 }, try descriptor.dispatchCounts());
+    }
     descriptor.rows = 128;
     descriptor.positions = &positions;
-    try std.testing.expectEqual(Descriptor.DispatchCounts{ .attention = 12, .ragged_recurrent = 20 }, try descriptor.dispatchCounts());
+    try std.testing.expectEqual(Descriptor.DispatchCounts{ .attention = 12, .attention_gates = 6, .ragged_recurrent = 20 }, try descriptor.dispatchCounts());
     descriptor.recurrent_layers = std.math.maxInt(usize);
     var phase: GraphPhase = undefined;
     try std.testing.expectError(error.Overflow, phase.initInto(descriptor));
+}
+
+test "bounded CUDA decoder recurrent page key distinguishes packet weights and state" {
+    const rows = @import("gated_delta.zig").max_packet_rows + 2;
+    const layer_words = rows * 3 + 2 * 4;
+    var words: [2 * layer_words + 3]u64 = @splat(0);
+    words[0] = 11;
+    words[1] = 12;
+    words[2] = 13;
+    words[3 + 4] = 21;
+    words[3 + 64 * 3 + 8] = 22;
+    words[3 + layer_words + 64 * 3 + 8] = 23;
+    const pages = try RecurrentPageKey.init(&words, 3, rows, 2);
+    try std.testing.expectEqual(@as(u64, 21), pages.page(0, 0).state);
+    try std.testing.expectEqual(@as(u64, 22), pages.page(0, 64).state);
+    try std.testing.expectEqual(@as(u64, 23), pages.page(1, 64).state);
+    try std.testing.expect(!pages.referencesState(11));
+    try std.testing.expect(pages.referencesState(23));
+    try std.testing.expectError(error.InvalidShape, RecurrentPageKey.init(words[0 .. words.len - 1], 3, rows, 2));
+
+    var owner: Module = .{
+        .key = &words,
+        .rows = rows,
+        .recurrent_layers = 2,
+        .sequence_count = rows,
+        .recurrent_page_key_start = 3,
+    };
+    try std.testing.expect(owner.referencesRecurrentAddress(23));
+    try std.testing.expect(!owner.referencesRecurrentAddress(11));
+    owner.recurrent_page_key_start = null;
+    try std.testing.expect(owner.referencesRecurrentAddress(11));
+}
+
+test "bounded CUDA decoder rebind protects packet leaders and captured KV roots" {
+    // One prefix word, four weight pointers, two recurrent bindings, a
+    // representative mutable page word and one four-word global KV root.
+    var previous = [_]u64{ 100, 10, 11, 12, 13, 21, 22, 23, 31, 32, 33, 80, 90, 91, 92, 93 };
+    var next = previous;
+    next[8] = 41;
+    next[11] = 81;
+    var owner: Module = .{
+        .phase = .replay,
+        .graph = @ptrFromInt(16),
+        .epoch_id = 1,
+        .rows = 2,
+        .hidden = 1024,
+        .vocab = 128,
+        .attention_layers = 1,
+        .recurrent_layers = 1,
+        .recurrent_page_key_start = 1,
+        .recurrent_page_table_staged = true,
+        .attention_page_tables_staged = true,
+        .attention_page_size = 16,
+        .key = &previous,
+        .sequence_count = 2,
+    };
+    owner.sequences[0..2].* = .{ 3, 4 };
+    const descriptor: Descriptor = .{
+        .epoch = 1,
+        .key = &next,
+        .sequences = &.{ 3, 5 },
+        .positions = &.{ 1, 1, 1, 2, 2, 2 },
+        .rows = 2,
+        .hidden = 1024,
+        .vocab = 128,
+        .future_tokens = 32,
+        .attention_layers = 1,
+        .recurrent_layers = 1,
+        .recurrent_page_key_start = 1,
+        .attention_page_key_start = 11,
+        .attention_page_size = 16,
+        .attention_tokens = &.{ 5, 7 },
+    };
+    try std.testing.expect(owner.canSuspendBinding(.{ .sequence = 4 }));
+    try std.testing.expect(owner.canSuspendBinding(.{ .recurrent = 31 }));
+    try std.testing.expect(!owner.canSuspendBinding(.{ .sequence = 3 }));
+    try std.testing.expect(!owner.canSuspendBinding(.{ .recurrent = 21 }));
+    try std.testing.expect(!owner.admitsRebind(descriptor));
+    owner.rebind_required = true;
+    try std.testing.expect(owner.admitsRebind(descriptor));
+    next[1] += 1;
+    try std.testing.expect(!owner.admitsRebind(descriptor));
+    next[1] -= 1;
+    next[12] += 1;
+    try std.testing.expect(!owner.admitsRebind(descriptor));
+    next[12] -= 1;
+    owner.publishRebind(descriptor);
+    try std.testing.expect(!owner.rebind_required);
+    try std.testing.expect(owner.referencesSequence(5) and !owner.referencesSequence(4));
+    try std.testing.expect(owner.referencesRecurrentAddress(41) and !owner.referencesRecurrentAddress(31));
 }
 
 test "bounded decoder graph reuse requires the prepared dispatch geometry" {
@@ -1355,6 +2357,13 @@ test "bounded decoder graph reuse requires the prepared dispatch geometry" {
     owner.key = &key;
     owner.attention_layers = descriptor.attention_layers;
     owner.recurrent_layers = descriptor.recurrent_layers;
+    try std.testing.expect(owner.referencesSequence(19));
+    owner.sequences[0..2].* = .{ 7, 8 };
+    owner.sequence_count = 2;
+    try std.testing.expect(owner.referencesSequence(7));
+    try std.testing.expect(!owner.referencesSequence(19));
+    try std.testing.expect(!owner.matches(descriptor));
+    owner.sequence_count = 0;
     try std.testing.expect(owner.matches(descriptor));
     var changed = descriptor;
     changed.future_tokens += 2;

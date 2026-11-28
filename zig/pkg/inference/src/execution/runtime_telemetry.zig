@@ -248,8 +248,10 @@ pub const Snapshot = struct {
     cuda_periodic_workspace: ?PeriodicWorkspace = null,
     metal_serial_workspace: ?@import("runtime_observation.zig").SerialWorkspaceObservation = null,
     cuda_audio_workspace: ?@import("runtime_observation.zig").CudaAudioWorkspace = null,
+    cuda_vendor_convolution: ?@import("runtime_observation.zig").CudaVendorConvolution = null,
     cuda_decoder_workspace: ?@import("runtime_observation.zig").CudaDecoderWorkspace = null,
     cuda_decoder_declines: ?@import("runtime_observation.zig").CudaDecoderDeclines = null,
+    cuda_decoder_retirements: ?@import("runtime_observation.zig").CudaDecoderRetirements = null,
     memory: Memory = .{},
     /// Invocation interval on its submitting thread, including CPU fallbacks.
     submission: ?@import("runtime_observation.zig").Counters = null,
@@ -270,8 +272,10 @@ pub const Snapshot = struct {
         self.owned_native_fallbacks = scope.native_fallbacks;
         self.metal_serial_workspace = scope.metal_serial_workspace;
         self.cuda_audio_workspace = scope.cuda_audio_workspace;
+        self.cuda_vendor_convolution = scope.cuda_vendor_convolution;
         self.cuda_decoder_workspace = scope.cuda_decoder_workspace;
         self.cuda_decoder_declines = scope.cuda_decoder_declines;
+        self.cuda_decoder_retirements = scope.cuda_decoder_retirements;
     }
 
     pub fn since(self: Snapshot, before: Snapshot) Snapshot {
@@ -297,8 +301,10 @@ pub const Snapshot = struct {
             .cuda_periodic_workspace = self.cuda_periodic_workspace,
             .metal_serial_workspace = self.metal_serial_workspace,
             .cuda_audio_workspace = self.cuda_audio_workspace,
+            .cuda_vendor_convolution = self.cuda_vendor_convolution,
             .cuda_decoder_workspace = self.cuda_decoder_workspace,
             .cuda_decoder_declines = self.cuda_decoder_declines,
+            .cuda_decoder_retirements = self.cuda_decoder_retirements,
             .cuda = if (self.cuda) |after| if (before.cuda) |start| after.since(start) else after else null,
             .native_allocations = if (self.native_allocations) |after| if (before.native_allocations) |start| after.since(start) else after else null,
             .process = if (self.process) |after| if (before.process) |start| after.since(start) else after else null,

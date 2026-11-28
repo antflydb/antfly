@@ -26,7 +26,12 @@ const Quota = @import("cache_quota.zig").Quota;
 const retirement = @import("../../execution/resource_retirement.zig");
 const platform = @import("antfly_platform");
 
-pub const Input = @import("../../execution/audio_schedule.zig").ExecutionInputs.Metadata;
+const ExecutionInputs = @import("../../execution/audio_schedule.zig").ExecutionInputs;
+pub const Input = ExecutionInputs.Metadata;
+pub const max_inputs = 20;
+comptime {
+    if (ExecutionInputs.count > max_inputs) @compileError("CUDA audio staging cannot hold the execution inputs");
+}
 pub const InputSpan = @import("buffer.zig").ByteSpan;
 
 /// The graph's input prefix is independent of how scratch is scheduled.
@@ -42,6 +47,7 @@ pub const Bindings = struct {
     }
 
     pub fn resolve(hash: *std.hash.Wyhash, inputs: []const Input, spans: ?[]InputSpan) !Bindings {
+        if (inputs.len > max_inputs) return error.InvalidShape;
         if (spans) |output| if (output.len != inputs.len) return error.InvalidShape;
         hash.update(std.mem.asBytes(&inputs.len));
         var input_bytes: usize = 0;
@@ -89,6 +95,7 @@ pub const Owner = struct {
         bindings: Bindings,
 
         pub fn finish(self: *Declaration, published_slot: u15) !void {
+            errdefer self.abort();
             try self.events.finish(published_slot);
             if (!self.owner.publishLayout(self.bindings)) return error.InvalidExecutionPlan;
         }
@@ -101,8 +108,17 @@ pub const Owner = struct {
 
     /// Describe variable-size stages directly in the admitted owner.
     pub fn beginDeclaration(self: *Owner, bindings: Bindings) !Declaration {
-        if (self.executable != null or bindings.output_bytes == 0) return error.InvalidExecutionPlan;
+        if (self.executable != null or !bindings.fitsArena()) return error.InvalidExecutionPlan;
         return .{ .owner = self, .events = try self.plan.declarationBuilder(), .bindings = bindings };
+    }
+
+    pub fn declare(self: *Owner, bindings: Bindings, events: []const Plan.Declaration, published_slot: u15) !void {
+        if (self.executable != null or !bindings.fitsArena()) return error.InvalidExecutionPlan;
+        try self.plan.declare(events, published_slot);
+        if (!self.publishLayout(bindings)) {
+            self.plan = .{};
+            return error.InvalidExecutionPlan;
+        }
     }
 
     fn publishLayout(self: *Owner, bindings: Bindings) bool {
@@ -162,6 +178,7 @@ pub const Entry = struct {
     warmed: bool = false,
     disabled: bool = false,
     owner: ?*Owner = null,
+    declaration: ?struct { source_key: u64, fingerprint: u64 } = null,
 
     pub fn executableFor(self: *const Entry, bindings: Bindings) ?Owner.Executable {
         const owner = self.owner orelse return null;
@@ -178,10 +195,14 @@ pub const Entry = struct {
 pub const Cache = struct {
     entries: [8]Entry = @splat(.{}),
     clock: u64 = 0,
-    /// Inspect eligible metadata without changing eviction order.
-    pub fn warmedFor(self: *const Cache, key: u64) ?*const Entry {
+    /// Inspect metadata eligible for admission without changing eviction order.
+    pub fn availableFor(self: *const Cache, key: u64) ?*const Entry {
         for (&self.entries) |*entry| {
-            if (entry.stamp != 0 and entry.key == key and entry.warmed and !entry.disabled) return entry;
+            if (entry.stamp == 0 or entry.key != key or entry.disabled) continue;
+            if (entry.warmed) return entry;
+            if (entry.owner) |owner| {
+                if (owner.plan.origin == .declared and owner.executable != null) return entry;
+            }
         }
         return null;
     }
@@ -208,6 +229,18 @@ pub const Cache = struct {
             return err;
         };
         if (entry.key != key or entry.stamp == 0) return error.AudioPlanChanged;
+        return entry;
+    }
+
+    /// Transfer a sealed, shape-declared plan only after validating its
+    /// identity and obtaining the slot. On failure the caller keeps ownership.
+    pub fn publishDeclared(self: *Cache, bindings: Bindings, owner: *Owner, current: Cleanup) !*Entry {
+        if (owner.retiring or owner.plan.origin != .declared or owner.executableFor(bindings) == null)
+            return error.InvalidExecutionPlan;
+        try owner.validateCleanup(current);
+        const entry = try self.getWithCleanup(bindings.key, current);
+        if (entry.disabled or entry.owner != null) return error.AudioPlanChanged;
+        entry.owner = owner;
         return entry;
     }
     pub fn validateCleanup(self: *const Cache, current: Cleanup) !void {
@@ -257,26 +290,36 @@ test "CUDA declared audio workspace matches the observed capture layout" {
     var declared: Owner = .{ .allocator = std.testing.allocator };
     {
         var builder = try declared.beginDeclaration(.{ .key = 13, .input_bytes = input_bytes, .output_bytes = output_bytes + 1 });
-        defer builder.abort();
         const result = try builder.events.allocate(output_bytes);
         try std.testing.expectError(error.InvalidExecutionPlan, builder.finish(result));
     }
+    try std.testing.expectEqual(arena.Origin.observed, declared.plan.origin);
+    try std.testing.expectEqual(@as(usize, 0), declared.plan.event_count);
     {
         var builder = try declared.beginDeclaration(bindings);
         errdefer builder.abort();
-        const scratch = try builder.events.allocate(256);
-        try builder.events.release(scratch);
+        try builder.events.scratchInterval(256);
         const result = try builder.events.allocate(output_bytes);
         try builder.finish(result);
     }
     try std.testing.expectEqual(arena.Origin.declared, declared.plan.origin);
+    var cache: Cache = .{};
+    cache.entries[0] = .{ .key = bindings.key, .stamp = 1, .owner = &declared };
+    const cold = cache.availableFor(bindings.key) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(!cold.warmed);
+    try std.testing.expectEqualDeep(declared.executable.?, cold.executableFor(bindings).?);
+    cache.entries[0].disabled = true;
+    try std.testing.expect(cache.availableFor(bindings.key) == null);
 
     var observed: Owner = .{ .allocator = std.testing.allocator };
-    observed.plan.allocate(256, 0x1000);
-    observed.plan.release(0x1000);
+    var scope = arena.Scope.observe(&observed.plan);
+    scope.recordScratchAllocation(256, 0x1000);
+    scope.release(0x1000);
     observed.plan.allocate(output_bytes, 0x2000);
     try std.testing.expect(observed.seal(0x2000, bindings));
     try std.testing.expectEqualDeep(observed.executable.?, declared.executable.?);
+    try std.testing.expectEqual(@as(usize, 1), declared.plan.declared_operation_scratch_intervals);
+    try std.testing.expectEqual(declared.plan.declared_operation_scratch_intervals, observed.plan.declared_operation_scratch_intervals);
 }
 
 test "embeddinggemma2 CUDA audio lifetime plan reuses dead regions and rejects allocation drift" {
@@ -307,4 +350,17 @@ test "embeddinggemma2 CUDA audio lifetime plan reuses dead regions and rejects a
     p.allocate(256, 1);
     p.allocate(256, 2);
     try std.testing.expect(!p.finish(2));
+}
+
+test "CUDA audio bindings reject more inputs than capture staging can hold" {
+    const input: Input = .{ .shape = &.{1}, .elements = 1 };
+    const inputs: [max_inputs + 1]Input = @splat(input);
+    var spans: [max_inputs]InputSpan = undefined;
+    var hash = std.hash.Wyhash.init(0);
+    const full = try Bindings.resolve(&hash, inputs[0..max_inputs], &spans);
+    try std.testing.expectEqual(max_inputs * arena.alignment, full.input_bytes);
+    try std.testing.expectEqual(@sizeOf(f32), full.output_bytes);
+    try std.testing.expectEqual((max_inputs - 1) * arena.alignment, spans[max_inputs - 1].offset);
+    hash = std.hash.Wyhash.init(0);
+    try std.testing.expectError(error.InvalidShape, Bindings.resolve(&hash, &inputs, null));
 }

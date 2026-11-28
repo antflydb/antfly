@@ -152,7 +152,13 @@ pub const SourceRmsLayout = enum { contiguous, channel_major };
 pub const SourceConvReduction = enum { direct_fma, tensorcore, vendor_f32 };
 pub const SourceBiasAddition = enum { gemm_addend, lt_epilogue };
 pub const Bf16SourceOperation = union(enum) {
-    clamp: struct { input: CT, min: ?f32 = null, max: ?f32 = null },
+    clamp: struct {
+        input: CT,
+        min: ?f32 = null,
+        max: ?f32 = null,
+        /// The caller may consume its unique F32 input as the output.
+        reuse_owned_input: bool = false,
+    },
     sinusoidal: struct { frequencies: CT, positions: usize, components: usize, reverse: bool = false, frequency_storage: SourceScalarStorage = .full_f32 },
     softplus: struct { input: CT },
     linear: struct {
@@ -185,6 +191,8 @@ pub const Bf16SourceOperation = union(enum) {
         /// Original [batch,time,channels] time extent; channel-major reduction
         /// vectorization depends on this stride, not the flattened row count.
         reference_rows_per_batch: usize = 0,
+        /// Unequal channel-major clips partition the rows in source order.
+        segments: []const usize = &.{},
     },
     channel_layer_norm_relu: struct {
         input: CT,
@@ -2387,7 +2395,8 @@ pub const ComputeBackend = struct {
     /// Fixed mathematical operations, not an arbitrary callback interpreter.
     /// Every CT is borrowed synchronously; a selected operation returns exactly
     /// one owning F32 tensor whose values publish the declared BF16 boundary.
-    /// Linear with an assigned output instead returns that borrowed destination.
+    /// Assigned linear returns its destination. A consuming clamp may return
+    /// its input when the caller grants mutation and the backend proves ownership.
     pub fn tryBf16SourceOperation(self: *const ComputeBackend, request: *const Bf16SourceOperation) !?CT {
         const op = self.vtable.bf16SourceOperation orelse return null;
         if (self.vtable.operation_services) |services| {
@@ -2400,6 +2409,15 @@ pub const ComputeBackend = struct {
         const op = self.vtable.roundBf16F32 orelse return null;
         if (self.vtable.operation_services) |services| {
             if (!services.accepts(self.vtable)) return null;
+        }
+        return op(self.ptr, tensor);
+    }
+
+    /// Rounds an exclusively owned result in place. A decline preserves it.
+    pub fn tryRoundOwnedBf16F32(self: *const ComputeBackend, tensor: CT) !bool {
+        const op = self.vtable.roundOwnedBf16F32 orelse return false;
+        if (self.vtable.operation_services) |services| {
+            if (!services.accepts(self.vtable)) return false;
         }
         return op(self.ptr, tensor);
     }
@@ -2784,18 +2802,51 @@ pub const ComputeBackend = struct {
         projectImageFeatures: ?*const fn (ctx: *anyopaque, input: CT, weight: CT, rows: usize, vision_dim: usize, projection_dim: usize) anyerror!?CT = null,
     };
 
+    pub const LocalRelativeDestination = struct {
+        tensor: CT,
+        first_row: usize,
+        /// Independent causal windows over contiguous rows. Empty denotes one window.
+        segments: []const usize = &.{},
+    };
+
     pub const AudioAttentionRegion = struct {
         localRelative: ?*const fn (ctx: *anyopaque, q: CT, k: CT, v: CT, rel: CT, q_dim_scales: CT, valid: CT, params: Gemma4AudioLocalAttentionParams) anyerror!?CT = null,
+        localRelativeInto: ?*const fn (ctx: *anyopaque, q: CT, k: CT, v: CT, rel: CT, q_dim_scales: CT, valid: CT, params: Gemma4AudioLocalAttentionParams, destination: LocalRelativeDestination, control: ?InferenceExecutionControl) anyerror!bool = null,
         packedLocalRelative: ?*const fn (ctx: *anyopaque, q: CT, k: CT, v: CT, rel: CT, q_dim_scales: CT, valid: CT, params: Gemma4AudioLocalAttentionParams) anyerror!?CT = null,
     };
 
     /// Admission, cancellation and publication for composite audio execution.
+    pub const GroupedAudioGeometry = struct {
+        recipe: *const @import("../execution/audio_schedule.zig").AudioRecipe,
+        segments: []const usize,
+        rows: usize,
+    };
+
+    pub const AudioWorkspaceDeclaration = @import("../execution/audio_schedule.zig").WorkspaceDeclaration;
+
+    pub const AudioDispatch = struct {
+        cleanup: @import("../execution/cleanup_context.zig").Context = .{},
+        control: ?InferenceExecutionControl = null,
+        defer_arena: bool = false,
+        geometry: ?GroupedAudioGeometry = null,
+        workspace: ?AudioWorkspaceDeclaration = null,
+    };
+
+    pub const AudioWorkspaceChoice = union(enum) {
+        compile,
+        observe,
+        declared: AudioWorkspaceDeclaration,
+    };
+
     pub const AudioExecutionRegion = struct {
+        workspaceChoice: ?*const fn (ctx: *anyopaque, recipe: @import("../execution/audio_schedule.zig").AudioRecipe) anyerror!AudioWorkspaceChoice = null,
+        /// Exact pre-submission scratch bytes, or null for an unsupported schedule.
+        workspaceBytes: ?*const fn (ctx: *anyopaque, physical: @import("../execution/grouped_audio_block.zig").Physical) anyerror!?usize = null,
         setControl: ?*const fn (ctx: *anyopaque, control: ?InferenceExecutionControl) ?InferenceExecutionControl = null,
         storage: ?*const fn (ctx: *anyopaque, begin: bool) anyerror!bool = null,
         /// run submits work synchronously. Input handles are borrowed for the
         /// callback and its returned output must own an independent handle.
-        execute: ?*const fn (ctx: *anyopaque, key: u64, inputs: []const CT, context: *anyopaque, run: *const fn (*anyopaque, []const CT) anyerror!CT, cleanup: @import("../execution/cleanup_context.zig").Context, defer_arena: bool) anyerror!?CT = null,
+        execute: ?*const fn (ctx: *anyopaque, key: u64, inputs: []const CT, context: *anyopaque, run: *const fn (*anyopaque, []const CT) anyerror!CT, dispatch: AudioDispatch) anyerror!?CT = null,
     };
 
     pub const TokenSelectionRegion = struct {
@@ -2933,6 +2984,7 @@ pub const ComputeBackend = struct {
         cumulativeSum: ?*const fn (ctx: *anyopaque, tensor: CT, axis: u8, exclusive: bool, reverse: bool) anyerror!?CT = null,
         convertDType: ?*const fn (ctx: *anyopaque, tensor: CT, target: GraphDType) anyerror!?CT = null,
         roundBf16F32: ?*const fn (ctx: *anyopaque, tensor: CT) anyerror!?CT = null,
+        roundOwnedBf16F32: ?*const fn (ctx: *anyopaque, tensor: CT) anyerror!bool = null,
         sourceScalarStorage: ?*const fn (ctx: *anyopaque, program: SourceScalarProgram) SourceScalarStorage = null,
         bf16SourceOperation: ?*const fn (ctx: *anyopaque, request: *const Bf16SourceOperation) anyerror!?CT = null,
         recordLossGradient: ?*const fn (ctx: *anyopaque, request: *const record_loss_math.Request) anyerror!void = null,
@@ -5886,10 +5938,11 @@ pub const ComputeBackend = struct {
     }
 
     pub fn audioExecution(self: *const ComputeBackend, key: u64, inputs: []const CT, context: *anyopaque, run: *const fn (*anyopaque, []const CT) anyerror!CT) !?CT {
-        return self.audioExecutionWithArenaFunding(key, inputs, context, run, false);
+        return self.audioExecutionWithArenaFunding(key, inputs, context, run, false, null);
     }
 
-    pub fn audioExecutionWithArenaFunding(self: *const ComputeBackend, key: u64, inputs: []const CT, context: *anyopaque, run: *const fn (*anyopaque, []const CT) anyerror!CT, defer_arena: bool) !?CT {
+    /// The callback borrows read-only inputs and returns an independent output.
+    pub fn audioExecutionWithArenaFunding(self: *const ComputeBackend, key: u64, inputs: []const CT, context: *anyopaque, run: *const fn (*anyopaque, []const CT) anyerror!CT, defer_arena: bool, geometry: ?GroupedAudioGeometry) !?CT {
         const op = self.vtable.regions.audio_execution.execute orelse return null;
         const previous = if (self.vtable.regions.audio_execution.setControl) |set| set(self.ptr, self.execution_control) else null;
         defer if (self.vtable.regions.audio_execution.setControl) |set| {
@@ -5897,7 +5950,14 @@ pub const ComputeBackend = struct {
         };
         try self.checkExecutionControl();
         const cleanup = if (self.call_context) |invocation| invocation.cleanup else @import("../execution/cleanup_context.zig").Context{};
-        const result = try self.observeBackendEntry(.audio_execution, op, .{ self.ptr, key, inputs, context, run, cleanup, defer_arena });
+        const dispatch: AudioDispatch = .{
+            .cleanup = cleanup,
+            .control = self.execution_control,
+            .defer_arena = defer_arena,
+            .workspace = if (geometry) |group| group.recipe.workspace else null,
+            .geometry = geometry,
+        };
+        const result = try self.observeBackendEntry(.audio_execution, op, .{ self.ptr, key, inputs, context, run, dispatch });
         errdefer if (result) |ct| self.free(ct);
         try self.checkExecutionControl();
         return result;
@@ -5963,6 +6023,11 @@ pub const ComputeBackend = struct {
     pub fn gemma4AudioLocalAttention(self: *const ComputeBackend, q: CT, k: CT, v: CT, rel: CT, q_dim_scales: CT, valid: CT, params: Gemma4AudioLocalAttentionParams) !?CT {
         const op = self.vtable.regions.audio_attention.localRelative orelse return null;
         return op(self.ptr, q, k, v, rel, q_dim_scales, valid, params);
+    }
+
+    pub fn localRelativeAttentionInto(self: *const ComputeBackend, q: CT, k: CT, v: CT, rel: CT, scales: CT, valid: CT, params: Gemma4AudioLocalAttentionParams, destination: LocalRelativeDestination) !bool {
+        const op = self.vtable.regions.audio_attention.localRelativeInto orelse return false;
+        return op(self.ptr, q, k, v, rel, scales, valid, params, destination, self.execution_control);
     }
 
     pub fn addScalar(self: *const ComputeBackend, input: CT, value: f32) !?CT {
@@ -7971,9 +8036,9 @@ test "audio execution forwards caller cleanup authority" {
     const Invocation = @import("../execution/invocation_context.zig").Context;
     const Epoch = @import("../execution/retirement_sink.zig").Epoch;
     const Fixture = struct {
-        fn execute(raw: *anyopaque, _: u64, _: []const CT, context: *anyopaque, run: *const fn (*anyopaque, []const CT) anyerror!CT, cleanup: Cleanup, _: bool) anyerror!?CT {
+        fn execute(raw: *anyopaque, _: u64, _: []const CT, context: *anyopaque, run: *const fn (*anyopaque, []const CT) anyerror!CT, dispatch: ComputeBackend.AudioDispatch) anyerror!?CT {
             const observed: *Cleanup = @ptrCast(@alignCast(raw));
-            observed.* = cleanup;
+            observed.* = dispatch.cleanup;
             return try run(context, &.{});
         }
         fn body(_: *anyopaque, _: []const CT) anyerror!CT {

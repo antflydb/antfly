@@ -245,7 +245,14 @@ pub const State = struct {
     }
 
     pub fn stepResidentDispatched(self: *State, suffix: Suffix, control: ?Control, dispatch: ?tensor_dispatch.Dispatch) ![]f32 {
+        return (try self.stepResidentSelecting(suffix, control, dispatch, null)).row;
+    }
+
+    const stages = @import("encoder_decoder_runtime.zig");
+
+    pub fn stepResidentSelecting(self: *State, suffix: Suffix, control: ?Control, dispatch: ?tensor_dispatch.Dispatch, policy: ?stages.FinalTokenPolicy) !stages.VocabularyResult {
         const end = try suffix.endAt(self.position);
+        try stages.preflightVocabularyReadback(self.session);
         const fresh = self.position == 0;
         if (self.resident_slots == null) {
             const slots = try self.allocator.alloc(?ResidentSlot, try std.math.mul(usize, 2, self.roles.len));
@@ -284,8 +291,8 @@ pub const State = struct {
         if (outputs.outputs.len != self.session.outputInfo().len) return error.InvalidDecoderOutput;
         defer @memset(updated, null);
         errdefer for (updated) |slot| if (slot) |owned| owned.pin.release();
-        const row = try @import("encoder_decoder_runtime.zig").residentVocabularyRow(self.allocator, self.session, &outputs, self.logits_index, suffix.tokens.len, self.vocab_size, control, dispatch != null);
-        errdefer self.allocator.free(row);
+        const selection = try stages.residentVocabularyResult(self.allocator, self.session, &outputs, self.logits_index, suffix.tokens.len, self.vocab_size, control, dispatch != null, policy);
+        errdefer if (selection == .row) self.allocator.free(selection.row);
         for (self.roles, slots, updated) |role, old, *slot| switch (role) {
             .past => |past| {
                 const value = outputs.outputs[past.output_index];
@@ -319,7 +326,7 @@ pub const State = struct {
             },
             else => {},
         };
-        // The logits readback has finished the invocation's numerical use.
+        // The token or row readback has completed the invocation.
         try self.migrateDependentCaches(slots, updated, control);
         if (control) |active| try active.check();
         for (slots, updated) |*old, new| if (new) |value| {
@@ -327,7 +334,7 @@ pub const State = struct {
             old.* = value;
         };
         self.position = end;
-        return row;
+        return selection;
     }
 
     const CacheAdoption = enum { standalone, isolated_or_standalone, pooled_or_standalone };
@@ -754,6 +761,57 @@ fn checkImportedCacheHandoff(backend: backends.BackendType, require_independent:
     defer next.deinit();
     try std.testing.expectEqualSlices(f32, &.{ 7, 8, 9, 10 }, next.logits);
     const state = if (decoder.incremental) |*value| value else return error.InvalidMergedDecoderFixture;
+    if (backend != .native) {
+        const Selection = struct {
+            fn accepts(_: *const anyopaque, candidate: u32) bool {
+                return candidate == 3;
+            }
+        };
+        // The decoder's second state starts from the same host encoder, but
+        // selects its result on the GPU instead of transporting the row.
+        var selected_decoder = try @import("decoder_stage.zig").Decoder.init(a, session, &encoded, 1, &.{1}, 4, .{ .native_call_policy = .in_process });
+        defer selected_decoder.deinit();
+        const policy: @import("encoder_decoder_runtime.zig").FinalTokenPolicy = .{ .context = &selected_decoder, .accepts = Selection.accepts };
+        const transfer_audit = @import("transfer_audit.zig");
+        const Probe = struct {
+            audit: transfer_audit.Audit = .{},
+            started: bool = false,
+
+            fn stage(raw: *anyopaque, _: tensor_dispatch.Task, allocator: std.mem.Allocator, target: backends.Session, bindings: []const sessions.StageInput, active: ?Control) !sessions.ResidentOutputs {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                var outputs = (try target.runStageInputsBeforeExecution(bindings, allocator, active)) orelse return error.MissingResidentResult;
+                errdefer outputs.deinit();
+                try transfer_audit.begin(&self.audit);
+                self.started = true;
+                return outputs;
+            }
+
+            fn host(_: *anyopaque, _: tensor_dispatch.Task, _: std.mem.Allocator, _: backends.Session, _: ?*sessions.RunPermit, _: ?*std.atomic.Mutex, _: []const backends.Tensor, _: ?Control) ![]backends.Tensor {
+                return error.UnexpectedHostDecoder;
+            }
+        };
+        var probe: Probe = .{};
+        const dispatch: tensor_dispatch.Dispatch = .{ .ptr = &probe, .task = .generate, .run_stage_fn = Probe.stage, .run_fn = Probe.host };
+        var selected = measured: {
+            defer if (probe.started) transfer_audit.end();
+            break :measured try selected_decoder.stepSelecting(&.{2}, 0, null, dispatch, policy);
+        };
+        defer selected.deinit();
+        try std.testing.expectEqual(@as(u64, @sizeOf(u32)), probe.audit.download_bytes);
+        try std.testing.expectEqual(@as(?u32, 3), selected.token);
+        try std.testing.expectEqual(@as(usize, 0), selected.logits.len);
+        {
+            var strict: transfer_audit.Audit = .{ .forbid_device_host_access = true };
+            try transfer_audit.begin(&strict);
+            defer transfer_audit.end();
+            try std.testing.expectError(error.DeviceReadbackForbidden, selected_decoder.stepSelecting(&.{ 2, 5 }, 1, null, null, policy));
+            try std.testing.expectEqual(@as(u64, 0), strict.download_bytes);
+            try std.testing.expectEqual(@as(usize, 1), selected_decoder.incremental.?.position);
+        }
+        var selected_next = try selected_decoder.stepSuffix(.{ .position = 1, .tokens = &.{5} }, null, null);
+        defer selected_next.deinit();
+        try std.testing.expectEqualSlices(f32, next.logits, selected_next.logits);
+    }
     const expected_cache: []const f32 = &.{ 3, 4, 5, 6, 7, 8, 9, 10 };
     if (!require_independent) {
         // Use separate Native contexts, and the shared context required for

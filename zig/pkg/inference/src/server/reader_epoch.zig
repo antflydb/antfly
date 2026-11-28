@@ -153,6 +153,7 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
         vision_seal_mutex: std.Io.Mutex = .init,
         prefill_seal_mutex: std.Io.Mutex = .init,
         prefill_await_groups: usize = 0,
+        retirement_capacity_retries: std.atomic.Value(usize) = .init(0),
         prefill_await_events: bool = false,
         prefill_host_scratch_acquisitions: usize = 0,
         prefill_host_scratch_releases: usize = 0,
@@ -468,6 +469,7 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
             defer cleanup.finishAfterUnlock();
             if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) {
                 std.debug.print("LIGHTONOCR3 device_recurrent_state={d} recurrent_cache_pages={d} host_recurrent_bytes_total={d}\n", .{ @intFromBool(ctx.cfg.qwen35_device_only_state), ctx.recurrent_cache_pages, ctx.host_recurrent_bytes_total });
+                std.debug.print("LIGHTONOCR3 retirement_capacity_retries={d}\n", .{ctx.retirement_capacity_retries.load(.monotonic)});
                 std.debug.print("LIGHTONOCR3 prefill_await_groups={d} prefill_await_events={d} prefill_decode_streak={d}\n", .{ ctx.prefill_await_groups, @intFromBool(ctx.prefill_await_events), ctx.features.prefill_decode_streak });
                 std.debug.print("LIGHTONOCR3 cpu_preprocess={d} cpu_preprocess_items={d} cpu_preprocess_ns={d} vision_batch_limit={d}\n", .{ @intFromBool(ctx.features.cpu_preprocess), ctx.cpu_preprocess_items, ctx.cpu_preprocess_ns, ctx.features.vision_batch_items });
                 std.debug.print("LIGHTONOCR3 shared_pool_event_waits={d} shared_pool_poll_waits={d}\n", .{ ctx.model.native_reader_stream.event_waits.load(.monotonic), ctx.model.native_reader_stream.poll_waits.load(.monotonic) });
@@ -652,7 +654,7 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
         /// it under the same lane as its producer, before the page/epoch dies.
         pub fn retireProjected(ctx: *LightOnStreamContext, projected: *qwen3vl_projector.ProjectedImages) void {
             if (projected.device_embeddings != null) {
-                ctx.lockStepForCleanup(.projected_image_cleanup);
+                ctx.lockStepForCleanup();
                 defer ctx.unlockStep();
                 projected.deinitWithCleanup(.{ .boundary = ctx.cleanup_owner.epoch(), .operation = if (ctx.cb) |*backend| backend.operationToken() else null });
             } else projected.deinit();
@@ -723,9 +725,15 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
             return .{};
         }
 
-        pub fn lockStep(ctx: *LightOnStreamContext, control: InferenceExecutionControl) !void {
+        /// Page setup can reserve budget and bind independently prepared
+        /// storage. Numerical foreground phases acquire lockStep separately.
+        pub fn lockPageSetup(ctx: *LightOnStreamContext, control: InferenceExecutionControl) !void {
             try ctx.pageAccess(control, true).acquire();
-            ctx.invalidateCudaDecodeGraph(.foreground_step);
+        }
+
+        pub fn lockStep(ctx: *LightOnStreamContext, control: InferenceExecutionControl, reason: @import("../ops/cuda/cuda_compute.zig").CudaCompute.GraphRetirement) !void {
+            try ctx.pageAccess(control, true).acquire();
+            ctx.invalidateCudaDecodeGraph(reason);
         }
         // Private park/restore owner only: it already owns the pause reservation.
         // This method neither invalidates the graph nor waits on its OWN pause.
@@ -740,15 +748,18 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
             access.acquireForCleanup();
         }
         fn invalidateCudaDecodeGraph(ctx: *LightOnStreamContext, reason: @import("../ops/cuda/cuda_compute.zig").CudaCompute.GraphRetirement) void {
-            // Vision and other foreground phases may resize shared CUDA
-            // scratch. Retire captured addresses before that phase executes.
+            // The provider retires graphs borrowing shared scratch before
+            // foreground work can resize that scratch.
             if (comptime build_options.enable_cuda) if (ctx.cb) |*cb| if (cb.kind() == .cuda) {
                 @import("../ops/cuda/cuda_compute.zig").CudaCompute.invalidateLightOnDecodeGraphWithCleanup(cb, .{ .boundary = ctx.cleanup_owner.epoch(), .operation = cb.operationToken() }, reason) catch platform.inference_process_supervisor.restartWorker();
             };
         }
-        pub fn lockStepForCleanup(ctx: *LightOnStreamContext, reason: @import("../ops/cuda/cuda_compute.zig").CudaCompute.GraphRetirement) void {
+        pub fn lockStepForCleanup(ctx: *LightOnStreamContext) void {
+            // Projected prompt rows are consumed during prefill. Decode graphs
+            // embed their own tokens and retain their cache roots explicitly.
+            // Page retirement invalidates its recurrent and KV dependencies
+            // at the corresponding provider release.
             ctx.pageAccess(.{}, true).acquireForCleanup();
-            ctx.invalidateCudaDecodeGraph(reason);
         }
         pub fn releasePageBudget(ctx: *LightOnStreamContext, reserved: runtime.tier.memory.AdmissionAmounts) void {
             ctx.pageAccess(.{}, true).acquireForCleanup();
@@ -920,7 +931,16 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
             serial_owned = false; // transferred to the returned metadata owner
             ctx.cleanup_owner.rotateAfterUnlock() catch |err| {
                 parked.restore() catch platform.inference_process_supervisor.restartWorker();
-                return err;
+                // The live boundary and all borrowed gates were restored.
+                // Optional graph preparation can decline, and required
+                // admission can retry when retained retirement records drain.
+                return switch (err) {
+                    error.RetirementEpochCapacityExceeded => retry: {
+                        _ = ctx.retirement_capacity_retries.fetchAdd(1, .monotonic);
+                        break :retry error.ResourceTemporarilyUnavailable;
+                    },
+                    else => err,
+                };
             };
             // Recovery is temporary. Every later outside opportunity retries
             // normal cache preparation instead of preserving a disabled policy.

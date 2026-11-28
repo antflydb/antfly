@@ -21,8 +21,11 @@ from benchmark_concurrency import (
     apply_token_burst_overrides,
     graph_first_replays,
     graph_funding_denials,
+    graph_recording_terminals,
+    graph_rebound_replays,
     graph_retirements,
     recurrent_placement_observation,
+    retirement_capacity_retries,
 )
 
 
@@ -55,6 +58,22 @@ class GraphFundingTests(unittest.TestCase):
 
 
 class GraphReplayTests(unittest.TestCase):
+    def test_recording_terminal_receipts_distinguish_zero_from_absent(self):
+        self.assertEqual(graph_recording_terminals("older reader"), [])
+        text = (
+            "LIGHTONOCR3 cuda_model_graph_recorded_eos_rows=0 rows=113 "
+            "minimum_remaining_tokens=101\n"
+            "LIGHTONOCR3 cuda_model_graph_recorded_eos_rows=3 rows=29 "
+            "minimum_remaining_tokens=78\n"
+        )
+        self.assertEqual(
+            graph_recording_terminals(text),
+            [
+                dict(eos_rows=0, rows=113, minimum_remaining_tokens=101),
+                dict(eos_rows=3, rows=29, minimum_remaining_tokens=78),
+            ],
+        )
+
     def test_distinguishes_dense_fused_and_uninstrumented_scratch(self):
         prefix = "LIGHTONOCR3 cuda_model_graph_first_replay_rows="
         text = "\n".join(
@@ -64,7 +83,8 @@ class GraphReplayTests(unittest.TestCase):
                 prefix
                 + "64 capture=1 head_packet_rows=64 head_bank_bytes=0 fused_head_scratch_bytes=0",
                 prefix
-                + "64 capture=1 head_packet_rows=64 head_bank_bytes=0 fused_head_scratch_bytes=496640",
+                + "64 capture=1 head_packet_rows=64 head_bank_bytes=0 fused_head_scratch_bytes=496640"
+                + " workspace_plan_origin=declared workspace_events=0 workspace_bytes=0",
             )
         )
         rows, banks = graph_first_replays(text)
@@ -72,14 +92,41 @@ class GraphReplayTests(unittest.TestCase):
         self.assertNotIn("fused_head_scratch_bytes", banks[0])
         self.assertEqual(banks[1]["fused_head_scratch_bytes"], 0)
         self.assertEqual(banks[2]["fused_head_scratch_bytes"], 496640)
+        self.assertNotIn("workspace_plan_origin", banks[1])
+        self.assertEqual(banks[2]["workspace_plan_origin"], "declared")
+        self.assertEqual(banks[2]["workspace_events"], 0)
+        self.assertEqual(banks[2]["workspace_bytes"], 0)
+
+
+class GraphReboundReplayTests(unittest.TestCase):
+    def test_counts_only_replays_with_completed_readback(self):
+        text = (
+            "LIGHTONOCR3 cuda_model_graph_rebound_rows=113\n"
+            "LIGHTONOCR3 cuda_model_graph_first_replay_rows=113\n"
+            "LIGHTONOCR3 cuda_model_graph_rebound_replay_rows=98\n"
+            "LIGHTONOCR3 cuda_model_graph_rebound_replay_rows=30\n"
+        )
+        self.assertEqual(graph_rebound_replays(text), [98, 30])
 
 
 class GraphRetirementTests(unittest.TestCase):
+    def test_capacity_reports_preserve_zero_and_distinguish_missing_data(self):
+        self.assertEqual(retirement_capacity_retries("legacy benchmark"), [])
+        self.assertEqual(
+            retirement_capacity_retries(
+                "LIGHTONOCR3 retirement_capacity_retries=0\n"
+                "LIGHTONOCR3 retirement_capacity_retries=23\n"
+            ),
+            [0, 23],
+        )
+
     def test_records_progress_and_ignores_reset_messages(self):
         text = (
             "LIGHTONOCR3 cuda_model_graph_reset phase=disabled rows=64\n"
             "LIGHTONOCR3 cuda_model_graph_retired reason=mixed_prefill "
             "phase=replay epoch=3 rows=64 progress=12\n"
+            "LIGHTONOCR3 cuda_model_graph_retired reason=foreground_vision "
+            "phase=capture epoch=3 rows=98 progress=2\n"
         )
         self.assertEqual(
             graph_retirements(text),
@@ -90,7 +137,8 @@ class GraphRetirementTests(unittest.TestCase):
                     epoch=3,
                     rows=64,
                     progress=12,
-                )
+                ),
+                dict(reason="foreground_vision", phase="capture", epoch=3, rows=98, progress=2),
             ],
         )
 

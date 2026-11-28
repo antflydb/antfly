@@ -63,17 +63,52 @@ def graph_first_replays(text):
     replays = re.findall(
         r"LIGHTONOCR3 cuda_model_graph_first_replay_rows=(\d+)"
         r"(?: capture=\d+ head_packet_rows=(\d+) head_bank_bytes=(\d+)"
-        r"(?: fused_head_scratch_bytes=(\d+))?)?",
+        r"(?: fused_head_scratch_bytes=(\d+))?"
+        r"(?: workspace_plan_origin=(observed|declared) workspace_events=(\d+) workspace_bytes=(\d+))?)?",
         text,
     )
     banks = []
-    for rows, packet, bank, fused in replays:
+    for rows, packet, bank, fused, origin, events, workspace in replays:
         if packet:
             entry = dict(rows=int(rows), packet_rows=int(packet), bank_bytes=int(bank))
             if fused:
                 entry["fused_head_scratch_bytes"] = int(fused)
+            if origin:
+                entry.update(
+                    workspace_plan_origin=origin,
+                    workspace_events=int(events),
+                    workspace_bytes=int(workspace),
+                )
             banks.append(entry)
-    return [int(rows) for rows, _, _, _ in replays], banks
+    return [int(rows) for rows, *_ in replays], banks
+
+
+def graph_rebound_replays(text):
+    return [
+        int(rows)
+        for rows in re.findall(
+            r"LIGHTONOCR3 cuda_model_graph_rebound_replay_rows=(\d+)", text
+        )
+    ]
+
+
+def retirement_capacity_retries(text):
+    return [
+        int(count)
+        for count in re.findall(r"LIGHTONOCR3 retirement_capacity_retries=(\d+)", text)
+    ]
+
+
+def graph_recording_terminals(text):
+    return [
+        dict(eos_rows=int(eos), rows=int(rows), minimum_remaining_tokens=int(remaining))
+        for eos, rows, remaining in re.findall(
+            r"^LIGHTONOCR3 cuda_model_graph_recorded_eos_rows=(\d+) "
+            r"rows=(\d+) minimum_remaining_tokens=(\d+)$",
+            text,
+            re.MULTILINE,
+        )
+    ]
 
 
 def graph_retirements(text):
@@ -619,6 +654,7 @@ def run(args, model, label, mode, concurrency, output):
                 "ANTFLY_CUDA_ENABLE_LIGHTON_MODEL_GRAPH",
                 "ANTFLY_CUDA_LIGHTON_GRAPH_HEAD_PACKETS",
                 "ANTFLY_CUDA_LIGHTON_GRAPH_SHARE_HEAD_ARENA",
+                "ANTFLY_CUDA_LIGHTON_GRAPH_DECLARED_WARMUP",
                 "ANTFLY_CUDA_ENABLE_LIGHTON_PREFIX_SHARED_QK",
                 "ANTFLY_CUDA_ENABLE_LIGHTON_STATE_POOL",
                 "ANTFLY_CUDA_ENABLE_LIGHTON_SHARED_RECURRENT_WEIGHTS",
@@ -648,6 +684,8 @@ def run(args, model, label, mode, concurrency, output):
         "exit_code": process.returncode,
         "status": "timeout" if timed_out else "failed",
     }
+    if retries := retirement_capacity_retries(text):
+        result["retirement_capacity_retries"] = retries
     if (
         process.returncode == 0
         and match
@@ -729,8 +767,37 @@ def run(args, model, label, mode, concurrency, output):
                     sample["model_graph_replay_cohort_rows"] = sorted(set(replay_rows))
                     sample["model_graph_first_replay_events"] = len(replay_rows)
                     sample["model_graph_max_replay_rows"] = max(replay_rows, default=0)
+                    max_declared_rows = max(
+                        (
+                            bank["rows"]
+                            for bank in banks
+                            if bank.get("workspace_plan_origin") == "declared"
+                        ),
+                        default=0,
+                    )
+                    sample["model_graph_max_declared_replay_rows"] = max_declared_rows
+                    rebound_rows = graph_rebound_replays(section)
+                    sample["model_graph_rebound_replays"] = len(rebound_rows)
+                    max_rebound_rows = max(rebound_rows, default=0)
+                    sample["model_graph_max_rebound_replay_rows"] = max_rebound_rows
+                    if (
+                        args.require_rebound_model_graph_replay_rows is not None
+                        and max_rebound_rows < args.require_rebound_model_graph_replay_rows
+                    ):
+                        result["status"] = "missing_required_rebound_model_graph_replay_rows"
+
+                    if recordings := graph_recording_terminals(section):
+                        sample["model_graph_recording_terminals"] = recordings
                     if retirements := graph_retirements(section):
                         sample["model_graph_retirements"] = retirements
+                        sample["recorded_graphs_retired_before_completed_replay"] = [
+                            retirement
+                            for retirement in retirements
+                            # A record-and-launch writes two tokens. The first
+                            # replay must start with that same progress value.
+                            if retirement["phase"] == "replay"
+                            and retirement["progress"] == 2
+                        ]
                     if denials := graph_funding_denials(section):
                         sample["model_graph_funding_denials"] = denials
                     if (
@@ -746,6 +813,11 @@ def run(args, model, label, mode, concurrency, output):
                         and max(replay_rows, default=0) <= 64
                     ):
                         result["status"] = "missing_timed_wide_model_graph_replay"
+                    if (
+                        args.require_declared_model_graph_replay_rows is not None
+                        and max_declared_rows < args.require_declared_model_graph_replay_rows
+                    ):
+                        result["status"] = "missing_required_declared_model_graph_replay_rows"
                     sample["vision_batch_sizes"] = sorted(
                         {
                             int(v)
@@ -906,10 +978,13 @@ def run(args, model, label, mode, concurrency, output):
                         result["status"] = (
                             "inconsistent_prepared_prefill_chunk_progress"
                         )
+                    expected_prefill_pages = (
+                        sample["requests"] * sample["pages_per_request"]
+                    )
                     if args.require_prepared_prefill_chunks and (
                         not chunk_progress
-                        or sample["packed_prefill_pages"] != args.requests
-                        or sample["packed_prefill_starts"] != args.requests
+                        or sample["packed_prefill_pages"] != expected_prefill_pages
+                        or sample["packed_prefill_starts"] != expected_prefill_pages
                         or sample["packed_prefill_chunks"]
                         <= sample["packed_prefill_pages"]
                     ):
@@ -2124,6 +2199,20 @@ def main():
         metavar="ROWS",
         help="Require a timed graph replay at this exact cohort width",
     )
+    parser.add_argument(
+        "--require-declared-model-graph-replay-rows",
+        type=int,
+        choices=range(2, 129),
+        metavar="MIN_ROWS",
+        help="Require a timed replay using a declared workspace at or above this width",
+    )
+    parser.add_argument(
+        "--require-rebound-model-graph-replay-rows",
+        type=int,
+        choices=range(2, 129),
+        metavar="MIN_ROWS",
+        help="Require a completed replay after rebinding at or above this width",
+    )
     parser.add_argument("--require-wide-packed-prefill", action="store_true")
     parser.add_argument("--require-lighton-norm-weight-cache", action="store_true")
     parser.add_argument("--require-florence-bart-ffn", action="store_true")
@@ -2461,6 +2550,34 @@ def main():
             )
         if args.require_model_graph_replay_rows > args.batch_rows:
             parser.error("--require-model-graph-replay-rows must fit --batch-rows")
+    if args.require_declared_model_graph_replay_rows is not None:
+        if not (
+            args.backend == "cuda"
+            and args.cuda_batch
+            and args.policy_rounds
+            and "batch" in args.modes
+        ):
+            parser.error(
+                "--require-declared-model-graph-replay-rows requires timed CUDA batch --policy-rounds"
+            )
+        if args.require_declared_model_graph_replay_rows > args.batch_rows:
+            parser.error(
+                "--require-declared-model-graph-replay-rows must fit --batch-rows"
+            )
+    if args.require_rebound_model_graph_replay_rows is not None:
+        if not (
+            args.backend == "cuda"
+            and args.cuda_batch
+            and args.policy_rounds
+            and "batch" in args.modes
+        ):
+            parser.error(
+                "--require-rebound-model-graph-replay-rows requires timed CUDA batch --policy-rounds"
+            )
+        if args.require_rebound_model_graph_replay_rows > args.batch_rows:
+            parser.error(
+                "--require-rebound-model-graph-replay-rows must fit --batch-rows"
+            )
     if args.require_physical128 and not args.policy_rounds:
         parser.error("--require-physical128 requires timed --policy-rounds")
     if args.require_physical128 and not args.physical128:

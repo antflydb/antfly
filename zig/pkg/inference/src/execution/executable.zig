@@ -3264,9 +3264,17 @@ test "Metal immutable literal plans and publishes exact typed graph outputs" {
         const literal = try b.tensorConstBytes(bytes, ml.graph.Shape.init(.i64, &.{2}));
         try graph.markOutput(literal);
         const table = try b.parameter("table", ml.graph.Shape.init(.f32, &.{ 2, 3 }));
+        const bias_values = [_]f32{ 10, 20, 30 };
+        const bias = try b.tensorConstBytes(std.mem.asBytes(&bias_values), ml.graph.Shape.init(.f32, &.{3}));
+        const biased = try graph.addNode(.{
+            .op = .add,
+            .output_shape = graph.node(table).output_shape,
+            .inputs = .{ if (invalid) bias else table, if (invalid) table else bias, ml.graph.null_node, ml.graph.null_node },
+            .num_inputs = 2,
+        });
         const index_values = [_]i64{ -1, if (invalid) data[0] else 0 };
         const indices = try b.tensorConstBytes(std.mem.asBytes(&index_values), ml.graph.Shape.init(.i64, &.{2}));
-        const gathered = try b.gather(table, indices, ml.graph.Shape.init(.f32, &.{ 2, 3 }));
+        const gathered = try b.gather(biased, indices, ml.graph.Shape.init(.f32, &.{ 2, 3 }));
         try graph.markOutput(gathered);
         var program = try ModelProgram.init(a, &graph, &.{.{ .name = "table", .node_id = table, .kind = .input }});
         defer program.deinit();
@@ -3327,11 +3335,11 @@ test "Metal immutable literal plans and publishes exact typed graph outputs" {
         const retagged = (try functions.physicalTensorView.?(cb.ptr, .{ .storage = owner, .shape = &.{4} })).?;
         defer cb.free(retagged);
         try std.testing.expectError(error.ReadOnlyPhysicalStorage, functions.writePhysicalFloat32.?(cb.ptr, retagged, &.{ 0, 0, 0, 0 }));
-        try std.testing.expectEqual(@as(u64, 1), result.stats.assigned_kernel_dispatches);
+        try std.testing.expectEqual(@as(u64, 2), result.stats.assigned_kernel_dispatches);
         try std.testing.expectEqual(@as(u64, 0), result.stats.index_metadata_host_access_bytes);
         const selected = try cb.toFloat32(result.outputs[1], a);
         defer a.free(selected);
-        try std.testing.expectEqualSlices(f32, &.{ 4, 5, 6, 1, 2, 3 }, selected);
+        try std.testing.expectEqualSlices(f32, &.{ 14, 25, 36, 11, 22, 33 }, selected);
     }
 }
 

@@ -97,21 +97,18 @@ pub fn CohortMemory(comptime Hooks: type) type {
                 // Static cohorts retain two complete maximum-sized working
                 // sets. CUDA epochs use the per-item plan below, growing for
                 // admitted pages while preserving both queued working sets.
-                var two_sets = try product(&.{ working_scratch, 2, self.max_prefill_batch_items });
-                if (self.packed_mixed) {
-                    if (working_rows == 0) return error.ResourceLimitExceeded;
-                    // Dense mixed intermediates include one token from each
-                    // other physical page. Round the entire existing working
-                    // set upward, retaining its fixed-cost allowance as well.
-                    const rows = std.math.add(usize, working_rows, self.decoder_rows - 1) catch return error.ResourceLimitExceeded;
-                    two_sets = std.math.divCeil(usize, try product(&.{ two_sets, rows }), working_rows) catch return error.ResourceLimitExceeded;
-                }
+                if (self.packed_mixed and working_rows == 0) return error.ResourceLimitExceeded;
                 const batch_head = try product(&.{ self.decoder_rows, logits });
-                const per_item = std.math.divCeil(usize, two_sets, self.max_prefill_batch_items) catch return error.ResourceLimitExceeded;
-                self.decoder_workspace.per_item = @max(self.decoder_workspace.per_item, per_item);
-                self.decoder_workspace.head = @max(self.decoder_workspace.head, batch_head);
+                const plan = try @import("reader_workspace.zig").Decoder.forPrefill(
+                    working_scratch,
+                    working_rows,
+                    if (self.packed_mixed) self.decoder_rows - 1 else 0,
+                    batch_head,
+                    self.max_prefill_batch_items,
+                );
                 self.decoder_workspace.max_items = self.max_prefill_batch_items;
-                const target = std.math.add(usize, two_sets, batch_head) catch return error.ResourceLimitExceeded;
+                self.decoder_workspace = try self.decoder_workspace.merge(plan);
+                const target = try self.decoder_workspace.requiredBytes(self.max_prefill_batch_items);
                 const envelope = std.math.ceilPowerOfTwo(usize, @max(target, 1)) catch return error.ResourceLimitExceeded;
                 self.decoder_backend_peak = @max(self.decoder_backend_peak, envelope);
             }

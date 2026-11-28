@@ -20,13 +20,30 @@ const std = @import("std");
 /// departing pages never shrink it while queued work or cached buffers exist.
 pub const Decoder = struct {
     per_item: usize = 0,
+    mixed_decode: usize = 0,
     head: usize = 0,
     max_items: usize = 1,
 
-    pub fn peak(self: Decoder, active_pages: usize) !usize {
+    pub fn forPrefill(working_bytes: usize, working_rows: usize, decode_peers: usize, head_bytes: usize, max_items: usize) !Decoder {
+        const per_item = try std.math.mul(usize, 2, working_bytes);
+        // All prefills in a mixed submission share the same one-token decode
+        // peers. Charge the full per-row allowance for both working sets once.
+        const mixed_decode = if (decode_peers != 0)
+            try std.math.divCeil(usize, try std.math.mul(usize, per_item, decode_peers), working_rows)
+        else
+            0;
+        return .{ .per_item = per_item, .mixed_decode = mixed_decode, .head = head_bytes, .max_items = max_items };
+    }
+
+    pub fn requiredBytes(self: Decoder, active_pages: usize) !usize {
         if (active_pages == 0 or self.max_items == 0) return error.ResourceLimitExceeded;
         const items = @min(active_pages, self.max_items);
-        const target = try std.math.add(usize, try std.math.mul(usize, self.per_item, items), self.head);
+        const working = try std.math.add(usize, try std.math.mul(usize, self.per_item, items), self.mixed_decode);
+        return std.math.add(usize, working, self.head);
+    }
+
+    pub fn peak(self: Decoder, active_pages: usize) !usize {
+        const target = try self.requiredBytes(active_pages);
         // CUDA scratch buffers grow to the requested size; a second geometric
         // lease rounding is unnecessary. Keep a device-page alignment margin.
         return (try std.math.add(usize, target, 65535)) & ~@as(usize, 65535);
@@ -34,7 +51,7 @@ pub const Decoder = struct {
 
     pub fn merge(self: Decoder, next: Decoder) !Decoder {
         if (self.max_items != next.max_items) return error.InvalidBatchDecodeState;
-        return .{ .per_item = @max(self.per_item, next.per_item), .head = @max(self.head, next.head), .max_items = self.max_items };
+        return .{ .per_item = @max(self.per_item, next.per_item), .mixed_decode = @max(self.mixed_decode, next.mixed_decode), .head = @max(self.head, next.head), .max_items = self.max_items };
     }
 };
 
@@ -52,4 +69,12 @@ test "reader workspace grows with available cohort and preserves both queued set
     try std.testing.expect(grown.head == plan.head and grown.per_item > plan.per_item);
     try std.testing.expectEqual(@as(usize, 2 * 123), try batchPeak(123, 2, 8));
     try std.testing.expectError(error.Overflow, (Decoder{ .per_item = std.math.maxInt(usize), .max_items = 4 }).peak(4));
+
+    const short = try Decoder.forPrefill(129, 2, 3, 48, 4);
+    const long = try Decoder.forPrefill(240, 8, 3, 64, 4);
+    const mixed = try short.merge(long);
+    try std.testing.expectEqual(@as(usize, 387), mixed.mixed_decode);
+    try std.testing.expectEqual(@as(usize, 931), try mixed.requiredBytes(1));
+    try std.testing.expectEqual(@as(usize, 2371), try mixed.requiredBytes(4));
+    try std.testing.expectEqual(try mixed.requiredBytes(4), try mixed.requiredBytes(128));
 }

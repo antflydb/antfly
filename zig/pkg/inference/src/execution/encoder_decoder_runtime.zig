@@ -406,8 +406,18 @@ pub fn finalVocabularyRow(allocator: std.mem.Allocator, decoder: backends.Sessio
     return (try finalVocabularyResult(allocator, decoder, inputs, query_rows, vocab, control, dispatch, null)).row;
 }
 
+/// A GPU vocabulary result always crosses the host boundary as a token or
+/// row. Reject forbidden transfers before launching the decoder stage.
+pub fn preflightVocabularyReadback(decoder: backends.Session) !void {
+    switch (decoder.backend()) {
+        .cuda, .metal => try @import("transfer_audit.zig").checkDeviceHostAccess(),
+        else => {},
+    }
+}
+
 pub fn finalVocabularyResult(allocator: std.mem.Allocator, decoder: backends.Session, inputs: []const session_mod.StageInput, query_rows: usize, vocab: usize, control: ?Control, dispatch: ?@import("tensor_dispatch.zig").Dispatch, token_policy: ?FinalTokenPolicy) !VocabularyResult {
     if (query_rows == 0 or vocab == 0) return error.InvalidInputShape;
+    try preflightVocabularyReadback(decoder);
     var outputs = try @import("tensor_dispatch.zig").runStage(allocator, decoder, inputs, control, dispatch);
     defer outputs.deinit();
     if (outputs.outputs.len != 1) return error.InvalidDecoderOutput;
@@ -420,7 +430,7 @@ pub fn residentVocabularyRow(allocator: std.mem.Allocator, decoder: backends.Ses
     return (try residentVocabularyResult(allocator, decoder, outputs, logits_index, query_rows, vocab, control, published, null)).row;
 }
 
-fn residentVocabularyResult(allocator: std.mem.Allocator, decoder: backends.Session, outputs: *const session_mod.ResidentOutputs, logits_index: usize, query_rows: usize, vocab: usize, control: ?Control, published: bool, token_policy: ?FinalTokenPolicy) !VocabularyResult {
+pub fn residentVocabularyResult(allocator: std.mem.Allocator, decoder: backends.Session, outputs: *const session_mod.ResidentOutputs, logits_index: usize, query_rows: usize, vocab: usize, control: ?Control, published: bool, token_policy: ?FinalTokenPolicy) !VocabularyResult {
     if (query_rows == 0 or vocab == 0 or logits_index >= outputs.outputs.len) return error.InvalidDecoderOutput;
     const expected = [_]i64{
         1,
@@ -447,6 +457,9 @@ fn residentVocabularyResult(allocator: std.mem.Allocator, decoder: backends.Sess
     if (token_policy) |policy| {
         const backend = outputs.backend;
         if (knows_dtype and (backend.kind() == .cuda or backend.kind() == .metal)) {
+            // The token reduction performs a synchronous scalar download.
+            // Admit that transfer before either provider encodes the kernel.
+            try @import("transfer_audit.zig").checkDeviceHostAccess();
             const candidate = candidate: {
                 var guard = if (control) |active| try active.enterUninterruptible(decoder.interruption()) else null;
                 defer if (guard) |*scope| scope.deinit();

@@ -23,13 +23,16 @@ const platform = @import("antfly_platform");
 const metadata_allocator = platform.allocator.processAllocator(platform.allocator.concurrentFallback());
 
 const Owner = struct {
-    const capacity = 64;
+    // A model may retain one cleanup record for each registered reader
+    // page. Leave room for the resident epoch and its reserved successor.
+    const capacity = @import("reader_pool.zig").Pool.max_capacity + 2;
     allocator: std.mem.Allocator,
     identity: u64,
     references: std.atomic.Value(usize) = .init(1),
     mutex: std.atomic.Mutex = .unlocked,
     closed: bool = false,
     next_nonce: u64 = 1,
+    free_records: std.StaticBitSet(capacity) = .full,
     records: [capacity]Record = @splat(.{}),
 
     const Record = struct {
@@ -112,18 +115,17 @@ pub const Ref = struct {
         defer owner.mutex.unlock();
         if (owner.closed) return error.RetirementSinkClosed;
         if (owner.next_nonce == 0 or owner.next_nonce == std.math.maxInt(u64)) return error.RetirementEpochIdentityExhausted;
-        for (&owner.records) |*record| {
-            if (record.references != 0) continue;
-            std.debug.assert(record.head == null and record.tail == null);
-            record.nonce = owner.next_nonce;
-            owner.next_nonce += 1;
-            record.references = 1;
-            record.sealed = false;
-            record.guards = 1;
-            owner.retain();
-            return .{ .epoch = .{ .record = record, .nonce = record.nonce } };
-        }
-        return error.RetirementEpochCapacityExceeded;
+        const slot = owner.free_records.findFirstSet() orelse return error.RetirementEpochCapacityExceeded;
+        const record = &owner.records[slot];
+        std.debug.assert(record.references == 0 and record.head == null and record.tail == null);
+        owner.free_records.unset(slot);
+        record.nonce = owner.next_nonce;
+        owner.next_nonce += 1;
+        record.references = 1;
+        record.sealed = false;
+        record.guards = 1;
+        owner.retain();
+        return .{ .epoch = .{ .record = record, .nonce = record.nonce } };
     }
 };
 
@@ -174,6 +176,9 @@ pub const Epoch = struct {
             // Zero references already revoke every Epoch/boundary capability;
             // enter() publishes a strictly newer nonce when reusing this slot.
             std.debug.assert(record.nonce != 0 and record.sealed);
+            const slot = (@intFromPtr(record) - @intFromPtr(&owner.records[0])) / @sizeOf(Owner.Record);
+            std.debug.assert(!owner.free_records.isSet(slot));
+            owner.free_records.set(slot);
         }
         owner.mutex.unlock();
         self.record = null;

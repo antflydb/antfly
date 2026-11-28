@@ -34,6 +34,14 @@ pub const Layout = struct {
         return (try std.math.add(usize, bytes, alignment - 1)) & ~@as(usize, alignment - 1);
     }
     pub fn init(rows: usize, hidden: usize, intermediate: usize, vendor_bytes: usize) !Layout {
+        return initStorage(rows, hidden, intermediate, vendor_bytes, .f32);
+    }
+
+    pub fn initCompact(rows: usize, hidden: usize, intermediate: usize) !Layout {
+        return initStorage(rows, hidden, intermediate, 0, .bf16);
+    }
+
+    fn initStorage(rows: usize, hidden: usize, intermediate: usize, vendor_bytes: usize, comptime intermediate_storage: enum { f32, bf16 }) !Layout {
         if (rows == 0 or rows > 8192 or hidden == 0 or intermediate == 0 or hidden > std.math.maxInt(u32) or intermediate > std.math.maxInt(u32)) return error.InvalidShape;
         const narrow = try std.math.mul(usize, rows, hidden);
         const wide = try std.math.mul(usize, rows, intermediate);
@@ -41,9 +49,13 @@ pub const Layout = struct {
         // Normalized BF16 dies after gate AND up; activated BF16 is then
         // written on that same stream. Gate/up remain distinct through SiLU.
         const activation = try alignBytes(try std.math.mul(usize, @max(narrow, wide), 2));
-        const plane = try alignBytes(try std.math.mul(usize, wide, 4));
-        const up = try std.math.add(usize, activation, plane);
-        return .{ .rows = rows, .hidden = hidden, .intermediate = intermediate, .gate_offset = activation, .up_offset = up, .scratch_bytes = try std.math.add(usize, up, plane), .output_bytes = try alignBytes(try std.math.mul(usize, narrow, 4)), .vendor_bytes = try alignBytes(vendor_bytes), .vendor_workspace_bytes = vendor_bytes };
+        const gate_bytes = switch (intermediate_storage) {
+            .f32 => try alignBytes(try std.math.mul(usize, wide, @sizeOf(f32))),
+            .bf16 => try alignBytes(try std.math.mul(usize, @max(narrow, wide), @sizeOf(u16))),
+        };
+        const up_bytes = if (intermediate_storage == .f32) gate_bytes else try alignBytes(try std.math.mul(usize, wide, @sizeOf(u16)));
+        const up = try std.math.add(usize, activation, gate_bytes);
+        return .{ .rows = rows, .hidden = hidden, .intermediate = intermediate, .gate_offset = activation, .up_offset = up, .scratch_bytes = try std.math.add(usize, up, up_bytes), .output_bytes = try alignBytes(try std.math.mul(usize, narrow, 4)), .vendor_bytes = try alignBytes(vendor_bytes), .vendor_workspace_bytes = vendor_bytes };
     }
     pub fn requirements(self: Layout, builder: *storage.Builder) !void {
         try builder.append(.{ .backend = .cuda, .class = .workspace, .bytes = self.scratch_bytes });
@@ -66,6 +78,11 @@ test "dense FFN layout derives original lifetimes and checked physical banks" {
     try std.testing.expect(small.gate_offset >= 2 * 3584);
     try std.testing.expect(small.up_offset >= small.gate_offset + 4 * 3584);
     try std.testing.expect(small.scratch_bytes >= small.up_offset + 4 * 3584);
+    const compact = try Layout.initCompact(1, 1024, 3584);
+    try std.testing.expectEqual(@as(usize, 3 * 3584 * @sizeOf(u16)), compact.scratch_bytes);
+    try std.testing.expectEqual(compact.output_bytes, small.output_bytes);
+    const compact_narrow = try Layout.initCompact(1, 1024, 512);
+    try std.testing.expect(compact_narrow.up_offset - compact_narrow.gate_offset >= 1024 * @sizeOf(u16));
     const vendor = try Layout.init(1, 1024, 3584, 9);
     try std.testing.expectEqual(@as(usize, 256), vendor.vendor_bytes);
     try std.testing.expectEqual(@as(usize, 9), vendor.vendor_workspace_bytes);

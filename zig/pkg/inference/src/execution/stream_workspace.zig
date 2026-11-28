@@ -50,25 +50,29 @@ const Allocation = struct {
 // never need pointer-width storage or an independently padded flag.
 const max_allocations = 2048;
 const Event = packed struct(u16) {
-    slot: u15,
+    slot: u14,
     allocate: bool,
+    operation_scratch: bool = false,
 };
 
 comptime {
     if (limit > std.math.maxInt(u32)) @compileError("stream workspace geometry overflow");
 
-    if (max_allocations > no_slot or max_allocations - 1 > std.math.maxInt(u15)) @compileError("stream workspace event slot overflow");
+    if (max_allocations > no_slot or max_allocations - 1 > std.math.maxInt(u14)) @compileError("stream workspace event slot overflow");
     if (limit / alignment > std.math.maxInt(u20)) @compileError("stream workspace placement overflow");
 }
 pub const Origin = enum { observed, declared };
 
 pub const Plan = struct {
+    pub const slot_capacity = max_allocations;
+
     origin: Origin = .observed,
     allocations: [max_allocations]Allocation = undefined,
     events: [max_allocations * 2]Event = undefined,
     first_live: Slot = no_slot,
     count: usize = 0,
     event_count: usize = 0,
+    declared_operation_scratch_intervals: usize = 0,
     peak: usize = 0,
     scratch_peak: usize = 0,
     external_scratch_savings_bytes: usize = 0,
@@ -85,6 +89,10 @@ pub const Plan = struct {
         self.event_count += 1;
     }
     pub fn allocate(self: *Plan, bytes: usize, pointer: DevicePointer) void {
+        if (self.origin != .observed) {
+            if (!self.sealed) self.valid = false;
+            return;
+        }
         self.allocateLive(bytes, pointer);
     }
 
@@ -140,6 +148,10 @@ pub const Plan = struct {
 
     pub fn release(self: *Plan, pointer: DevicePointer) void {
         if (!self.valid or self.sealed or pointer == 0) return;
+        if (self.origin != .observed) {
+            self.valid = false;
+            return;
+        }
         var previous: Slot = no_slot;
         var slot = self.first_live;
         while (slot != no_slot) {
@@ -181,9 +193,29 @@ pub const Plan = struct {
         self.event(slot, false);
     }
 
+    fn allocateOperationScratch(self: *Plan, bytes: usize, address: ?DevicePointer) bool {
+        const slot = self.count;
+        self.allocateLive(bytes, address);
+        if (!self.valid or self.count == slot) return false;
+        self.events[self.event_count - 1].operation_scratch = true;
+        self.declared_operation_scratch_intervals += 1;
+        return true;
+    }
+
+    fn appendOperationScratch(self: *Plan, bytes: usize) bool {
+        const slot = self.count;
+        if (!self.allocateOperationScratch(bytes, null)) return false;
+        self.releaseSlot(@intCast(slot));
+        return self.valid;
+    }
+
     /// Allocations receive slots in declaration order. A release names the
     /// slot of an earlier allocation. Only the published slot may escape.
-    pub const Declaration = union(enum) { allocate: usize, release: u15 };
+    pub const Declaration = union(enum) {
+        allocate: usize,
+        allocate_scratch: usize,
+        release: u15,
+    };
 
     /// Incremental declaration lets operation contracts compose directly into
     /// the destination plan without storing a second, flat event recipe.
@@ -191,6 +223,7 @@ pub const Plan = struct {
         plan: *Plan,
 
         pub fn allocate(self: Builder, bytes: usize) !u15 {
+            if (self.plan.origin != .declared) return error.InvalidExecutionPlan;
             const slot = self.plan.count;
             self.plan.allocateLive(bytes, null);
             if (!self.plan.valid or self.plan.count == slot) return error.InvalidExecutionPlan;
@@ -198,25 +231,41 @@ pub const Plan = struct {
         }
 
         pub fn release(self: Builder, slot: u15) !void {
-            if (!self.plan.valid or self.plan.sealed or slot >= self.plan.count or self.plan.allocations[slot].lifetime.live_id == 0)
+            if (self.plan.origin != .declared or !self.plan.valid or self.plan.sealed or
+                slot >= self.plan.count or self.plan.allocations[slot].lifetime.live_id == 0)
                 return error.InvalidExecutionPlan;
             self.plan.releaseSlot(@intCast(slot));
             if (!self.plan.valid) return error.InvalidExecutionPlan;
         }
 
+        /// Declare scratch that stays live across other scoped allocations.
+        pub fn allocateScratch(self: Builder, bytes: usize) !u15 {
+            if (self.plan.origin != .declared) return error.InvalidExecutionPlan;
+            const slot = self.plan.count;
+            if (!self.plan.allocateOperationScratch(bytes, null)) return error.InvalidExecutionPlan;
+            return @intCast(slot);
+        }
+
+        /// An operation submits all of its scratch users before the next
+        /// declared event. Its private offsets are relative to this interval.
+        pub fn scratchInterval(self: Builder, bytes: usize) !void {
+            if (self.plan.origin != .declared or !self.plan.appendOperationScratch(bytes)) return error.InvalidExecutionPlan;
+        }
+
         pub fn finish(self: Builder, published_slot: ?u15) !void {
+            if (self.plan.origin != .declared) return error.InvalidExecutionPlan;
             const published: ?u64 = if (published_slot) |slot| p: {
                 if (slot >= self.plan.count or self.plan.allocations[slot].lifetime.live_id == 0) return error.InvalidExecutionPlan;
                 break :p self.plan.allocations[slot].lifetime.live_id;
             } else null;
             if (!self.plan.seal(published)) return error.InvalidExecutionPlan;
-            self.plan.origin = .declared;
         }
     };
 
     pub fn declarationBuilder(self: *Plan) !Builder {
-        if (!self.valid or self.sealed or self.event_count != 0 or self.count != 0)
+        if (!self.valid or self.sealed or self.origin != .observed or self.event_count != 0 or self.count != 0)
             return error.InvalidExecutionPlan;
+        self.origin = .declared;
         return .{ .plan = self };
     }
 
@@ -225,6 +274,7 @@ pub const Plan = struct {
         errdefer self.* = .{};
         for (declarations) |declaration| switch (declaration) {
             .allocate => |bytes| _ = try builder.allocate(bytes),
+            .allocate_scratch => |bytes| _ = try builder.allocateScratch(bytes),
             .release => |slot| try builder.release(slot),
         };
         try builder.finish(published_slot);
@@ -232,28 +282,44 @@ pub const Plan = struct {
 
     /// Both ordinary execution and recording consume the same interval.
     pub fn declareScratch(self: *Plan, bytes: usize) !void {
-        return self.declare(&.{ .{ .allocate = bytes }, .{ .release = 0 } }, null);
+        const builder = try self.declarationBuilder();
+        errdefer self.* = .{};
+        try builder.scratchInterval(bytes);
+        try builder.finish(null);
     }
 
     pub fn finishNoOutput(self: *Plan) bool {
-        return self.seal(null);
+        return self.origin == .observed and self.seal(null);
     }
 
     pub fn finish(self: *Plan, pointer: DevicePointer) bool {
-        return self.seal(pointer);
+        return self.origin == .observed and self.seal(pointer);
     }
 
     fn seal(self: *Plan, expected: ?u64) bool {
         if (self.sealed) return false;
-        for (self.allocations[0..self.count], 0..) |*allocation, index| {
-            if (allocation.lifetime.live_id == 0) continue;
+        var slot = self.first_live;
+        while (slot != no_slot) : (slot = self.nextLive(slot)) {
+            const allocation = &self.allocations[slot];
             if (expected != allocation.lifetime.live_id or self.output != null) self.valid = false;
             // The published layout keeps slot geometry, never a learning-run address.
             allocation.lifetime.live_id = 0;
-            self.output = index;
+            self.output = slot;
         }
         self.valid = self.valid and (expected == null) == (self.output == null);
-        if (self.valid) if (self.output) |output| self.packExternalScratch(output);
+        if (self.valid) if (self.output) |output| {
+            // Scratch is private to an operation even when its lifetime spans
+            // other events. Only a tensor allocation can become a publication.
+            if (self.declared_operation_scratch_intervals != 0) {
+                for (self.events[0..self.event_count]) |entry| {
+                    if (entry.slot == output and entry.operation_scratch) {
+                        self.valid = false;
+                        break;
+                    }
+                }
+            }
+            if (self.valid) self.packExternalScratch(output);
+        };
         self.first_live = no_slot;
         self.sealed = self.valid;
         if (self.sealed) self.recipe = self.hashEvents(0);
@@ -367,6 +433,14 @@ pub const Scope = struct {
         self.recipe.observing.allocate(bytes, pointer);
     }
 
+    /// Observe scratch that stays live across other scoped allocations.
+    pub fn recordScratchAllocation(self: *Scope, bytes: usize, pointer: DevicePointer) void {
+        std.debug.assert(!self.isBound());
+        const plan = self.recipe.observing;
+        std.debug.assert(plan.origin == .observed);
+        _ = plan.allocateOperationScratch(bytes, pointer);
+    }
+
     /// Bind the funded byte range before recording or submitting any kernels.
     pub fn bind(plan: *const Plan, layout: Layout, backing: DevicePointer, backing_bytes: usize) !Scope {
         if (!std.meta.eql(layout, try plan.layoutImpl(layout.scratch_offset, layout.external_output))) return error.InvalidExecutionPlan;
@@ -409,12 +483,20 @@ pub const Scope = struct {
         return (self.published_ptr != 0 and pointer == self.published_ptr) or
             (pointer >= self.base and pointer - self.base < peak);
     }
-    fn offset(self: *const Scope, slot: u15) DevicePointer {
+    fn offset(self: *const Scope, slot: u14) DevicePointer {
         const allocation = self.recipe.bound.allocations[slot];
         return if (self.requires_published_output) allocation.lifetime.external_offset else allocation.offset();
     }
 
     pub fn allocate(self: *Scope, bytes: usize) !DevicePointer {
+        return self.allocateRole(bytes, false);
+    }
+
+    pub fn allocateScratch(self: *Scope, bytes: usize) !DevicePointer {
+        return self.allocateRole(bytes, true);
+    }
+
+    fn allocateRole(self: *Scope, bytes: usize, operation_scratch: bool) !DevicePointer {
         // Observation scopes register real allocations through Plan.allocate.
         // Only an admitted backing may issue addresses from a sealed recipe.
         if (!self.isBound() or !self.valid or self.cursor >= self.recipe.bound.event_count or
@@ -424,7 +506,7 @@ pub const Scope = struct {
             return error.InvalidExecutionPlan;
         }
         const e = self.recipe.bound.events[self.cursor];
-        if (!e.allocate or self.recipe.bound.allocations[e.slot].bytes != bytes) {
+        if (!e.allocate or e.operation_scratch != operation_scratch or self.recipe.bound.allocations[e.slot].bytes != bytes) {
             self.valid = false;
             return error.InvalidExecutionPlan;
         }
@@ -449,6 +531,22 @@ pub const Scope = struct {
         self.cursor += 1;
     }
 };
+
+test "stream workspace rejects scratch as a published tensor" {
+    const p = try std.testing.allocator.create(Plan);
+    defer std.testing.allocator.destroy(p);
+    p.* = .{};
+    const builder = try p.declarationBuilder();
+    const scratch = try builder.allocateScratch(256);
+    try std.testing.expectError(error.InvalidExecutionPlan, builder.finish(scratch));
+    try std.testing.expectError(error.InvalidExecutionPlan, p.layout(0));
+
+    p.* = .{};
+    var scope = Scope.observe(p);
+    scope.recordScratchAllocation(256, 0x1000);
+    try std.testing.expect(!p.finish(0x1000));
+    try std.testing.expectError(error.InvalidExecutionPlan, p.layout(0));
+}
 
 test "stream workspace rejects live buffers and event drift" {
     const p = try std.testing.allocator.create(Plan);
@@ -515,7 +613,7 @@ test "sealed workspace identity excludes learning addresses and distinguishes ge
     try std.testing.expect(identity != plan.fingerprint(17));
 }
 
-test "declared scratch is identical to a sealed allocation interval" {
+test "declared scratch retains its role independently of allocation geometry" {
     var declared: Plan = .{};
     var learned: Plan = .{};
     try std.testing.expectError(error.InvalidExecutionPlan, declared.declareScratch(0));
@@ -524,8 +622,19 @@ test "declared scratch is identical to a sealed allocation interval" {
     learned.allocate(257, 1024);
     learned.release(1024);
     try std.testing.expect(learned.finishNoOutput());
-    try std.testing.expectEqual(try learned.layout(0), try declared.layout(0));
-    try std.testing.expectEqual(learned.fingerprint(17), declared.fingerprint(17));
+    const scratch = try declared.layout(0);
+    const ordinary = try learned.layout(0);
+    try std.testing.expectEqual(ordinary.bytes, scratch.bytes);
+    try std.testing.expect(learned.fingerprint(17) != declared.fingerprint(17));
+    var wrong_role = try Scope.bind(&declared, scratch, 0x1000, scratch.bytes);
+    try std.testing.expectError(error.InvalidExecutionPlan, wrong_role.allocate(257));
+    try std.testing.expectEqual(@as(usize, 0), wrong_role.cursor);
+    var wrong_scratch = try Scope.bind(&learned, ordinary, 0x1000, ordinary.bytes);
+    try std.testing.expectError(error.InvalidExecutionPlan, wrong_scratch.allocateScratch(257));
+    try std.testing.expectEqual(@as(usize, 0), wrong_scratch.cursor);
+    var bound = try Scope.bind(&declared, scratch, 0x1000, scratch.bytes);
+    bound.release(try bound.allocateScratch(257));
+    try std.testing.expect(bound.complete());
 }
 
 test "declared CUDA workspace reuses dead slots and redirects its sole published output" {
@@ -572,6 +681,80 @@ test "declared CUDA workspace reuses dead slots and redirects its sole published
     try builder.finish(publication);
     try std.testing.expectEqual(layout, try composed.layoutWithExternalOutput(alignment));
     try std.testing.expectEqual(plan.fingerprint(0), composed.fingerprint(0));
+}
+
+test "an operation can declare scratch inside an observed workspace" {
+    var plan: Plan = .{};
+    var scope = Scope.observe(&plan);
+    scope.recordAllocation(64, 0x1000);
+    scope.recordScratchAllocation(512, 0x2000);
+    scope.release(0x2000);
+    scope.release(0x1000);
+    scope.recordAllocation(128, 0x1000);
+    try std.testing.expect(plan.finish(0x1000));
+    try std.testing.expectEqual(Origin.observed, plan.origin);
+    try std.testing.expectEqual(@as(usize, 1), plan.declared_operation_scratch_intervals);
+
+    var declared: Plan = .{};
+    const builder = try declared.declarationBuilder();
+    const declared_input = try builder.allocate(64);
+    try builder.scratchInterval(512);
+    try builder.release(declared_input);
+    const publication = try builder.allocate(128);
+    try builder.finish(publication);
+    try std.testing.expectEqual(Origin.declared, declared.origin);
+    try std.testing.expectEqual(plan.declared_operation_scratch_intervals, declared.declared_operation_scratch_intervals);
+    try std.testing.expectEqual(try plan.layout(0), try declared.layout(0));
+
+    const layout = try plan.layout(0);
+    var bound = try Scope.bind(&plan, layout, 0x2000, layout.bytes);
+    const input = try bound.allocate(64);
+    const scratch = try bound.allocateScratch(512);
+    try std.testing.expectEqual(@as(DevicePointer, 0x2100), scratch);
+    bound.release(scratch);
+    bound.release(input);
+    try std.testing.expectEqual(input, try bound.allocate(128));
+    try std.testing.expect(bound.complete());
+}
+
+test "observed operation scratch cannot alias a concurrently live token" {
+    var plan: Plan = .{};
+    var observing = Scope.observe(&plan);
+    observing.recordScratchAllocation(256, 0x1000);
+    observing.recordAllocation(4, 0x2000);
+    observing.release(0x1000);
+    try std.testing.expect(plan.finish(0x2000));
+
+    var declared: Plan = .{};
+    try declared.declare(&.{
+        .{ .allocate_scratch = 256 },
+        .{ .allocate = 4 },
+        .{ .release = 0 },
+    }, 1);
+    const layout = try declared.layout(0);
+    try std.testing.expectEqual(try plan.layout(0), layout);
+    var bound = try Scope.bind(&declared, layout, 0x3000, layout.bytes);
+    const scratch = try bound.allocateScratch(256);
+    const token = try bound.allocate(4);
+    try std.testing.expect(token >= scratch + 256);
+    bound.release(scratch);
+    try std.testing.expect(bound.complete());
+}
+
+test "stream workspace keeps declared slots separate from observed addresses" {
+    var plan: Plan = .{};
+    const builder = try plan.declarationBuilder();
+    try std.testing.expectError(error.InvalidExecutionPlan, plan.declarationBuilder());
+    try std.testing.expect(!plan.finishNoOutput());
+    const slot = try builder.allocate(64);
+    plan.release(@as(u64, slot) + 1);
+    try std.testing.expectError(error.InvalidExecutionPlan, builder.finish(slot));
+
+    plan = .{};
+    try std.testing.expectError(error.InvalidExecutionPlan, builder.allocate(64));
+    const fresh = try plan.declarationBuilder();
+    plan.allocate(64, 0x1000);
+    try std.testing.expectError(error.InvalidExecutionPlan, fresh.finish(null));
 }
 
 test "CUDA arena preserves device addresses wider than a 32-bit host pointer" {
