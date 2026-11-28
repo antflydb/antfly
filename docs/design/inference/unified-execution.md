@@ -2980,6 +2980,17 @@ passed 35 of 36 checks, with no skips. The separate assigned-projection
 fixture restored the generic test profile before invoking the recurrent
 projection helper and failed its eligibility check.
 
+Spark passed all 37 focused checks at `8d4b13c954` with zero skips,
+including the repaired assigned-recurrent fixture. With the declared
+warmup enabled, the same released HTTP case matched both serial page
+outputs. It completed one warm burst, one recorded burst and seven
+replays, with no separate learning burst. The serving receipt verified
+the declared zero-byte plan and the same 2,004,992-byte layer workspace.
+The new epoch logs measured the two scheduled prefill intervals at
+41.14 and 40.95 ms and emitted both prepared vision intervals. These
+are host durations and can include waits. The paired latency gate
+remains independent of this correctness fixture.
+
 ### Metal validation of the grouped audio follow-up
 
 The M4 Max production HTTP server built from `78a42df545` served the
