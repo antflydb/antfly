@@ -4983,12 +4983,12 @@ const GroupedAudioDeclaration = struct {
         return slot;
     }
 
-    fn allocate(self: *GroupedAudioDeclaration, width: usize, scratch: usize) !Value {
+    fn allocate(self: *GroupedAudioDeclaration, width: usize, scratch_bytes: usize) !Value {
         const bytes = try std.math.mul(usize, try std.math.mul(usize, self.rows, width), @sizeOf(f32));
-        if (bytes > Scope.limit or scratch > Scope.limit) return error.UnsupportedGroupedAudioWorkspace;
+        if (bytes > Scope.limit or scratch_bytes > Scope.limit) return error.UnsupportedGroupedAudioWorkspace;
         const slot = try self.addSlot(.{ .allocate = bytes });
-        if (scratch != 0) {
-            const temporary = try self.addSlot(.{ .allocate_scratch = scratch });
+        if (scratch_bytes != 0) {
+            const temporary = try self.addSlot(.{ .allocate_scratch = scratch_bytes });
             self.events.appendAssumeCapacity(.{ .release = temporary });
         }
         return .{ .slot = slot, .width = width };

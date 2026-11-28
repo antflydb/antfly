@@ -8015,10 +8015,7 @@ pub const CudaCompute = struct {
             if (workspace.events.len == 0) return;
             // Seal the exact same event program before reserving either charge.
             var preview: AudioPlan.Owner = .{ .allocator = std.heap.page_allocator };
-            preview.declare(base, workspace.events, workspace.published_slot) catch |err| switch (err) {
-                error.InvalidExecutionPlan => return,
-                else => return err,
-            };
+            preview.declare(base, workspace.events, workspace.published_slot) catch return;
             try builder.add(.{ .audio_learning = .{ .key = base.key, .declared_cold = true } });
             try builder.add(audioArenaRequest(preview.executable.?));
         } else if (existing != null) try builder.add(.{ .audio_learning = .{ .key = base.key } });
