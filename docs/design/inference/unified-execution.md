@@ -3401,6 +3401,15 @@ variant. The graph still checks the full cohort key and retires on a
 referenced page release. Attention still captures its block table by
 value.
 
+The same-binary Spark 4B ABBA comparison at `8b7c115ca8` completed
+1,024 pages with exact serial output and zero retirement-capacity
+retries. Pooled throughput was 6.25 pages/s with the table off and
+6.29 pages/s with it on. The opt-in route recorded and launched a
+113-row graph with 96 recurrent packet dispatches. One row emitted
+EOS, and dependent page cleanup retired that graph before its first
+replay. Candidate replay reached 30 and 19 rows. Baseline replay
+reached 113 and 30 rows. Wide replay remains unqualified.
+
 The M4 Max focused cohort at `061f213135` passed all seven checks
 with zero skips. It exercised the shared installed Whisper Small
 checkpoint with the Metal backend required, verified assigned packed
