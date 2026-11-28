@@ -3736,22 +3736,30 @@ pub const CudaCompute = struct {
         }
         return eligible;
     }
-    pub fn lightOnGraphKvWords(cb: *const ops.ComputeBackend, storage: *kv_storage_runtime.KvStorageRuntime, sequence: kv_storage_runtime.SequenceId, future_tokens: usize, physical_tokens: usize, layer_indices: []const usize, words: []u64) !?usize {
-        const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
-        const hook = storage.device_write_hook orelse return error.InvalidPagedKvState;
-        if (hook.vtable != &CudaKvDeviceStorage.hook_vtable or storage.storage.config.dtype != .f16)
-            return error.InvalidPagedKvState;
-        if (storage.storage.config.sliding_window_size) |window|
-            if (future_tokens > window) return error.InvalidPagedKvState;
+    fn lightOnGraphKvBacking(cb: *const ops.ComputeBackend, storage: *const kv_storage_runtime.KvStorageRuntime) ?*CudaKvDeviceStorage {
+        if (!acceptsPhysicalImplementation(cb.vtable) or storage.storage.config.backend != .cuda or storage.storage.config.dtype != .f16) return null;
+        const hook = storage.device_write_hook orelse return null;
+        if (hook.vtable != &CudaKvDeviceStorage.hook_vtable) return null;
         const device: *CudaKvDeviceStorage = @ptrCast(@alignCast(hook.ctx));
-        if (device.compute != self or words.len < layer_indices.len * 3 + 1) return error.InvalidPagedKvState;
+        if (@intFromPtr(device.compute) != @intFromPtr(cb.ptr) or device.dtype != .f16) return null;
+        return device;
+    }
+
+    pub fn lightOnGraphKvBackingAvailable(cb: *const ops.ComputeBackend, storage: *const kv_storage_runtime.KvStorageRuntime) bool {
+        return lightOnGraphKvBacking(cb, storage) != null;
+    }
+
+    pub fn lightOnGraphKvWords(cb: *const ops.ComputeBackend, storage: *const kv_storage_runtime.KvStorageRuntime, sequence: kv_storage_runtime.SequenceId, future_tokens: usize, physical_tokens: usize, layer_indices: []const usize, words: []u64) !?usize {
+        const device = lightOnGraphKvBacking(cb, storage) orelse return null;
+        if (storage.storage.config.sliding_window_size) |window|
+            if (future_tokens > window) return null;
+        if (words.len == 0 or layer_indices.len > (words.len - 1) / 3) return error.InvalidPagedKvState;
         words[0] = @intFromPtr(device);
         var count: usize = 1;
         for (layer_indices) |index| {
             const key = try device.layerKey(sequence, index);
-            const layer = device.layers.getPtr(key) orelse return error.InvalidPagedKvState;
-            if (layer.compressed_format != cuda_kv_format_f16 or layer.value_format != cuda_kv_value_format_f16 or layer.k.ptr == 0 or layer.v.ptr == 0)
-                return error.InvalidPagedKvState;
+            const layer = device.layers.getPtr(key) orelse return null;
+            if (layer.compressed_format != cuda_kv_format_f16 or layer.value_format != cuda_kv_value_format_f16 or layer.k.ptr == 0 or layer.v.ptr == 0) return null;
             // Let the ordinary suffix path grow sparse page backing before
             // freezing the K/V addresses into a captured graph.
             if (layer.capacity_tokens < physical_tokens) return null;
@@ -60592,12 +60600,18 @@ test "CUDA reserved paged read rejects copied foreign hooks and invalid runtime 
     var query = CudaTensor{ .buffer = .{ .ptr = 1, .len = 128 }, .dtype = .f32, .shape = &shape, .elem_count = 32, .owns_buffer = false, .owns_shape = false };
     var expected = metadataOnlyTestCompute();
     var foreign = metadataOnlyTestCompute();
+    const backend = expected.computeBackend();
+    var graph_words: [4]u64 = undefined;
+    try std.testing.expect(!CudaCompute.lightOnGraphKvBackingAvailable(&backend, &storage));
+    try std.testing.expect(try CudaCompute.lightOnGraphKvWords(&backend, &storage, 1, 16, 16, &.{0}, &graph_words) == null);
+
     const attention = ops.AttentionContext{ .mode = .paged_decode, .total_sequence_len = 1, .query_sequence_len = 1, .kv_sequence_len = 1, .kv_storage = &storage, .kv_cache = .{ .sequence_id = 1, .pool_id = 0, .logical_block_count = 1, .tail_tokens = 1, .logical_blocks = &.{0}, .kv_storage = &storage } };
     var paged = kv_storage_runtime.DevicePagedKvLayer{ .runtime = @ptrFromInt(1), .slot = 0, .format = cuda_kv_format_f16, .token_count = 1, .key_row_bytes = 64, .base_key_row_bytes = 64, .v_row_stride = 64, .page_size_tokens = 16, .position_offset = 0 };
     var copied = CudaKvDeviceStorage.hook_vtable;
     std.mem.doNotOptimizeAway(&copied);
     try std.testing.expect(@intFromPtr(&copied) != @intFromPtr(&CudaKvDeviceStorage.hook_vtable));
     storage.device_write_hook = .{ .ctx = @ptrFromInt(1), .vtable = &copied };
+    try std.testing.expect(!CudaCompute.lightOnGraphKvBackingAvailable(&backend, &storage));
     try std.testing.expectError(error.InvalidPagedKvState, gqaPagedAttentionWithCompressedDeviceKv(&expected, @ptrCast(&query), null, attention, paged, 1, 1, 1, 32));
     storage.device_write_hook = .{ .ctx = @ptrFromInt(2), .vtable = &CudaKvDeviceStorage.hook_vtable };
     try std.testing.expectError(error.InvalidPagedKvState, gqaPagedAttentionWithCompressedDeviceKv(&expected, @ptrCast(&query), null, attention, paged, 1, 1, 1, 32));
@@ -60605,6 +60619,10 @@ test "CUDA reserved paged read rejects copied foreign hooks and invalid runtime 
     paged.runtime = &other;
     storage.device_write_hook = .{ .ctx = &other, .vtable = &CudaKvDeviceStorage.hook_vtable };
     try std.testing.expectError(error.InvalidPagedKvState, gqaPagedAttentionWithCompressedDeviceKv(&expected, @ptrCast(&query), null, attention, paged, 1, 1, 1, 32));
+    try std.testing.expect(!CudaCompute.lightOnGraphKvBackingAvailable(&backend, &storage));
+    other.compute = &expected;
+    try std.testing.expect(CudaCompute.lightOnGraphKvBackingAvailable(&backend, &storage));
+    try std.testing.expect(try CudaCompute.lightOnGraphKvWords(&backend, &storage, 1, 16, 16, &.{0}, &graph_words) == null);
     try std.testing.expect(other.layers.count() == 0); // no phantom allocation/publication
 }
 

@@ -867,7 +867,7 @@ pub const Executor = struct {
             const graph = @import("../ops/cuda/bounded_decode_graph.zig");
             const page_size = storage.storage.config.page_size_tokens;
             if (page_size == 0) return decline(decline_code, .context_or_page_capacity);
-            if (storage.storage.config.backend != .cuda or storage.storage.config.dtype != .f16) return decline(decline_code, .missing_kv_binding);
+            if (!C.lightOnGraphKvBackingAvailable(self.context.cb, storage)) return decline(decline_code, .missing_kv_binding);
             var future: [graph.max_rows]usize = undefined;
             var minimum_packet_blocks: usize = 0;
             var max_future: usize = 0;
