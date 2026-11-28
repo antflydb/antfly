@@ -612,6 +612,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "durable enrichment server retry deadline survives restart without early execution",
         "durable enrichment scoped retry",
         "scoped retry workset",
+        "document extraction generated OCR rejects malformed envelopes",
         "db scoped retry workset",
         "model aware media URL fields",
         "provider retry guidance preserves server minimum beyond bounded worker backoff",

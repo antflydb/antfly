@@ -1459,6 +1459,11 @@ fn loadScopedRetriesTxn(alloc: Allocator, txn: anytype) !scoped_retries.State {
         header.state.sleeping = try backlog.Backlog.decode(alloc, try txn.get(backlog.index_key));
         if (header.state.sleeping.entries.items.len == 0)
             return error.InvalidEnrichmentState;
+        const prune = txn.get(backlog.prune_key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        if (prune) |checkpoint| try header.state.sleeping.decodePrune(checkpoint);
     }
     for (header.slots[0..header.count]) |slot| {
         const bytes = try txn.get(&scopedRetryTicketKey(slot));
@@ -1917,10 +1922,39 @@ test "scoped retry workset spills and promotes debt atomically with its frontier
     try saveScopedRetryState(a, &store, &state, Guard{});
     var restored = try loadScopedRetries(a, &store);
     defer restored.deinit(a);
+    {
+        var read = try store.beginProbe();
+        defer read.abort();
+        const raw_cursor = try read.get(scoped_retry_key);
+        try std.testing.expect(std.mem.startsWith(u8, raw_cursor, scoped_retries.backlog.magic));
+        try std.testing.expect(!scoped_retries.State.isHeader(raw_cursor));
+    }
     try std.testing.expectEqual(@as(u64, 19), restored.scanned_sequence);
     try std.testing.expectEqual(@as(u64, 9), restored.appliedThrough(19));
     try std.testing.expectEqual(@as(u64, 12_000), restored.deadline());
     try std.testing.expectEqual(@as(usize, 0), restored.tickets.items.len);
+
+    // Cursor-only maintenance does not rewrite the full sleeping index.
+    var old_index: []u8 = undefined;
+    {
+        var read = try store.beginProbe();
+        defer read.abort();
+        old_index = try a.dupe(u8, try read.get(scoped_retries.backlog.index_key));
+    }
+    defer a.free(old_index);
+    restored.sleeping.prune_target = 19;
+    restored.sleeping.prune_after = restored.sleeping.entries.items[0].id;
+    restored.sleeping.prune_dirty = true;
+    try saveScopedRetryState(a, &store, &restored, Guard{});
+    {
+        var read = try store.beginProbe();
+        defer read.abort();
+        try std.testing.expectEqualSlices(u8, old_index, try read.get(scoped_retries.backlog.index_key));
+    }
+    restored.deinit(a);
+    restored = try loadScopedRetries(a, &store);
+    try std.testing.expectEqual(@as(u64, 19), restored.sleeping.prune_target);
+    try std.testing.expectEqual(restored.sleeping.entries.items[0].id, restored.sleeping.prune_after);
 
     const entry = restored.sleeping.entries.items[0];
     const raw = try loadScopedRetryBacklogRow(a, &store, entry);
@@ -1932,6 +1966,15 @@ test "scoped retry workset spills and promotes debt atomically with its frontier
     try std.testing.expectEqual(@as(u32, 2), restored.prior(9).failures);
     try saveScopedRetryState(a, &store, &restored, Guard{});
     try std.testing.expectError(error.InvalidEnrichmentState, loadScopedRetryBacklogRow(a, &store, entry));
+    {
+        var read = try store.beginProbe();
+        defer read.abort();
+        const raw_cursor = try read.get(scoped_retry_key);
+        var compatible = try scoped_retries.State.decodeHeader(a, raw_cursor);
+        defer compatible.state.deinit(a);
+        try std.testing.expectEqual(@as(u64, 19), compatible.state.scanned_sequence);
+        try std.testing.expectError(error.NotFound, read.get(scoped_retries.backlog.prune_key));
+    }
     var active = try loadScopedRetries(a, &store);
     defer active.deinit(a);
     try std.testing.expectEqual(@as(u64, 9), active.appliedThrough(19));

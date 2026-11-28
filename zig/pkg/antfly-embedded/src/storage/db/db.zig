@@ -15070,7 +15070,8 @@ pub const DB = struct {
         self.core.unlockApplyShared();
         apply_locked = false;
         if (result.reprocess) |*reprocess| {
-            if (reprocess.status == .pending) reprocess.worker = self.documentArtifactReprocessWorker();
+            if (reprocess.status == .pending or reprocess.last_retry != null)
+                reprocess.worker = self.documentArtifactReprocessWorker();
         }
         try row_policy_lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
         return result;
@@ -15113,7 +15114,7 @@ pub const DB = struct {
             .requested_generation = target,
             .accepted_sequence = accepted_sequence,
             .status = status,
-            .last_retry = if (status == .pending and accepted_sequence != null) intent.observeRetry(receipt.?) else null,
+            .last_retry = if (accepted_sequence != null) intent.observeRetry(receipt.?) else null,
         };
     }
 
@@ -101284,6 +101285,25 @@ test "db document extraction manifest inspection and reprocess API" {
     var after = (try db.getDocumentArtifactManifest(alloc, "doc:a", "document_units_v1")) orelse return error.TestUnexpectedResult;
     defer after.deinit(alloc);
     try std.testing.expectEqual(@as(u64, 2), after.generation);
+    // A published manifest can coexist with retry diagnostics for the same
+    // accepted attempt. Polling the artifact must still expose that history.
+    const intent = @import("artifact_reprocess_intent.zig");
+    const receipt_key = try intent.receiptKeyAlloc(alloc, "doc:a", "document_units_v1");
+    defer alloc.free(receipt_key);
+    const old_receipt = try db.core.store.get(alloc, receipt_key);
+    defer alloc.free(old_receipt);
+    const observation: intent.RetryObservation = .{
+        .retry_at_ms = 20_000,
+        .reason = .provider_retry_after,
+        .stage = .ocr,
+        .error_code = intent.RetryErrorCode.init("ReadRateLimited"),
+    };
+    const retry_receipt = intent.withRetry(old_receipt, after.reprocess.?.accepted_sequence.?, observation).?;
+    try db.core.store.put(receipt_key, &retry_receipt);
+    var with_retry_history = (try db.getDocumentArtifactManifest(alloc, "doc:a", "document_units_v1")).?;
+    defer with_retry_history.deinit(alloc);
+    try std.testing.expectEqual(.published, with_retry_history.reprocess.?.status);
+    try std.testing.expectEqual(observation, with_retry_history.reprocess.?.last_retry.?);
     try std.testing.expectEqualStrings("remote", after.child_ranges[0].placement);
     try std.testing.expectEqual(@as(?u64, 7001), after.child_ranges[0].owner_group_id);
     try std.testing.expectEqual(@as(?u64, 2), after.child_ranges[0].placement_generation);

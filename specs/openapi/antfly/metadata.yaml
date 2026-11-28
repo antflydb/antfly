@@ -3875,7 +3875,7 @@ components:
           $ref: "#/components/schemas/DocumentArtifactReprocessRetry"
     DocumentArtifactReprocessRetry:
       type: object
-      description: Most recent durable deferral for this accepted extraction attempt. The deadline can be in the past if replay has since resumed.
+      description: Most recent durable deferral for this accepted extraction attempt, retained independently of publication status. This is a historical observation and does not imply the attempt is still waiting.
       required: [reason, retry_at_ms]
       properties:
         reason:
@@ -3885,6 +3885,32 @@ components:
           type: integer
           format: uint64
           description: Unix timestamp in milliseconds before which this attempt is deferred.
+        stage:
+          type: string
+          enum: [source_fetch, pdf_prepare, pdf_inspect, pdf_render, ocr, publication, enrichment]
+          description: Enrichment stage identified by the retry outcome, when available. Enrichment is used when the failure does not identify a narrower stage.
+        error_code:
+          type: string
+          maxLength: 96
+          description: Stable error identifier associated with the deferral, when available.
+    DocumentArtifactRetryBacklog:
+      type: object
+      description: Shard-wide retry debt sampled from the replay worker.
+      required: [active_tickets, sleeping_tickets]
+      properties:
+        active_tickets:
+          type: integer
+          format: uint32
+        sleeping_tickets:
+          type: integer
+          format: uint32
+        oldest_unresolved_sequence:
+          type: integer
+          format: uint64
+        admission_blocked_by:
+          type: string
+          enum: [document_workset, backlog_ticket_limit, backlog_byte_limit]
+          description: Admission constraint preventing replay from admitting fresh work, when blocked.
     DocumentArtifactReprocessWorker:
       type: object
       description: Sample of the owning shard's enrichment worker, when present. The worker services multiple documents and producers. Sequence values use the shard's enrichment replay sequence space.
@@ -3905,6 +3931,8 @@ components:
         retry_queue_full:
           type: boolean
           description: Whether retry debt is preventing the worker from admitting new source groups.
+        backlog:
+          $ref: "#/components/schemas/DocumentArtifactRetryBacklog"
         retrying:
           type: boolean
           description: Whether the worker has retry work.
@@ -3915,6 +3943,13 @@ components:
         failed:
           type: boolean
           description: Whether the shard's worker has failed.
+        last_error_code:
+          type: string
+          description: Latest known worker error such as a publication wait. This is shard-wide.
+        last_progress_at_ms:
+          type: integer
+          format: uint64
+          description: Unix timestamp of the last observed worker activity, when available. This is shard-wide.
         background_running:
           type: boolean
           description: Whether a background worker has started. Embedded callers can also drive replay inline.

@@ -508,14 +508,21 @@ pub const State = struct {
         return (max_documents - 1) -| self.tickets.items.len;
     }
 
-    pub fn discoverySaturated(self: State) bool {
-        if (self.discoverySlots() != 0) return false;
-        if (self.sleeping.entries.items.len >= backlog.max_entries) return true;
+    pub fn backlogAdmissionBlock(self: State) ?@import("../types.zig").DocumentArtifactReprocessStatus.AdmissionBlock {
+        if (self.discoverySlots() != 0) return null;
+        if (self.sleeping.entries.items.len >= backlog.max_entries) return .backlog_ticket_limit;
         for (self.tickets.items) |ticket| {
             const allowance = backlogAllowance(ticket) catch continue;
-            if (self.sleeping.canAdd(allowance)) return false;
+            if (self.sleeping.canAdd(allowance)) return null;
         }
-        return true;
+        return .backlog_byte_limit;
+    }
+
+    pub fn oldestUnresolvedSequence(self: State) ?u64 {
+        var oldest: u64 = std.math.maxInt(u64);
+        for (self.tickets.items) |ticket| oldest = @min(oldest, ticket.sequence);
+        for (self.sleeping.entries.items) |entry| oldest = @min(oldest, entry.id.sequence);
+        return if (self.hasDebt()) oldest else null;
     }
 
     fn encodeTicket(ticket: Ticket, a: A) ![]u8 {
@@ -847,10 +854,7 @@ pub const State = struct {
         return if (self.hasDebt()) result else 0;
     }
     pub fn appliedThrough(self: State, scanned: u64) u64 {
-        var result = scanned;
-        for (self.tickets.items) |ticket| result = @min(result, ticket.sequence -| 1);
-        for (self.sleeping.entries.items) |entry| result = @min(result, entry.id.sequence -| 1);
-        return result;
+        return if (self.oldestUnresolvedSequence()) |oldest| @min(scanned, oldest -| 1) else scanned;
     }
     pub fn due(self: State, a: A, now_ms: u64) !Due {
         return self.selectDue(a, now_ms, false, null, 0);

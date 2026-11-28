@@ -1099,14 +1099,26 @@ pub const DocumentArtifactReprocessAcceptance = struct {
 };
 
 pub const DocumentArtifactReprocessStatus = struct {
+    pub const AdmissionBlock = enum { document_workset, backlog_ticket_limit, backlog_byte_limit };
+
+    pub const Backlog = struct {
+        active_tickets: u32 = 0,
+        sleeping_tickets: u32 = 0,
+        oldest_unresolved_sequence: ?u64 = null,
+        admission_blocked_by: ?AdmissionBlock = null,
+    };
+
     pub const Worker = struct {
         scanned_sequence: u64,
         applied_sequence: u64,
         target_sequence: u64,
         retry_queue_full: bool,
+        backlog: ?Backlog = null,
         retrying: bool,
         next_retry_at_ms: ?u64 = null,
         failed: bool,
+        last_error_code: ?RuntimeErrorName = null,
+        last_progress_at_ms: ?u64 = null,
         background_running: bool,
     };
 

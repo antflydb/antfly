@@ -25,6 +25,9 @@ pub const magic = "ESQ6";
 const index_magic = "ESI1";
 const key_prefix = "\x00\x00__metadata__:enrichment_scoped_retry_backlog:v1:";
 pub const index_key = key_prefix ++ "index";
+pub const prune_key = key_prefix ++ "prune";
+const prune_magic = "ESP1";
+const prune_bytes = 8 + 8 + 32 + 8;
 
 pub const Identity = struct {
     document: [32]u8,
@@ -63,6 +66,7 @@ pub const Backlog = struct {
     entries: std.ArrayListUnmanaged(Entry) = .empty,
     charged_bytes: usize = 0,
     dirty: bool = false,
+    prune_dirty: bool = false,
     /// Deletion need not appear in the replay journal. Visit a bounded page
     /// after primary activity, retaining the reclamation frontier on disk.
     prune_through: u64 = 0,
@@ -85,6 +89,7 @@ pub const Backlog = struct {
         self.puts.clearRetainingCapacity();
         self.deletes.clearRetainingCapacity();
         self.dirty = false;
+        self.prune_dirty = false;
     }
 
     pub fn canAdd(self: Backlog, bytes: usize) bool {
@@ -130,9 +135,7 @@ pub const Backlog = struct {
         var reader = binary.Reader{ .bytes = raw, .offset = 4 };
         var self = Backlog{};
         errdefer self.deinit(a);
-        self.prune_through = try reader.int(u64);
-        self.prune_target = try reader.int(u64);
-        self.prune_after = .{ .document = (try reader.take(32))[0..32].*, .sequence = try reader.int(u64) };
+        try self.readPrune(&reader);
         const n = try reader.int(u16);
         if (n > max_entries or raw.len != header_bytes + @as(usize, n) * entry_bytes)
             return error.InvalidEnrichmentState;
@@ -160,7 +163,34 @@ pub const Backlog = struct {
         return self;
     }
 
+    pub fn decodePrune(self: *Backlog, raw: []const u8) !void {
+        if (raw.len != prune_magic.len + prune_bytes or !std.mem.startsWith(u8, raw, prune_magic)) return error.InvalidEnrichmentState;
+        var reader: binary.Reader = .{ .bytes = raw, .offset = prune_magic.len };
+        try self.readPrune(&reader);
+    }
+
+    fn readPrune(self: *Backlog, reader: *binary.Reader) !void {
+        self.prune_through = try reader.int(u64);
+        self.prune_target = try reader.int(u64);
+        self.prune_after = .{ .document = (try reader.take(32))[0..32].*, .sequence = try reader.int(u64) };
+        if (self.prune_through > self.prune_target) return error.InvalidEnrichmentState;
+    }
+
+    fn encodePrune(self: Backlog, writer: *binary.Writer) void {
+        writer.int(u64, self.prune_through);
+        writer.int(u64, self.prune_target);
+        writer.put(&self.prune_after.document);
+        writer.int(u64, self.prune_after.sequence);
+    }
+
     pub fn write(self: Backlog, a: Allocator, txn: anytype) !void {
+        if (self.prune_dirty and self.entries.items.len != 0) {
+            var raw: [prune_magic.len + prune_bytes]u8 = undefined;
+            var writer: binary.Writer = .{ .bytes = &raw };
+            writer.put(prune_magic);
+            self.encodePrune(&writer);
+            try txn.put(prune_key, &raw);
+        }
         if (!self.dirty) return;
         for (self.deletes.items) |id| txn.delete(&id.key()) catch |err| if (err != error.NotFound) {
             return err;
@@ -168,16 +198,14 @@ pub const Backlog = struct {
         for (self.puts.items) |put| try txn.put(&put.id.key(), put.bytes);
         if (self.entries.items.len == 0) {
             txn.delete(index_key) catch |err| if (err != error.NotFound) return err;
+            txn.delete(prune_key) catch |err| if (err != error.NotFound) return err;
             return;
         }
         const raw = try a.alloc(u8, header_bytes + self.entries.items.len * entry_bytes);
         defer a.free(raw);
         var writer = binary.Writer{ .bytes = raw };
         writer.put(index_magic);
-        writer.int(u64, self.prune_through);
-        writer.int(u64, self.prune_target);
-        writer.put(&self.prune_after.document);
-        writer.int(u64, self.prune_after.sequence);
+        self.encodePrune(&writer);
         writer.int(u16, @intCast(self.entries.items.len));
         for (self.entries.items) |entry| {
             writer.put(&entry.id.document);

@@ -104,6 +104,7 @@ pub const DocumentArtifactReprocessRetry = types.DocumentArtifactReprocessRetry;
 pub const DocumentArtifactReprocessShardCursor = types.DocumentArtifactReprocessShardCursor;
 pub const DocumentArtifactReprocessStatus = types.DocumentArtifactReprocessStatus;
 pub const DocumentArtifactReprocessWorker = types.DocumentArtifactReprocessWorker;
+pub const DocumentArtifactRetryBacklog = types.DocumentArtifactRetryBacklog;
 pub const DocumentArtifactTableReprocessRequest = types.DocumentArtifactTableReprocessRequest;
 pub const DocumentArtifactTableReprocessResponse = types.DocumentArtifactTableReprocessResponse;
 pub const Edge = types.Edge;

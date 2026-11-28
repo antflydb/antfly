@@ -13415,11 +13415,48 @@ pub const DocumentArtifactReprocessResponse = struct {
     }
 };
 
-/// Most recent durable deferral for this accepted extraction attempt. The deadline can be in the past if replay has since resumed.
+/// Most recent durable deferral for this accepted extraction attempt, retained independently of publication status. This is a historical observation and does not imply the attempt is still waiting.
 pub const DocumentArtifactReprocessRetry = struct {
     reason: []const u8,
     /// Unix timestamp in milliseconds before which this attempt is deferred.
     retry_at_ms: u64,
+    /// Enrichment stage identified by the retry outcome, when available. Enrichment is used when the failure does not identify a narrower stage.
+    stage: ?[]const u8 = null,
+    /// Stable error identifier associated with the deferral, when available.
+    error_code: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "reason", "reason", false },
+        .{ "retry_at_ms", "retry_at_ms", false },
+        .{ "stage", "stage", true },
+        .{ "error_code", "error_code", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("reason");
+        try jw.write(self.reason);
+        try jw.objectField("retry_at_ms");
+        try jw.write(self.retry_at_ms);
+        if (self.stage) |value| {
+            try jw.objectField("stage");
+            try jw.write(value);
+        }
+        if (self.error_code) |value| {
+            try jw.objectField("error_code");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const DocumentArtifactReprocessShardCursor = struct {
@@ -13527,12 +13564,17 @@ pub const DocumentArtifactReprocessWorker = struct {
     target_sequence: u64,
     /// Whether retry debt is preventing the worker from admitting new source groups.
     retry_queue_full: bool,
+    backlog: ?DocumentArtifactRetryBacklog = null,
     /// Whether the worker has retry work.
     retrying: bool,
     /// Unix timestamp in milliseconds for the worker's next scheduled retry, when available. This is shard-wide.
     next_retry_at_ms: ?u64 = null,
     /// Whether the shard's worker has failed.
     failed: bool,
+    /// Latest known worker error such as a publication wait. This is shard-wide.
+    last_error_code: ?[]const u8 = null,
+    /// Unix timestamp of the last observed worker activity, when available. This is shard-wide.
+    last_progress_at_ms: ?u64 = null,
     /// Whether a background worker has started. Embedded callers can also drive replay inline.
     background_running: bool,
 
@@ -13542,9 +13584,12 @@ pub const DocumentArtifactReprocessWorker = struct {
         .{ "applied_sequence", "applied_sequence", false },
         .{ "target_sequence", "target_sequence", false },
         .{ "retry_queue_full", "retry_queue_full", false },
+        .{ "backlog", "backlog", true },
         .{ "retrying", "retrying", false },
         .{ "next_retry_at_ms", "next_retry_at_ms", true },
         .{ "failed", "failed", false },
+        .{ "last_error_code", "last_error_code", true },
+        .{ "last_progress_at_ms", "last_progress_at_ms", true },
         .{ "background_running", "background_running", false },
     };
 
@@ -13566,6 +13611,10 @@ pub const DocumentArtifactReprocessWorker = struct {
         try jw.write(self.target_sequence);
         try jw.objectField("retry_queue_full");
         try jw.write(self.retry_queue_full);
+        if (self.backlog) |value| {
+            try jw.objectField("backlog");
+            try jw.write(value);
+        }
         try jw.objectField("retrying");
         try jw.write(self.retrying);
         if (self.next_retry_at_ms) |value| {
@@ -13574,8 +13623,58 @@ pub const DocumentArtifactReprocessWorker = struct {
         }
         try jw.objectField("failed");
         try jw.write(self.failed);
+        if (self.last_error_code) |value| {
+            try jw.objectField("last_error_code");
+            try jw.write(value);
+        }
+        if (self.last_progress_at_ms) |value| {
+            try jw.objectField("last_progress_at_ms");
+            try jw.write(value);
+        }
         try jw.objectField("background_running");
         try jw.write(self.background_running);
+        try jw.endObject();
+    }
+};
+
+/// Shard-wide retry debt sampled from the replay worker.
+pub const DocumentArtifactRetryBacklog = struct {
+    active_tickets: u32,
+    sleeping_tickets: u32,
+    oldest_unresolved_sequence: ?u64 = null,
+    /// Admission constraint preventing replay from admitting fresh work, when blocked.
+    admission_blocked_by: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "active_tickets", "active_tickets", false },
+        .{ "sleeping_tickets", "sleeping_tickets", false },
+        .{ "oldest_unresolved_sequence", "oldest_unresolved_sequence", true },
+        .{ "admission_blocked_by", "admission_blocked_by", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("active_tickets");
+        try jw.write(self.active_tickets);
+        try jw.objectField("sleeping_tickets");
+        try jw.write(self.sleeping_tickets);
+        if (self.oldest_unresolved_sequence) |value| {
+            try jw.objectField("oldest_unresolved_sequence");
+            try jw.write(value);
+        }
+        if (self.admission_blocked_by) |value| {
+            try jw.objectField("admission_blocked_by");
+            try jw.write(value);
+        }
         try jw.endObject();
     }
 };

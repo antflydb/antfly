@@ -23,11 +23,22 @@ const keys = @import("../internal_keys.zig");
 const kind = keys.asset_reprocess_intent_kind;
 pub const encoded_len = 76;
 const receipt_len = 53;
+const retry_code_capacity = 96;
+const diagnostic_receipt_len = receipt_len + 1 + retry_code_capacity;
+
+fn isReceipt(raw: []const u8) bool {
+    return (raw.len == receipt_len and std.mem.eql(u8, raw[0..4], "ARR1")) or
+        (raw.len == diagnostic_receipt_len and std.mem.eql(u8, raw[0..4], "ARR2"));
+}
 
 pub const RetryReason = enum(u8) { provider_capacity = 1, provider_retry_after = 2, transient = 3 };
+pub const RetryStage = enum(u8) { source_fetch = 1, pdf_prepare, pdf_inspect, pdf_render, ocr, publication, enrichment };
+pub const RetryErrorCode = @import("types.zig").InlineStatusText(retry_code_capacity);
 pub const RetryObservation = struct {
     retry_at_ms: u64,
     reason: RetryReason,
+    stage: ?RetryStage = null,
+    error_code: ?RetryErrorCode = null,
 };
 
 /// The companion preserves the existing ARP1 reader during a rolling upgrade.
@@ -41,33 +52,42 @@ pub fn newReceipt(intent: *const [encoded_len]u8) [receipt_len]u8 {
 }
 
 pub fn stampReceipt(raw: []u8, sequence: u64) !void {
-    if (raw.len != receipt_len or !std.mem.eql(u8, raw[0..4], "ARR1") or sequence == 0)
+    if (!isReceipt(raw) or sequence == 0)
         return error.InvalidArtifactPayload;
     std.mem.writeInt(u64, raw[36..44], sequence, .little);
 }
 
 pub fn receiptSequence(raw: []const u8, checked_intent: []const u8) ?u64 {
-    if (raw.len != receipt_len or checked_intent.len != encoded_len or
-        !std.mem.eql(u8, raw[0..4], "ARR1") or
+    if (!isReceipt(raw) or checked_intent.len != encoded_len or
         !std.mem.eql(u8, raw[4..36], checked_intent[44..76])) return null;
     const sequence = std.mem.readInt(u64, raw[36..44], .little);
     return if (sequence == 0) null else sequence;
 }
 
 pub fn observeRetry(raw: []const u8) ?RetryObservation {
-    if (raw.len != receipt_len or !std.mem.eql(u8, raw[0..4], "ARR1")) return null;
+    if (!isReceipt(raw)) return null;
     const reason = std.enums.fromInt(RetryReason, raw[52]) orelse return null;
     const retry_at_ms = std.mem.readInt(u64, raw[44..52], .little);
     if (retry_at_ms == 0) return null;
-    return .{ .reason = reason, .retry_at_ms = retry_at_ms };
+    var observation: RetryObservation = .{ .reason = reason, .retry_at_ms = retry_at_ms };
+    if (raw.len == diagnostic_receipt_len) {
+        observation.stage = std.enums.fromInt(RetryStage, raw[receipt_len]);
+        const code = std.mem.sliceTo(raw[receipt_len + 1 ..], 0);
+        if (code.len != 0 and std.unicode.utf8ValidateSlice(code)) observation.error_code = RetryErrorCode.init(code);
+    }
+    return observation;
 }
 
-pub fn withRetry(raw: []const u8, accepted_sequence: u64, retry: RetryObservation) ?[receipt_len]u8 {
-    if (raw.len != receipt_len or !std.mem.eql(u8, raw[0..4], "ARR1") or
+pub fn withRetry(raw: []const u8, accepted_sequence: u64, retry: RetryObservation) ?[diagnostic_receipt_len]u8 {
+    if (!isReceipt(raw) or
         std.mem.readInt(u64, raw[36..44], .little) != accepted_sequence) return null;
-    var revised = raw[0..receipt_len].*;
+    var revised: [diagnostic_receipt_len]u8 = @splat(0);
+    @memcpy(revised[0..receipt_len], raw[0..receipt_len]);
+    @memcpy(revised[0..4], "ARR2");
     std.mem.writeInt(u64, revised[44..52], retry.retry_at_ms, .little);
     revised[52] = @backingInt(retry.reason);
+    if (retry.stage) |stage| revised[receipt_len] = @backingInt(stage);
+    if (retry.error_code) |code| @memcpy(revised[receipt_len + 1 ..][0..code.len], code.slice());
     return revised;
 }
 
@@ -197,7 +217,12 @@ test "extraction receipt requires its own publication witness even when another 
     try std.testing.expect(!isPublished(90, 3, 0, 3));
     try std.testing.expect(!isPublished(90, 3, 91, 4));
     try std.testing.expect(isPublished(90, 3, 90, 3));
-    const retry = RetryObservation{ .retry_at_ms = 200, .reason = .provider_retry_after };
+    const retry = RetryObservation{
+        .retry_at_ms = 200,
+        .reason = .provider_retry_after,
+        .stage = .ocr,
+        .error_code = RetryErrorCode.init("ReadRateLimited"),
+    };
     try std.testing.expect(withRetry(&receipt, 89, retry) == null);
     const deferred = withRetry(&receipt, 90, retry).?;
     try std.testing.expectEqual(@as(?u64, 90), receiptSequence(&deferred, &target));
