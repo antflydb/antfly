@@ -27223,7 +27223,9 @@ pub const IndexManager = struct {
                     try validateContextSourcesConfig(self.alloc, cfg);
                     try self.rejectContextSourceFeedback(cfg);
                 }
-                if (self.getEnrichment(.asset, cfg.source_artifact_name)) |upstream| if (enrichment_catalog.externallyMaintained(upstream)) return error.InvalidEnrichmentConfig;
+                // An externally maintained upstream has no publication
+                // receipt; its consumers bind to its output bytes instead
+                // (`readExternalUpstream`, `validateLocalSourceFence`).
                 if (cfg.source_artifact_name.len > 0) {
                     // Asset-consumes-asset: the upstream chain must resolve
                     // to admitted assets and terminate without revisiting

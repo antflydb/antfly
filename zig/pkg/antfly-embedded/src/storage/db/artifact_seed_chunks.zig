@@ -113,6 +113,139 @@ pub fn chunksForInputAlloc(comptime chunker: type, alloc: Allocator, record: ?[]
     return try chunksFromFieldsAlloc(chunker, alloc, fields);
 }
 
+const vectors_magic = "antfly-staged-chunk-vectors-v1\x00";
+const vectors_record_name_prefix = "\x00seeded-chunk-vectors\x00";
+
+/// Seeded vectors of a staged chunk collection (above `max_seed_chunks`).
+/// Its chunks publish on replay, so the write records the accepted vectors
+/// with the chunk record they belong to and the embedder revision they were
+/// accepted for. The replay worker uses them in place of embedding while
+/// both still match.
+pub fn vectorsKeyAlloc(alloc: Allocator, doc_key: []const u8, embedding_name: []const u8) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try internal_keys.appendDocumentPrefix(&list, alloc, doc_key);
+    try list.append(alloc, internal_keys.asset_state_kind);
+    const name = try std.mem.concat(alloc, u8, &.{ vectors_record_name_prefix, embedding_name });
+    defer alloc.free(name);
+    try internal_keys.appendEncodedComponent(&list, alloc, name);
+    return try list.toOwnedSlice(alloc);
+}
+
+/// The digest a vectors record binds to: the exact chunk record bytes.
+pub fn chunkRecordDigest(record: []const u8) [32]u8 {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(record, &digest, .{});
+    return digest;
+}
+
+const vectors_header_len = vectors_magic.len + 32 + 1 + 32 + 4 + 4;
+
+/// `vectors` are unsplit chunk vectors in strictly increasing chunk id
+/// order, each `dims` long.
+pub fn encodeVectorsAlloc(alloc: Allocator, chunk_record: [32]u8, revision: ?[32]u8, dims: u32, vectors: []const artifact_seeds.ChunkVector) ![]u8 {
+    const entry_len = 4 + @as(usize, dims) * 4;
+    const out = try alloc.alloc(u8, vectors_header_len + vectors.len * entry_len);
+    errdefer alloc.free(out);
+    var at: usize = 0;
+    @memcpy(out[at..][0..vectors_magic.len], vectors_magic);
+    at += vectors_magic.len;
+    @memcpy(out[at..][0..32], &chunk_record);
+    at += 32;
+    out[at] = @intFromBool(revision != null);
+    at += 1;
+    @memcpy(out[at..][0..32], &(revision orelse @as([32]u8, @splat(0))));
+    at += 32;
+    std.mem.writeInt(u32, out[at..][0..4], dims, .little);
+    at += 4;
+    std.mem.writeInt(u32, out[at..][0..4], @intCast(vectors.len), .little);
+    at += 4;
+    for (vectors, 0..) |entry, i| {
+        if (entry.window_index != null or entry.vector.len != dims) return error.InvalidArtifactSeed;
+        if (i > 0 and vectors[i - 1].chunk_id >= entry.chunk_id) return error.InvalidArtifactSeed;
+        std.mem.writeInt(u32, out[at..][0..4], entry.chunk_id, .little);
+        at += 4;
+        for (entry.vector) |value| {
+            std.mem.writeInt(u32, out[at..][0..4], @bitCast(value), .little);
+            at += 4;
+        }
+    }
+    return out;
+}
+
+/// A vectors record that matches its chunk record and embedder revision.
+pub const StagedVectors = struct {
+    bytes: []const u8,
+    dims: u32,
+    count: u32,
+
+    /// Validates `record` against the chunk record it binds to and the
+    /// embedder revision of the replay; null when absent or stale.
+    pub fn bind(record: ?[]const u8, chunk_record: ?[]const u8, revision: ?[32]u8, dims: u32) ?StagedVectors {
+        const bytes = record orelse return null;
+        const chunks = chunk_record orelse return null;
+        if (bytes.len < vectors_header_len or !std.mem.eql(u8, bytes[0..vectors_magic.len], vectors_magic)) return null;
+        var at: usize = vectors_magic.len;
+        if (!std.mem.eql(u8, bytes[at..][0..32], &chunkRecordDigest(chunks))) return null;
+        at += 32;
+        const has_revision = bytes[at] != 0;
+        at += 1;
+        if (has_revision != (revision != null)) return null;
+        if (revision) |expected| if (!std.mem.eql(u8, bytes[at..][0..32], &expected)) return null;
+        at += 32;
+        const recorded_dims = std.mem.readInt(u32, bytes[at..][0..4], .little);
+        at += 4;
+        const count = std.mem.readInt(u32, bytes[at..][0..4], .little);
+        if (recorded_dims != dims or bytes.len != vectors_header_len + @as(usize, count) * (4 + @as(usize, dims) * 4)) return null;
+        return .{ .bytes = bytes, .dims = dims, .count = count };
+    }
+
+    /// The seeded vector of `chunk_id`, copied, or null when none was seeded.
+    pub fn vectorAlloc(self: StagedVectors, alloc: Allocator, chunk_id: u32) !?[]f32 {
+        const entry_len = 4 + @as(usize, self.dims) * 4;
+        var low: usize = 0;
+        var high: usize = self.count;
+        while (low < high) {
+            const middle = low + (high - low) / 2;
+            const entry = self.bytes[vectors_header_len + middle * entry_len ..][0..entry_len];
+            const id = std.mem.readInt(u32, entry[0..4], .little);
+            if (id < chunk_id) {
+                low = middle + 1;
+            } else if (id > chunk_id) {
+                high = middle;
+            } else {
+                const out = try alloc.alloc(f32, self.dims);
+                for (out, 0..) |*value, i| value.* = @bitCast(std.mem.readInt(u32, entry[4 + i * 4 ..][0..4], .little));
+                return out;
+            }
+        }
+        return null;
+    }
+};
+
+test "staged chunk vectors bind their chunk record and embedder revision" {
+    const alloc = std.testing.allocator;
+    var first = [_]f32{ 1, 2 };
+    var second = [_]f32{ 3, 4 };
+    const vectors = [_]artifact_seeds.ChunkVector{ .{ .chunk_id = 0, .window_index = null, .vector = &first }, .{ .chunk_id = 7, .window_index = null, .vector = &second } };
+    const revision: [32]u8 = @splat(9);
+    const record = try encodeVectorsAlloc(alloc, chunkRecordDigest("chunks"), revision, 2, &vectors);
+    defer alloc.free(record);
+    const bound = StagedVectors.bind(record, "chunks", revision, 2).?;
+    const seven = (try bound.vectorAlloc(alloc, 7)).?;
+    defer alloc.free(seven);
+    try std.testing.expectEqualSlices(f32, &second, seven);
+    try std.testing.expect((try bound.vectorAlloc(alloc, 3)) == null);
+    try std.testing.expect(StagedVectors.bind(record, "other chunks", revision, 2) == null);
+    try std.testing.expect(StagedVectors.bind(record, "chunks", null, 2) == null);
+    try std.testing.expect(StagedVectors.bind(record, "chunks", revision, 3) == null);
+    const unordered = [_]artifact_seeds.ChunkVector{ vectors[1], vectors[0] };
+    try std.testing.expectError(error.InvalidArtifactSeed, encodeVectorsAlloc(alloc, chunkRecordDigest("chunks"), revision, 2, &unordered));
+    var windowed = vectors;
+    windowed[1].window_index = 1;
+    try std.testing.expectError(error.InvalidArtifactSeed, encodeVectorsAlloc(alloc, chunkRecordDigest("chunks"), revision, 2, &windowed));
+}
+
 const partial_magic = "antfly-partial-extraction-v1\x00";
 const partial_record_name_prefix = "\x00partial-extraction\x00";
 

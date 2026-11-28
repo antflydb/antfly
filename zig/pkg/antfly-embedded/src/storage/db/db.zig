@@ -109243,6 +109243,44 @@ test "db artifact seed preparation serves enrichment sync levels without inferen
     try std.testing.expectEqualSlices(u8, &(try execution_resources.PreparedEnrichments.requestDigest(alloc, req)), &(try execution_resources.PreparedEnrichments.requestDigest(alloc, full_index)));
 }
 
+test "db artifact seed preparation leaves unseeded outputs to the enrichments sync wait" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    const req: types.BatchRequest = .{ .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"same source\",\"_artifacts\":{\"body_dense_v1\":{\"value\":[1,2,3]}}}" }}, .sync_level = .enrichments };
+    var counting = CountingDenseEmbedder{};
+    var leader_producer = TestAssetProducer{};
+    const packet = packet: {
+        var leader = try DB.open(alloc, std.mem.span(path), .{ .enrichment = .{ .owner_id = "worker-a", .dense_embedder = counting.interface(), .asset_producer = leader_producer.producer() } });
+        defer leader.close();
+        try addSeededDenseTestIndex(&leader);
+        try leader.addEnrichment(.{ .name = "summary", .kind = .asset, .field = "body", .content_type = "text/plain", .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"g\"}}" });
+        break :packet try leader.prepareSeedEnrichments(alloc, req);
+    };
+    defer alloc.free(packet);
+    // Preparation ran no producer: the summary is planned, not generated.
+    try std.testing.expectEqual(@as(usize, 0), counting.calls);
+    try std.testing.expectEqual(@as(usize, 0), leader_producer.calls);
+    try std.testing.expect(std.mem.indexOf(u8, packet, "\"artifact_name\":\"summary\"") != null);
+
+    // Applying the packet at `enrichments` returns only once the unseeded
+    // summary exists; the seeded vector is never embedded.
+    var producer = TestAssetProducer{};
+    var replica = try DB.open(alloc, std.mem.span(path), .{ .enrichment = .{ .owner_id = "worker-a", .asset_producer = producer.producer() } });
+    defer replica.close();
+    var prepared = req;
+    prepared.prepared_enrichments_json = packet;
+    try replica.batch(prepared);
+    try expectSeededDenseVector(alloc, &replica, "doc:a", "same source", &.{ 1, 2, 3 });
+    const key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "asset", "summary");
+    defer alloc.free(key);
+    const summary = try replica.core.store.get(alloc, key);
+    defer alloc.free(summary);
+    try std.testing.expectEqual(@as(usize, 1), producer.generator_calls);
+}
+
 test "db artifact seeds maintain an external asset with no producer" {
     const alloc = std.testing.allocator;
     var path_tmp = try TestDirectory.init("db");
@@ -109255,8 +109293,6 @@ test "db artifact seeds maintain an external asset with no producer" {
     // No producer and no input: maintained outside Antfly.
     try db.addEnrichment(.{ .name = "notes", .kind = .asset, .content_type = "text/plain" });
     try db.addEnrichment(.{ .name = "labels", .kind = .asset, .content_type = "application/json", .seed_json = "{\"field\":\"legacy_labels\",\"format\":\"json\",\"on_missing\":\"generate\"}" });
-    // Asset producers may not consume it (they need a producer receipt).
-    try std.testing.expectError(error.InvalidEnrichmentConfig, db.addEnrichment(.{ .name = "notes_summary", .kind = .asset, .source_artifact_name = "notes", .content_type = "text/plain", .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"g\"}}" }));
     try std.testing.expectError(error.InvalidEnrichmentConfig, db.addEnrichment(.{ .name = "bad", .kind = .asset, .content_type = "text/plain", .full_text_index = true }));
 
     {
@@ -109351,6 +109387,41 @@ test "db artifact seeds maintain an external asset with no producer" {
     const doc_b_notes = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:b", "asset", "notes");
     defer alloc.free(doc_b_notes);
     try std.testing.expect((try db.core.getStoreValue(alloc, doc_b_notes)) == null);
+}
+
+test "db artifact asset producers consume an external asset's seeded bytes" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    var fake = TestAssetProducer{};
+    var db = try DB.open(alloc, std.mem.span(path), .{ .enrichment = .{ .owner_id = "worker-a", .asset_producer = fake.producer() } });
+    defer db.close();
+    try db.addEnrichment(.{ .name = "notes", .kind = .asset, .content_type = "text/plain" });
+    // It binds to the seeded bytes; no producer receipt exists.
+    try db.addEnrichment(.{ .name = "notes_summary", .kind = .asset, .source_artifact_name = "notes", .content_type = "text/plain", .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"g\"}}" });
+
+    try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"x\",\"_artifacts\":{\"notes\":{\"value\":\"silver submarine\"}}}" }}, .sync_level = .write });
+    try db.runUntilIdle();
+    try expectStoredAssetForTest(alloc, &db, "doc:a", "notes_summary", "generator:silver submarine");
+    try std.testing.expectEqual(@as(usize, 1), fake.generator_calls);
+
+    // Source rewrites keep the asset and its consumer.
+    try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"rewritten\"}" }}, .sync_level = .write });
+    try db.runUntilIdle();
+    try expectStoredAssetForTest(alloc, &db, "doc:a", "notes_summary", "generator:silver submarine");
+    try std.testing.expectEqual(@as(usize, 1), fake.generator_calls);
+
+    // A new seed regenerates it, also through a seed-only transform.
+    try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"rewritten\",\"_artifacts\":{\"notes\":{\"value\":\"copper kettle\"}}}" }}, .sync_level = .write });
+    try db.runUntilIdle();
+    try expectStoredAssetForTest(alloc, &db, "doc:a", "notes_summary", "generator:copper kettle");
+    const ops = [_]types.TransformOp{.{ .op = .set, .path = "_artifacts.notes", .value_json = "{\"value\":\"golden whale\"}" }};
+    try db.batch(.{ .transforms = &.{.{ .key = "doc:a", .operations = &ops }}, .sync_level = .write });
+    try db.runUntilIdle();
+    try expectStoredAssetForTest(alloc, &db, "doc:a", "notes_summary", "generator:golden whale");
+    try std.testing.expectEqual(@as(usize, 3), fake.generator_calls);
 }
 
 test "db artifact chunks of an external asset follow its seeds" {
@@ -109785,6 +109856,79 @@ test "db artifact seeded chunk collections above the atomic write bound publish 
     }
 }
 
+test "db artifact vector seeds of staged chunk collections publish on replay" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    var embedder = CountingDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{ .enrichment = .{ .owner_id = "worker-a", .dense_embedder = embedder.interface() } });
+    defer db.close();
+    try addSeedRoundTripTestIndexes(&db);
+
+    const count = @import("artifact_seeds.zig").max_seed_chunks + 5;
+    var body = std.ArrayListUnmanaged(u8).empty;
+    defer body.deinit(alloc);
+    for (0..count) |i| try body.append(alloc, "abcdefghijklmnopqrstuvwxyz"[i % 26]);
+    const DocJson = struct {
+        fn build(a: Allocator, text: []const u8, vectors: []const u8) ![]u8 {
+            var json = std.ArrayListUnmanaged(u8).empty;
+            errdefer json.deinit(a);
+            try json.print(a, "{{\"title\":\"big\",\"body\":\"{s}\",\"_chunks\":{{\"body_chunks_v1\":[", .{text});
+            for (0..text.len) |i| {
+                if (i != 0) try json.append(a, ',');
+                try json.print(a, "{{\"_chunk_id\":{d},\"_content\":\"{c}\",\"_start_char\":{d},\"_end_char\":{d}}}", .{ i, text[i], i, i + 1 });
+            }
+            try json.print(a, "]}},\"_artifacts\":{{\"chunk_dense_v1\":{s}}}}}", .{vectors});
+            return json.toOwnedSlice(a);
+        }
+    };
+    const last = count - 1;
+    const vectors = try std.fmt.allocPrint(alloc, "{{\"value\":[{{\"chunk_id\":0,\"vector\":[1,0,0]}},{{\"chunk_id\":{d},\"vector\":[0,0,1]}}]}}", .{last});
+    defer alloc.free(vectors);
+    const doc = try DocJson.build(alloc, body.items, vectors);
+    defer alloc.free(doc);
+
+    const report = (try db.batchReportingSeeds(alloc, .{ .writes = &.{.{ .key = "doc:a", .value = doc }}, .sync_level = .write })).?;
+    defer alloc.free(report);
+    try std.testing.expect(std.mem.indexOf(u8, report, "\"name\":\"chunk_dense_v1\",\"outcome\":\"accepted\"") != null);
+    try db.runUntilIdle();
+    try std.testing.expectEqual(@as(u64, count), db.core.index_manager.denseIndex("dv_chunks").?.index.metadata.active_count);
+    for ([_]struct { id: u32, vector: []const f32 }{ .{ .id = 0, .vector = &.{ 1, 0, 0 } }, .{ .id = @intCast(last), .vector = &.{ 0, 0, 1 } } }) |expected| {
+        const member = try internal_keys.chunkArtifactKeyAlloc(alloc, "doc:a", "body_chunks_v1", expected.id);
+        defer alloc.free(member);
+        const key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(alloc, member, "chunk_dense_v1");
+        defer alloc.free(key);
+        const stored = try db.core.store.get(alloc, key);
+        defer alloc.free(stored);
+        try std.testing.expect((try enrichment_artifact_codec.decodeHeaderPrefix(stored)).flags.seeded);
+        const vector = try enrichment_artifact_codec.decodeDenseEmbeddingAlloc(alloc, stored);
+        defer alloc.free(vector);
+        try std.testing.expectEqualSlices(f32, expected.vector, vector);
+    }
+    {
+        // An unseeded chunk was embedded and stored as generated output.
+        const member = try internal_keys.chunkArtifactKeyAlloc(alloc, "doc:a", "body_chunks_v1", 1);
+        defer alloc.free(member);
+        const key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(alloc, member, "chunk_dense_v1");
+        defer alloc.free(key);
+        const stored = try db.core.store.get(alloc, key);
+        defer alloc.free(stored);
+        try std.testing.expect(!(try enrichment_artifact_codec.decodeHeaderPrefix(stored)).flags.seeded);
+    }
+
+    // Vectors must name chunks of the collection, whole.
+    const unknown = try std.fmt.allocPrint(alloc, "{{\"value\":[{{\"chunk_id\":{d},\"vector\":[1,0,0]}}]}}", .{count + 10});
+    defer alloc.free(unknown);
+    const unknown_doc = try DocJson.build(alloc, body.items, unknown);
+    defer alloc.free(unknown_doc);
+    try std.testing.expectError(error.InvalidArtifactSeed, db.batch(.{ .writes = &.{.{ .key = "doc:b", .value = unknown_doc }}, .sync_level = .write }));
+    const windowed_doc = try DocJson.build(alloc, body.items, "{\"value\":[{\"chunk_id\":0,\"window_index\":0,\"vector\":[1,0,0]}]}");
+    defer alloc.free(windowed_doc);
+    try std.testing.expectError(error.ArtifactSeedNotAccepted, db.batch(.{ .writes = &.{.{ .key = "doc:b", .value = windowed_doc }}, .sync_level = .write }));
+}
+
 test "db artifact seeded chunk collections survive unrelated edits and replays of the same input" {
     const alloc = std.testing.allocator;
     var path_tmp = try TestDirectory.init("db");
@@ -110037,6 +110181,50 @@ test "db artifact seeds accept extracted units with pages, transcripts and unit-
         return error.TestUnexpectedResult
     else |err|
         try std.testing.expect(err == error.ArtifactSeedNotAccepted);
+}
+
+test "db artifact unit-scoped chunk seeds above the atomic write bound publish" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    var fake = TestAssetProducer{};
+    var db = try DB.open(alloc, std.mem.span(path), .{ .enrichment = .{ .owner_id = "worker-a", .asset_producer = fake.producer() } });
+    defer db.close();
+    try db.addEnrichment(.{ .name = "extracted", .kind = .asset, .template = "{{url}}", .content_type = "application/json", .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}" });
+    try db.addEnrichment(.{ .name = "passages", .kind = .chunk, .source_artifact_name = "extracted", .field = "text", .chunk_size = 64, .chunk_overlap = 0 });
+
+    // Three pages whose unit chunks together exceed one write's bound.
+    const per_unit = 1500;
+    const units = 3;
+    var json = std.ArrayListUnmanaged(u8).empty;
+    defer json.deinit(alloc);
+    try json.appendSlice(alloc, "{\"url\":\"https://example.invalid/big.pdf\",\"_artifacts\":{\"extracted\":{\"value\":{\"units\":[");
+    for (0..units) |unit| {
+        if (unit != 0) try json.append(alloc, ',');
+        try json.print(alloc, "{{\"page_number\":{d},\"text\":\"", .{unit + 1});
+        for (0..per_unit) |i| try json.append(alloc, "abcdefghijklmnopqrstuvwxyz"[i % 26]);
+        try json.appendSlice(alloc, "\"}");
+    }
+    try json.appendSlice(alloc, "]}}},\"_chunks\":{\"passages\":[");
+    for (0..units) |unit| for (0..per_unit) |i| {
+        if (unit != 0 or i != 0) try json.append(alloc, ',');
+        try json.print(alloc, "{{\"_chunk_id\":{d},\"_content\":\"{c}\",\"_start_char\":{d},\"_end_char\":{d},\"_parent_unit_id\":\"page:{d:0>6}\"}}", .{ i, "abcdefghijklmnopqrstuvwxyz"[i % 26], i, i + 1, unit + 1 });
+    };
+    try json.appendSlice(alloc, "]}}");
+    try std.testing.expect(units * per_unit > @import("artifact_seeds.zig").max_seed_chunks);
+
+    try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = json.items }}, .sync_level = .write });
+    try db.runUntilIdle();
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    var view = (try db.lookup(alloc, "doc:a", .{ .fields = &.{"_chunks"}, .include_all_fields = false, .artifact_view = .seed })).?;
+    defer view.deinit(alloc);
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, view.json, .{});
+    defer parsed.deinit();
+    const chunks = parsed.value.object.get("_chunks").?.object.get("passages").?.array.items;
+    try std.testing.expectEqual(@as(usize, units * per_unit), chunks.len);
+    try std.testing.expectEqualStrings("page:000003", chunks[chunks.len - 1].object.get("_parent_unit_id").?.string);
 }
 
 test "db artifact seed preparation carries extracted units and their chunk vectors to a replica" {

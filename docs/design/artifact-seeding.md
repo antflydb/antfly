@@ -255,8 +255,13 @@ fences the upstream by its content digest, and the ordered authority observes
 the upstream without a producer proof (`readExternalUpstream`). A write
 carrying seeds always replays its derived requests, so a seed that changes the
 asset (also through a seed-only transform) regenerates its chunks and their
-vectors even when the logical row is unchanged. Asset producers may not
-consume one, and full-text projection of the asset itself stays refused.
+vectors even when the logical row is unchanged.
+
+Asset producers may consume one as well (`source_artifact_name`), on the same
+binding: the producer reads the seeded bytes (`readExternalUpstream` under the
+ordered authority) and its local source fence checks their digest instead of
+a producer receipt. A seed that changes the asset regenerates the consumer's
+output. Full-text projection of the asset itself stays refused.
 
 ### Transforms
 
@@ -313,10 +318,22 @@ mutation with its manifest). Larger collections, up to 65,536 chunks, are
 accepted into the record only: the write reports them `accepted`, defers the
 collection's chunk request and its chunk consumers to replay, and the worker
 publishes the recorded set from the record, through staged chunk generations
-where the ordered authority applies (`docs/design/media-pass.md`). Vector
-seeds for the chunks of such a collection are refused
-(`ArtifactSeedNotAccepted`): they would bind to rows the write does not
-prepare; the chunks are embedded on replay instead.
+where the ordered authority applies (`docs/design/media-pass.md`).
+
+Dense vector seeds for the chunks of such a collection bind to rows the write
+does not prepare, so the write records them instead
+(`artifact_seed_chunks.StagedVectors`). The record holds one unsplit vector
+per seeded chunk, bound to the exact chunk record and to the embedder
+revision the write accepted them for. When replay publishes the chunks, the
+chunk embedding consumer stores a recorded vector as that chunk's `seeded`
+output instead of embedding the chunk; unseeded chunks are embedded as usual.
+A stale record (other chunks, another embedder revision) is ignored. `null`
+deletes the record. Windowed seeds and sparse vector seeds of a staged
+collection are refused (`ArtifactSeedNotAccepted`).
+
+Unit-scoped chunks of an extraction's chunk consumers have no per-write
+bound of their own beyond the 65,536 collection limit: they are recorded per
+unit and published with the units the extraction producer streams.
 
 ### Rich document extraction
 
@@ -544,12 +561,12 @@ chunker, vectors from the consuming embeddings index's embedder (one per
 chunk for an upstream chunk collection), field copies, and producer-backed
 assets (generator, extractor, reader, document_extraction, ...) through the
 host's asset producer; JSON content types store JSON values. Outputs are
-written with `origin: generated` records. A native host passes its asset
-producer as `BootstrapConfig.asset_producer`; the standalone serverless binary
-does not construct one yet (the asset producer runtime's inference modules are
-outside its compilation unit), so there producer-backed assets stay pending
-while chunks, vectors and copies generate. Outputs whose producer or embedder
-is missing stay pending rather than failing.
+written with `origin: generated` records. A host may lend its asset producer
+as `BootstrapConfig.asset_producer`; otherwise the bootstrap builds the
+standalone asset producer runtime over the stack's embedding providers and
+inference settings (the serverless runtime library imports the extraction
+schemas it needs). Outputs whose producer or embedder is missing stay pending
+rather than failing.
 
 A producer error is recorded on the output's acceptance record
 (`{"failed": n, "input": ..., "error": ...}`) instead of failing the
@@ -628,26 +645,18 @@ These fail with `ArtifactSeedNotAccepted` rather than regenerating:
 
 ## Remaining work
 
-These need work this repository cannot verify on a 16.8 GB machine (the data
-runtime, storage kernel and server API test builds declare 19-21 GB), or are
-subsystem features of their own:
+The data runtime, storage kernel and server API test builds declare 15-22 GB
+and do not build on a 16.8 GB machine. These parts are written but not yet
+compiled or run:
 
-- Running the server tests of per-item outcomes and enrichment counts: the
-  data runtime and public table HTTP test builds declare 15-22 GB. The
-  distributed and serverless runtime libraries compile; the storage kernel
-  library (the data runtime) exceeds this machine's memory to rebuild.
-- An asset producer in the standalone serverless binary.
-- Compiling and running the data runtime's leader-preparation gating
-  (`seedPreparationCandidate`, the owner preflight's seed-mapping flag) and a
-  cross-shard 2PC seed transform test through the server harness. Both need
-  the storage kernel build. The embedded DB tests cover the transaction and
-  sync-level packets. Not yet tested: an `enrichments` write whose packet
-  leaves unseeded outputs pending, and whether the proposer's sync wait
-  covers them.
-- Partial extraction seeds: an end-to-end test with a real PDF (PDF reading
-  is compiled out of the DB unit tests; the overlay and the write path are
-  tested separately).
-- Vector seeds for seeded chunk collections above 4,095 chunks; unit-scoped
-  (extraction) chunk inventories above that bound.
-- Asset producers consuming externally maintained assets (they need an
-  upstream producer receipt); an ordered-authority test of chunk consumers.
+- The server tests of per-item outcomes and enrichment counts.
+- The data runtime's leader-preparation gating (`seedPreparationCandidate`)
+  and the owner preflight's seed-mapping flag. The embedded DB tests cover
+  the transaction and sync-level packets themselves, including an
+  `enrichments` write whose packet leaves unseeded outputs to the apply-side
+  wait.
+- End-to-end tests that need the server binary:
+  `test_multi_batch_carries_artifact_seeds_and_seed_transforms` (a multi-table
+  2PC batch with seeds and a seed-only transform) and
+  `test_artifact_seed_extraction.py` (a partial extraction seed over a real
+  PDF; PDF reading is compiled out of every Zig test build).

@@ -93,6 +93,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         const computeSeededDenseRequestDerived = S.computeSeededDenseRequestDerived;
         const computeSeededDenseChunkRequestDerived = S.computeSeededDenseChunkRequestDerived;
         const installSeededChunks = S.installSeededChunks;
+        const recordStagedSeededChunkVectors = S.recordStagedSeededChunkVectors;
         const installGeneratedChunks = S.installGeneratedChunks;
         const computeSeededSparseRequestDerived = S.computeSeededSparseRequestDerived;
         const computeSeededSparseChunkRequestDerived = S.computeSeededSparseChunkRequestDerived;
@@ -1198,6 +1199,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     try metadata.put(a, try seed_records.extractionKeyAlloc(a, producer.doc_key, name), {});
                     try metadata.put(a, try seed_records.partialExtractionKeyAlloc(a, producer.doc_key, name), {});
                     try metadata.put(a, try seed_records.assetKeyAlloc(a, producer.doc_key, name), {});
+                    try metadata.put(a, try seed_records.vectorsKeyAlloc(a, producer.doc_key, name), {});
                 }
                 if (producer.kind != .asset) continue;
                 if (children.get(name)) |list| for (list.items) |child| {
@@ -1610,10 +1612,15 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         }
                     }
                     const seed = request_seeds[request_index];
-                    if (stagedChunkConsumer(request, staged_chunk_names.items)) {
-                        // Vectors of these chunks would bind to rows this
-                        // write does not prepare.
-                        if (seed != null and request.kind != .chunk_text) return error.ArtifactSeedNotAccepted;
+                    if (stagedChunkConsumer(request, staged_chunk_names.items)) |chunk_name| {
+                        // Vectors of these chunks bind to rows this write does
+                        // not prepare: the write records them for the replay
+                        // that publishes the chunks.
+                        if (seed) |entry| if (request.kind != .chunk_text) {
+                            const items = chunkSeedFor(generated, request_seeds, chunk_name) orelse return error.ArtifactSeedNotAccepted;
+                            const result = try recordStagedSeededChunkVectors(alloc, self, request, chunk_name, items, entry, &artifact_writes, &artifact_delete_keys);
+                            try appendSeedOutcome(alloc, &seed_outcomes, request, result);
+                        };
                         if (request.kind == .chunk_text) try appendSeedOutcome(alloc, &seed_outcomes, request, .{ .outcome = .accepted });
                         try appendGeneratedEnrichmentRef(alloc, &planned, request);
                         continue;
@@ -2667,14 +2674,15 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             }
         }
 
-        fn stagedChunkConsumer(request: enrichment_types.GeneratedEnrichmentRequest, staged: []const []const u8) bool {
-            if (staged.len == 0) return false;
+        /// The staged collection `request` produces or consumes, if any.
+        fn stagedChunkConsumer(request: enrichment_types.GeneratedEnrichmentRequest, staged: []const []const u8) ?[]const u8 {
+            if (staged.len == 0) return null;
             const consumes = request.kind == .chunk_text or ((request.kind == .dense_embedding or request.kind == .sparse_embedding) and request.input_kind != .document);
-            if (!consumes) return false;
+            if (!consumes) return null;
             for (staged) |name| {
-                if (std.mem.eql(u8, name, request.artifact_name) or std.mem.eql(u8, name, requestArtifactName(request))) return true;
+                if (std.mem.eql(u8, name, request.artifact_name) or std.mem.eql(u8, name, requestArtifactName(request))) return name;
             }
-            return false;
+            return null;
         }
 
         pub fn shouldPrecomputeGeneratedRequest(

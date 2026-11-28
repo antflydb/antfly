@@ -457,6 +457,8 @@ pub const AntflyRootImports = struct {
         mod.addImport("lake_execution_options", self.lake_provider_options);
         mod.addImport("antfly_provision_contract", self.provision_contract);
         inline for (object_runtime_imports) |field| self.addImport(mod, field);
+        // Named enrichment asset producers (#1791) parse extraction schemas.
+        self.addImport(mod, "extraction_openapi");
         addSnowballModule(b, mod);
     }
 

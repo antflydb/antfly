@@ -6315,6 +6315,8 @@ const ChunkedDenseWindowItem = struct {
     /// Embedded from the chunk's own text, which re-chunking the parent
     /// reproduces (see `Flags.text_input`).
     text_input: bool = false,
+    /// `precomputed` is a staged collection's accepted vector seed (#1791).
+    seeded: bool = false,
 };
 
 const ChunkEmbeddingSource = struct {
@@ -7500,6 +7502,44 @@ fn getOrCreateRequestChunksWithProvider(runtime: *EnrichmentRuntime, alloc: Allo
         .source_record_digest = sourceRecordDigest(raw.?),
     });
     return .{ .chunks = chunks, .source_record_digest = source_digest };
+}
+
+/// Accepted vector seeds of a staged chunk collection, bound to the chunk
+/// record they were accepted with and this replay's embedder revision.
+const StagedSeededChunkVectors = struct {
+    record: ?[]u8 = null,
+    chunks: ?[]u8 = null,
+    bound: ?@import("../artifact_seed_chunks.zig").StagedVectors = null,
+
+    fn load(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest, chunk_name: []const u8, embedding_name: []const u8, revision: ?[32]u8) !StagedSeededChunkVectors {
+        const seed_chunks = @import("../artifact_seed_chunks.zig");
+        var self: StagedSeededChunkVectors = .{};
+        errdefer self.deinit(runtime);
+        const key = try seed_chunks.vectorsKeyAlloc(runtime.alloc, request.doc_key, embedding_name);
+        defer runtime.alloc.free(key);
+        self.record = try storeGetOptionalAllocWithRetry(runtime, key);
+        if (self.record == null) return self;
+        const chunks_key = try seed_chunks.keyAlloc(runtime.alloc, request.doc_key, chunk_name);
+        defer runtime.alloc.free(chunks_key);
+        self.chunks = try storeGetOptionalAllocWithRetry(runtime, chunks_key);
+        self.bound = seed_chunks.StagedVectors.bind(self.record, self.chunks, revision, request.expected_dims);
+        return self;
+    }
+
+    fn deinit(self: *StagedSeededChunkVectors, runtime: *EnrichmentRuntime) void {
+        if (self.record) |bytes| runtime.alloc.free(bytes);
+        if (self.chunks) |bytes| runtime.alloc.free(bytes);
+        self.* = .{};
+    }
+};
+
+fn seededChunkIdentity(key: []const u8) ?struct { chunk_id: u32, window: u32 } {
+    const parent = internal_keys.mediaWindowParent(key);
+    if (parent.len < 5 or parent[parent.len - 5] != internal_keys.chunk_record_kind) return null;
+    return .{
+        .chunk_id = std.mem.readInt(u32, parent[parent.len - 4 ..][0..4], .big),
+        .window = internal_keys.mediaWindowIndex(key) orelse 0,
+    };
 }
 
 /// Accepted unit-scoped chunk seeds of an extraction consumer, for exactly
@@ -17665,14 +17705,21 @@ fn processAsset(
             request.upstream_artifact_name,
         );
         defer runtime.alloc.free(upstream_key);
+        // Only seeds write an externally maintained upstream: the consumer
+        // binds to its bytes (fenced by digest), not a producer receipt.
+        const external_upstream = externalAsset(runtime, request.upstream_artifact_name);
         if (context) |*value| {
             var read = try runtime.store.beginProbe();
             defer read.abort();
-            break :blk try @import("../artifact_asset_publication.zig").readUpstream(runtime.alloc, value, &read, upstream_key);
+            const assets = @import("../artifact_asset_publication.zig");
+            break :blk if (external_upstream)
+                try assets.readExternalUpstream(runtime.alloc, value, &read, upstream_key)
+            else
+                try assets.readUpstream(runtime.alloc, value, &read, upstream_key);
         }
         const bytes = try storeGetOptionalAllocWithRetry(runtime, upstream_key);
         errdefer if (bytes) |value| runtime.alloc.free(value);
-        if (bytes) |value| {
+        if (bytes) |value| if (!external_upstream) {
             const privacy = @import("../../../privacy/document.zig");
             if (!privacy.isProtectedArtifactName(request.upstream_artifact_name) and privacy.consumerPolicyVersion(request.upstream_artifact_name) == null) {
                 var read = try runtime.store.beginProbe();
@@ -17681,7 +17728,7 @@ fn processAsset(
                 defer runtime.alloc.free(upstream_source_text);
                 try requireLocalAssetSource(runtime, &read, request.doc_key, request.upstream_artifact_name, upstream_source_text, value);
             }
-        }
+        };
         break :blk bytes;
     } else try extractAssetSourceValue(runtime.alloc, runtime.config, raw, request)) orelse {
         if (context) |*value| return enqueueAssetProducerOutput(runtime, request, value, key, null);
@@ -31185,7 +31232,10 @@ fn flushChunkedDenseItems(
         const digest = item.source_record_digest orelse return error.MissingChunkSourceFence;
         writes[i] = .{
             .key = key,
-            .value = try enrichment_artifact_codec.encodeProducedDenseEmbeddingAlloc(runtime.alloc, item.source_hash, item.text_input, vector),
+            .value = if (item.seeded)
+                try enrichment_artifact_codec.encodeSeededDenseEmbeddingAlloc(runtime.alloc, item.source_hash, vector)
+            else
+                try enrichment_artifact_codec.encodeProducedDenseEmbeddingAlloc(runtime.alloc, item.source_hash, item.text_input, vector),
             .source_key = if (item.source_record_is_parent) parent_key else item.chunk_key,
             .source_digest = digest,
             .parent_key = parent_key,
@@ -33511,6 +33561,8 @@ fn processChunkedDenseWindow(
 
             var request_complete = true;
             var request_batch_items_pending = false;
+            var seeded_vectors = try StagedSeededChunkVectors.load(runtime, request, chunk_artifact_name, embedding_artifact_name, generation.revision);
+            defer seeded_vectors.deinit(runtime);
             source_loop: for (source_set.sources) |*source| {
                 if (runtimeShuttingDown(runtime)) return error.EnrichmentRetryAborted;
                 const source_hash = if (source.metadata == null) retainedTextEmbeddingHashAtRevision(request, source.text, generation.revision) else try modelChunkEmbeddingSourceHash(runtime.alloc, source.*, request);
@@ -33536,6 +33588,21 @@ fn processChunkedDenseWindow(
                     }
                     if (owned_vector == null) owned_vector = try publishedModelChunkVector(runtime, runtime.alloc, request, metadata);
                     precomputed = owned_vector;
+                };
+                // A staged collection's accepted vector seed is its output
+                // (`artifact_seed_chunks.StagedVectors`); an unsplit seed
+                // stands for window 0 of a windowed chunk.
+                var seeded_item = false;
+                if (source.metadata == null and precomputed == null) if (seeded_vectors.bound) |bound| if (seededChunkIdentity(source.key)) |identity| {
+                    if (try bound.vectorAlloc(runtime.alloc, identity.chunk_id)) |vector| {
+                        if (identity.window != 0) {
+                            runtime.alloc.free(vector);
+                            continue :source_loop;
+                        }
+                        owned_vector = vector;
+                        precomputed = vector;
+                        seeded_item = true;
+                    }
                 };
                 if (source.text.len == 0 and precomputed == null) {
                     const metadata = source.metadata orelse return error.IncompatibleChunkEmbeddingTarget;
@@ -33606,6 +33673,7 @@ fn processChunkedDenseWindow(
                     // Plain text chunks only: model metadata means media
                     // windows or model outputs re-chunking cannot redo.
                     .text_input = request.input_kind == .inline_chunks and source.metadata == null and precomputed == null and locally_replayable,
+                    .seeded = seeded_item,
                 });
                 owned_vector = null; // The bounded batch now owns this result.
                 request_batch_items_pending = true;
@@ -43834,6 +43902,89 @@ test "ordered artifact inventory dense parts hash preserves legacy bytes without
             try std.testing.expectEqual(expected, actual);
         };
     }
+}
+
+test "ordered artifact inventory chunks of an external asset publish from its seeded bytes" {
+    const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
+    const inventory = @import("../artifact_chunk_manifest.zig");
+    const alloc = std.testing.allocator;
+    const Harness = struct {
+        encoded: ?[]u8 = null,
+        calls: usize = 0,
+        fn enqueue(ptr: *anyopaque, _: ordered_publication.Namespace, bytes: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const copy = try std.testing.allocator.dupe(u8, bytes);
+            if (self.encoded) |old| std.testing.allocator.free(old);
+            self.encoded = copy;
+            self.calls += 1;
+        }
+    };
+    var harness: Harness = .{};
+    defer if (harness.encoded) |bytes| alloc.free(bytes);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/external-chunks", .{tmp.sub_path});
+    defer alloc.free(path);
+    const options: db_mod.OpenOptions = .{
+        .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 2 },
+        .online_source_authority = .raft,
+        .primary_backend = .{ .lsm = .{} },
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+        .artifact_publication_dispatcher = .{ .ptr = &harness, .enqueue = Harness.enqueue },
+    };
+    var db = try db_mod.DB.open(alloc, path, options);
+    defer db.close();
+    try db.setSchemaJson(alloc, "{}");
+    // Maintained outside Antfly: only seeds write it, and no producer
+    // publishes a receipt for its consumers to bind to.
+    try db.addEnrichment(.{ .name = "notes", .kind = .asset, .content_type = "text/plain" });
+    try db.addEnrichment(.{ .name = "notes_chunks", .kind = .chunk, .source_artifact_name = "notes", .field = "text", .chunk_size = 8, .chunk_overlap = 0 });
+    try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{\"sources\":[{\"artifact\":\"notes_chunks\"}]}" });
+    try server_test_adapter.applyOrdered(&db, .{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"x\",\"_artifacts\":{\"notes\":{\"value\":\"silver submarine\"}}}" }}, .timestamp_ns = 100 }, .{ .term = 1, .index = 1 });
+    var catalog = try db.artifactInventoryCommand(alloc);
+    defer catalog.catalogs.deinit(alloc);
+    catalog.binding.effect_protocol = 15;
+    try server_test_adapter.applyOrdered(&db, .{ .artifact_catalog = catalog }, .{ .term = 1, .index = 2 });
+    var activation: ordered_publication.Command = .{ .mode = .activate, .namespace = catalog.namespace, .authority_epoch = catalog.binding.epoch, .catalog_digest = catalog.binding.digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) };
+    activation.publication_digest = activation.digest();
+    try server_test_adapter.applyOrdered(&db, .{ .artifact_publication = activation }, .{ .term = 1, .index = 3 });
+
+    try db.reconfigureEnrichmentRuntimePaused(.{ .enable_without_producers = true });
+    const runtime = db.enrichment_runtime orelse return error.TestUnexpectedResult;
+    try std.testing.expect(try runtime.ownership.ensureLease(runtime.clock.nowRealtimeMs()));
+    var plan = try db.core.index_manager.acquireWritePlanSnapshot();
+    defer plan.release();
+    var request = for (plan.plan().generated_templates) |candidate| {
+        if (candidate.kind == .chunk_text and std.mem.eql(u8, candidate.artifact_name, "notes_chunks")) break candidate;
+    } else return error.TestUnexpectedResult;
+    request.doc_key = "doc";
+    var cache: std.ArrayListUnmanaged(WorkerChunkCacheEntry) = .empty;
+    defer freeWorkerChunkCache(runtime.alloc, &cache);
+    var window: GeneratedReplayWindow = .{ .alloc = runtime.alloc };
+    defer window.deinit();
+    // Each round publishes through the ordered log; the consumer observes
+    // the external asset without a producer proof.
+    var index: u64 = 4;
+    var published = false;
+    for (0..4) |_| {
+        processChunkText(runtime, request, &cache, &window, null) catch |err| {
+            if (err != error.ArtifactPublicationPending) return err;
+            var decoded = try @import("../artifact_publication_transport_codec.zig").decodeBorrowed(alloc, harness.encoded.?);
+            defer decoded.deinit();
+            try server_test_adapter.applyOrdered(&db, .{ .artifact_publication = decoded.command }, .{ .term = 1, .index = index });
+            index += 1;
+            continue;
+        };
+        published = true;
+        break;
+    }
+    try std.testing.expect(published);
+    const manifest_key = try inventory.keyAlloc(alloc, "doc", "notes_chunks");
+    defer alloc.free(manifest_key);
+    var read = try db.core.store.beginReadTxn();
+    defer read.abort();
+    try std.testing.expectEqual(@as(u64, 2), (try inventory.Manifest.decode(try read.get(manifest_key))).count);
 }
 
 test "ordered artifact inventory chunk vectors carry unchanged text across unrelated row changes" {

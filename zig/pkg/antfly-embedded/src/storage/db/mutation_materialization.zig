@@ -8446,6 +8446,64 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
         pub const SeededChunkInstall = enum { installed, staged };
 
+        /// Seeded vectors of a staged chunk collection: its chunks publish on
+        /// replay, so this write records the accepted vectors with the chunk
+        /// record staged above and the embedder revision they were accepted
+        /// for (`artifact_seed_chunks.StagedVectors`). The replay worker
+        /// stores them as seeded output instead of embedding those chunks.
+        /// `null` drops the record; the worker embeds every chunk.
+        pub fn recordStagedSeededChunkVectors(
+            alloc: Allocator,
+            db: anytype,
+            request: enrichment_types.GeneratedEnrichmentRequest,
+            chunk_name: []const u8,
+            chunk_items: []const std.json.Value,
+            seed: artifact_seeds.Entry,
+            artifact_writes: anytype,
+            artifact_delete_keys: anytype,
+        ) !artifact_seeds.Result {
+            if (request.kind != .dense_embedding or request.upstream_artifact_name.len != 0) return error.ArtifactSeedNotAccepted;
+            const embedding_name = requestEmbeddingName(request);
+            const key = try artifact_seed_chunks.vectorsKeyAlloc(alloc, request.doc_key, embedding_name);
+            const envelope = switch (seed) {
+                .delete => {
+                    errdefer alloc.free(key);
+                    try artifact_delete_keys.append(alloc, key);
+                    return .{ .outcome = .deleted };
+                },
+                .chunks => {
+                    alloc.free(key);
+                    return error.UnknownArtifactSeed;
+                },
+                .artifact => |value| value,
+            };
+            defer alloc.free(key);
+            try artifact_seeds.rejectSourceHash(envelope.source);
+            const resolved = try seedEmbedder(db, artifact_writes);
+            const generation = try resolved.embedder.captureTextGeneration(alloc, embedding_name);
+            const vectors = try artifact_seeds.decodeChunkVectorsAlloc(alloc, envelope.value, request.expected_dims);
+            defer artifact_seeds.freeChunkVectors(alloc, vectors);
+            // Every vector names a chunk of the staged collection, whole.
+            const fields = try artifact_seeds.decodeChunksAlloc(alloc, chunk_items, null);
+            defer alloc.free(fields);
+            for (vectors) |vector| {
+                if (vector.window_index != null) return error.ArtifactSeedNotAccepted;
+                for (fields) |field| {
+                    if (field.chunk_id == vector.chunk_id) break;
+                } else return error.InvalidArtifactSeed;
+            }
+            const chunk_key = try artifact_seed_chunks.keyAlloc(alloc, request.doc_key, chunk_name);
+            defer alloc.free(chunk_key);
+            const chunk_record = for (artifact_writes.list.items) |write| {
+                if (std.mem.eql(u8, write.key, chunk_key)) break write.value;
+            } else return error.ArtifactSeedNotAccepted;
+            const record = try artifact_seed_chunks.encodeVectorsAlloc(alloc, artifact_seed_chunks.chunkRecordDigest(chunk_record), generation.revision, request.expected_dims, vectors);
+            defer alloc.free(record);
+            try appendPreparedArtifactCopy(alloc, artifact_writes, key, record);
+            try resolved.embedder.requireTextGeneration(alloc, embedding_name, generation);
+            return .{ .outcome = .accepted };
+        }
+
         /// Seeded generic asset. Its state row binds the seed to the same
         /// producer input fingerprint the producer would record.
         pub fn computeSeededAssetRequestDerived(

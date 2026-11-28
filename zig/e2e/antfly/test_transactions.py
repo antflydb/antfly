@@ -1007,6 +1007,82 @@ def test_session_mixed_read_write_delete_commit(stateful_api):
         stateful_api.lookup_key(table_name, "doc:2")
 
 
+def test_multi_batch_carries_artifact_seeds_and_seed_transforms(stateful_api):
+    """A multi-shard 2PC batch prepares and resolves artifact seeds (#1791)."""
+    table_a, table_b = _create_tables(stateful_api, "multi_batch_seeds")
+    for table in (table_a, table_b):
+        # Maintained outside Antfly: only seeds write it.
+        response = stateful_api.s.put(
+            f"{stateful_api.url}/tables/{table}/artifacts/notes/enrichment",
+            json={"kind": "asset", "content_type": "text/plain"},
+            timeout=30,
+        )
+        assert response.ok, response.text
+    stateful_api.batch_write(
+        table_b, inserts={"order:1": {"item": "widget"}}, sync_level="write"
+    )
+
+    result = stateful_api.multi_batch(
+        {
+            table_a: {
+                "inserts": {
+                    "user:1": {
+                        "name": "Alice",
+                        "_artifacts": {"notes": {"value": "prefers email"}},
+                    },
+                    "user:2": {
+                        "name": "Bob",
+                        "_artifacts": {"notes": {"value": "prefers phone"}},
+                    },
+                },
+                "sync_level": "write",
+            },
+            table_b: {
+                # A seed-only transform of an external asset needs no
+                # expected_version: its seeds bind to no input.
+                "transforms": [
+                    _transform(
+                        "order:1",
+                        _op("$set", "_artifacts.notes", {"value": "gift wrap"}),
+                    )
+                ],
+                "sync_level": "write",
+            },
+        }
+    )
+    assert result["tables"][table_a]["inserted"] == 2
+    assert result["tables"][table_b]["transformed"] == 1
+
+    def seeded_note(table: str, key: str):
+        response = stateful_api.s.get(
+            f"{stateful_api.url}/tables/{table}/documents/{quote(key, safe='')}",
+            params={"fields": "_artifacts", "artifact_view": "seed"},
+            timeout=30,
+        )
+        if response.status_code == 404:
+            return None
+        assert response.ok, response.text
+        notes = response.json().get("_artifacts", {}).get("notes")
+        return notes.get("value") if notes else None
+
+    for table, key, expected in (
+        (table_a, "user:1", "prefers email"),
+        (table_a, "user:2", "prefers phone"),
+        (table_b, "order:1", "gift wrap"),
+    ):
+        assert (
+            wait_until(
+                lambda table=table, key=key, expected=expected: (
+                    seeded_note(table, key) == expected
+                ),
+                timeout_s=10.0,
+                interval_s=0.1,
+            )
+            is True
+        ), f"{table}/{key}: {seeded_note(table, key)!r}"
+    assert stateful_api.lookup_key(table_b, "order:1")["item"] == "widget"
+
+
 def _create_table(stateful_api, prefix: str) -> str:
     table_name = f"{prefix}_{time.time_ns()}"
     created = stateful_api.create_table(table_name, num_shards=NUM_SHARDS)
