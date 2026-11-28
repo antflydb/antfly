@@ -21731,12 +21731,27 @@ fn runAudioWithWorkspace(
     scope: *@import("../../execution/stream_workspace.zig").Scope,
     context: *anyopaque,
     inputs: []const CT,
+    original_inputs: []const CT,
     run: *const fn (*anyopaque, []const CT) anyerror!CT,
 ) !CT {
     std.debug.assert(self.execution_scope == null);
     self.execution_scope = scope;
     defer self.execution_scope = null;
-    return run(context, inputs);
+    const output = try run(context, inputs);
+    if (std.mem.indexOfScalar(CT, inputs, output) == null and std.mem.indexOfScalar(CT, original_inputs, output) == null) {
+        // The audio publication owns one F32 span. Projection mirrors are
+        // temporary within this workspace, including any on its final norm.
+        const tensor = tensorFromCt(output);
+        if (tensor.owns_bf16_mirror) {
+            releaseDeviceBuffer(self, &tensor.bf16_mirror);
+            tensor.owns_bf16_mirror = false;
+        }
+        if (tensor.owns_q8_1_mirror) {
+            releaseDeviceBuffer(self, &tensor.q8_1_mirror);
+            tensor.owns_q8_1_mirror = false;
+        }
+    }
+    return output;
 }
 
 fn cachedGroupedAudioWorkspace(ctx: *anyopaque, recipe: CudaCompute.CacheFunding.AudioRecipe) anyerror!?ops.ComputeBackend.AudioWorkspaceDeclaration {
@@ -21922,7 +21937,7 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
         var scope = plan_mod.Scope.observe(plan);
         const h2d_before = self.stats.h2d_bytes;
         const d2h_before = self.stats.d2h_bytes;
-        const out = runAudioWithWorkspace(self, &scope, context, canonical[0..canonical_count], run) catch |err| {
+        const out = runAudioWithWorkspace(self, &scope, context, canonical[0..canonical_count], inputs, run) catch |err| {
             retireUnusableAudioPlan(entry, plan_cleanup, err == error.Cancelled or err == error.Timeout);
             return err;
         };
@@ -22041,7 +22056,7 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
         };
         const h2d_before = self.stats.h2d_bytes;
         const d2h_before = self.stats.d2h_bytes;
-        const result = runAudioWithWorkspace(self, scope, context, stable[0..inputs.len], run) catch |err| {
+        const result = runAudioWithWorkspace(self, scope, context, stable[0..inputs.len], inputs, run) catch |err| {
             if (capture) {
                 graph_mod.discardRecording(&self.ctx);
             }

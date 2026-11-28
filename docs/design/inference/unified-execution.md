@@ -3025,6 +3025,17 @@ recorded one warm execution, one unsealed learning run and five disabled
 plan fallbacks. It recorded zero funding denials and zero learning host
 transfers. The BF16 arm recorded one graph and replayed four times.
 
+Spark inspection identified two live allocations at F32 sealing,
+the published tensor and its BF16 RMS mirror. The audio workspace now
+retires owned mirrors on the callback result before sealing or
+validating the F32 publication. With cuDNN unavailable and mirrors
+enabled, the released F32 checkpoint captured and replayed at widths
+two, three and four. The planned and captured arenas agreed at
+3,672,832, 5,369,344 and 6,991,360 bytes. Replay with changed samples
+matched eager vectors exactly at each width. Five focused checks also
+passed, including the released BF16 checkpoint and borrowed input
+rejection. F32 still learns its workspace schedule.
+
 The Spark serving comparison used the prior grouped-audio server
 from `54b7bbb92d` and the compact-input server with declared graphs on
 both. All 576 measured requests completed and matched output hashes
