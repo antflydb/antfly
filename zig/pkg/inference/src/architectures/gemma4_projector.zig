@@ -1502,12 +1502,6 @@ test "audio cache recipe shares exact execution key and original HF packed names
     };
 }
 
-/// Values are collected under the actual caller's Stage owner, before any
-/// feature/subsample tensor exists. The Stage certifies and retains that owner
-/// and rebuilds backend-dependent requests after every cold admission window.
-pub fn embeddingGemma2AudioCacheRecipe(cb: *const ComputeBackend, prepared: []const *const PreparedAudio) !AudioCacheRecipe {
-    return audioCacheRecipe(cb, embeddingGemma2AudioConfig(), prepared);
-}
 fn audioCacheRecipe(cb: *const ComputeBackend, cfg: AudioConfig, prepared: []const *const PreparedAudio) !AudioCacheRecipe {
     if (cb.kind() != .cuda or prepared.len == 0 or prepared.len > audio_schedule.GroupedRows.max_clips) return error.UnsupportedPreparedAudioCache;
     var recipe = audioCacheConfig(try audioConfigForBackend(cb, cfg));
