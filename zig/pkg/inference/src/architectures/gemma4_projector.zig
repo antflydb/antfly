@@ -2391,25 +2391,28 @@ fn encodeAudioFeatureCohortResidentWithinStorage(cb: *const ComputeBackend, allo
     };
 
     if (cohort and cb.kind() == .metal and !cb.decoderRuntimeHasActiveFrame()) frame = if (pipelined) try Submission.beginPipelined(cb) else try Submission.begin(cb);
-    const output = try audioSourceLinear(cb, allocator, store, cfg, hidden, "a.pre_encode.out", subsampled.seq_len, cfg.audio_hidden, cfg.output_hidden, .row_major, false, true);
-    cb.free(hidden);
-    hidden_live = false;
-    defer cb.free(output);
-    if (@import("builtin").is_test) try embeddingGemma2StageTensor(cb, allocator, "audio_output", output);
-
-    const normed = try audioSourceRms(cb, cfg, output, layer_inputs.ones, subsampled.seq_len, cfg.output_hidden, .contiguous, subsampled.seq_len);
-    defer cb.free(normed);
-    const projection_w = try projectorLinearWeightCt(cb, allocator, store, "mm.a.input_projection.weight", cfg.output_hidden, cfg.text_hidden);
-    const projected = if (cfg.source_scalar_storage == .bf16)
-        (try cb.tryBf16SourceOperation(&.{ .linear = .{
-            .input = normed,
-            .weight = projection_w,
-            .rows = subsampled.seq_len,
-            .width = cfg.output_hidden,
-            .columns = cfg.text_hidden,
-        } })) orelse return error.SourceArithmeticUnavailable
-    else
-        try cb.linearNoBias(normed, projection_w, subsampled.seq_len, cfg.output_hidden, cfg.text_hidden);
+    const projected = project: {
+        const normed = normalize: {
+            const output = try audioSourceLinear(cb, allocator, store, cfg, hidden, "a.pre_encode.out", subsampled.seq_len, cfg.audio_hidden, cfg.output_hidden, .row_major, false, true);
+            cb.free(hidden);
+            hidden_live = false;
+            defer cb.free(output);
+            if (@import("builtin").is_test) try embeddingGemma2StageTensor(cb, allocator, "audio_output", output);
+            break :normalize try audioSourceRms(cb, cfg, output, layer_inputs.ones, subsampled.seq_len, cfg.output_hidden, .contiguous, subsampled.seq_len);
+        };
+        defer cb.free(normed);
+        const projection_w = try projectorLinearWeightCt(cb, allocator, store, "mm.a.input_projection.weight", cfg.output_hidden, cfg.text_hidden);
+        break :project if (cfg.source_scalar_storage == .bf16)
+            (try cb.tryBf16SourceOperation(&.{ .linear = .{
+                .input = normed,
+                .weight = projection_w,
+                .rows = subsampled.seq_len,
+                .width = cfg.output_hidden,
+                .columns = cfg.text_hidden,
+            } })) orelse return error.SourceArithmeticUnavailable
+        else
+            try cb.linearNoBias(normed, projection_w, subsampled.seq_len, cfg.output_hidden, cfg.text_hidden);
+    };
     defer cb.free(projected);
     audioProfileMark(.tail);
     // A contiguous copy owns its destination independently of the frame.
