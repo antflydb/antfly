@@ -21542,15 +21542,18 @@ test "CUDA audio retained views prove publication custody and byte bounds" {
     try std.testing.expect(!audioInputRetainsPublication(&view, &publication, 16));
 }
 
-test "CUDA unusable audio learning drops its owner and preserves retry policy" {
+test "CUDA unusable audio workspace drops its owner and preserves retry policy" {
     const audio = @import("audio_execution_plan.zig");
     for ([_]bool{ false, true }) |retry| {
         var entry: audio.Entry = .{
             .warmed = true,
             .stamp = 1,
             .owner = try audio.Owner.create(std.testing.allocator),
+            .declaration = .{ .source_key = 63, .fingerprint = 19 },
         };
         retireUnusableAudioPlan(&entry, .{}, retry);
+        try std.testing.expectEqual(@as(u64, 63), entry.declaration.?.source_key);
+        try std.testing.expectEqual(@as(u64, 19), entry.declaration.?.fingerprint);
         try std.testing.expect(entry.owner == null and entry.warmed);
         try std.testing.expectEqual(!retry, entry.disabled);
     }
@@ -22154,8 +22157,8 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
                 graph_mod.discardRecording(&self.ctx);
             }
             arena.captureFailed(err);
-            entry.disabled = err != error.Cancelled and err != error.Timeout;
             if (err == error.Cancelled or err == error.Timeout) return err;
+            retireUnusableAudioPlan(entry, plan_cleanup, false);
             if (!capture) return err;
             observation.cudaAudioResult(.capture_callback_declined);
             return null;
@@ -22177,7 +22180,7 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
             freeTensor(self, result);
         }
         if (!matches) {
-            entry.disabled = true;
+            retireUnusableAudioPlan(entry, plan_cleanup, false);
             // The ordinary callback may already have submitted numerical work.
             if (!capture) return error.AudioPlanChanged;
             observation.cudaAudioResult(.capture_layout_declined);
@@ -64689,6 +64692,24 @@ test "CUDA cold audio declaration dispatches before any learning invocation" {
     }
     try std.testing.expect(compute.audio_graph_replays > replay_before);
     try std.testing.expect(!entry.warmed);
+
+    // A separate, deliberately invalid publication exercises the actual
+    // capture rejection path. The failed key keeps only its fingerprint.
+    const Borrowed = struct {
+        fn call(_: *anyopaque, callback_inputs: []const CT) !CT {
+            return callback_inputs[0];
+        }
+    };
+    const rejected_key = cold_key + 1;
+    try std.testing.expect((try audioExecutionOp(&compute, rejected_key, &inputs, @constCast(&cb), Borrowed.call, .{
+        .workspace = workspace,
+    })) == null);
+    const rejected_base = try compute.audioCacheBase(workspace.cacheKey(rejected_key), &geometry, null);
+    const rejected = try compute.audio_plans.getWithCleanup(rejected_base.key, .{});
+    try std.testing.expect(rejected.disabled and rejected.owner == null);
+    try std.testing.expectEqual(rejected_key, rejected.declaration.?.source_key);
+    try std.testing.expectEqual(workspace.fingerprint, rejected.declaration.?.fingerprint);
+    try std.testing.expect(entry.executableFor(bindings) != null);
 }
 
 test "source GEMM row descriptors reject missing physical input before opaque CUDA access" {
