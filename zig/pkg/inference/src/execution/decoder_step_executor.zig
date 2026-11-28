@@ -840,12 +840,34 @@ pub const Executor = struct {
             code.* = value;
             return null;
         }
+        fn pageBindings(
+            manager: *@import("../runtime/kv/manager.zig").KvManager,
+            storage: *@import("../runtime/kv/storage_runtime.zig").KvStorageRuntime,
+            sequence: u32,
+            decline_code: *CudaGraphDecline,
+        ) ?*@import("../runtime/kv/storage_runtime.zig").SequenceState {
+            const owned = storage.sequenceMut(sequence) catch {
+                decline_code.* = .missing_kv_binding;
+                return null;
+            };
+            const managed = manager.sequenceMut(sequence) catch {
+                decline_code.* = .missing_kv_binding;
+                return null;
+            };
+            if (owned.block_table.shared_prefix_blocks != 0 or managed.block_table.shared_prefix_blocks != 0) {
+                decline_code.* = .context_or_page_capacity;
+                return null;
+            }
+            return owned;
+        }
+
         fn build(self: *Executor, key: *Key, claimed: []const runtime.scheduler.native_generate.StepItem, items: []MixedBatchDecodeItem, manager: *@import("../runtime/kv/manager.zig").KvManager, storage: *@import("../runtime/kv/storage_runtime.zig").KvStorageRuntime, embedding_out: *?ops.CT, head_out: *?ops.CT, comptime reserve: bool, decline_code: *CudaGraphDecline) !?Info {
             const C = @import("../ops/cuda/cuda_compute.zig").CudaCompute;
             const attention = @import("../ops/cuda/paged_attention_bf16.zig");
             const graph = @import("../ops/cuda/bounded_decode_graph.zig");
             const page_size = storage.storage.config.page_size_tokens;
             if (page_size == 0) return decline(decline_code, .context_or_page_capacity);
+            if (storage.storage.config.backend != .cuda or storage.storage.config.dtype != .f16) return decline(decline_code, .missing_kv_binding);
             var future: [graph.max_rows]usize = undefined;
             var minimum_packet_blocks: usize = 0;
             var max_future: usize = 0;
@@ -867,10 +889,7 @@ pub const Executor = struct {
                 // Reject a packet that cannot fit before growing either KV owner.
                 if (i % attention.max_packet_rows == 0) minimum_packet_blocks = 0;
                 const sequence = mixed.state.sequence_id.?;
-                const owned = storage.sequenceMut(sequence) catch return decline(decline_code, .missing_kv_binding);
-                const manager_table = manager.blockTable(sequence) orelse return decline(decline_code, .missing_kv_binding);
-                if (owned.block_table.shared_prefix_blocks != 0 or manager_table.shared_prefix_blocks != 0)
-                    return decline(decline_code, .context_or_page_capacity);
+                const owned = pageBindings(manager, storage, sequence, decline_code) orelse return null;
                 if (!reserve and try manager.reservedTokenCapacity(sequence) < future[i])
                     return decline(decline_code, .context_or_page_capacity);
                 const existing = try std.math.add(usize, owned.block_table.blocks.items.len, owned.reserved_tail_blocks.items.len);
@@ -2031,6 +2050,37 @@ test "bounded CUDA decoder reports missing lane ownership before backend access"
     try std.testing.expect(try executor.tryOrderedLightOnCudaDecodeGraph(&.{}, &.{}, &.{}, &decode) == null);
     try std.testing.expectEqual(@as(u64, 1), executor.lighton_graph_attempts);
     try std.testing.expectEqualDeep(observation.CudaDecoderDeclines{ .unsupported_lane_state = 1 }, scope.cuda_decoder_declines.?);
+}
+
+test "captured graph page binding rejects the inactive managed sequence and either shared prefix" {
+    const a = std.testing.allocator;
+    const config: @import("../runtime/kv/pool.zig").KvPoolConfig = .{
+        .backend = .native,
+        .dtype = .f32,
+        .page_size_tokens = 2,
+        .num_kv_heads = 1,
+        .head_dim = 1,
+    };
+    var manager = @import("../runtime/kv/manager.zig").KvManager.init(a);
+    defer manager.deinit();
+    var storage = try @import("../runtime/kv/storage_runtime.zig").KvStorageRuntime.init(a, config);
+    defer storage.deinit();
+    const sequence = try storage.attachSequence(storage.poolId());
+    const pool_id = try manager.addPool(config);
+    try std.testing.expectEqual(sequence, try manager.attachSequence(pool_id));
+    const recipe = Executor.CapturedGraphRecipe;
+    var reason: CudaGraphDecline = .admission_or_revalidation;
+    const owned = recipe.pageBindings(&manager, &storage, sequence, &reason).?;
+    const managed = try manager.sequenceMut(sequence);
+    for ([_]*u32{ &owned.block_table.shared_prefix_blocks, &managed.block_table.shared_prefix_blocks }) |prefix| {
+        prefix.* = 1;
+        defer prefix.* = 0;
+        try std.testing.expect(recipe.pageBindings(&manager, &storage, sequence, &reason) == null);
+        try std.testing.expectEqual(CudaGraphDecline.context_or_page_capacity, reason);
+    }
+    try manager.releaseSequence(sequence);
+    try std.testing.expect(recipe.pageBindings(&manager, &storage, sequence, &reason) == null);
+    try std.testing.expectEqual(CudaGraphDecline.missing_kv_binding, reason);
 }
 
 test "captured graph recipe compares every rebuilt key word without a second key buffer" {
