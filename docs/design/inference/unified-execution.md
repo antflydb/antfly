@@ -3293,6 +3293,30 @@ guard, the foreign Metal encoder handoff without host transport, and
 the mixed reader workspace bounds. This cohort qualifies the listed
 paths for correctness and ownership.
 
+### Current HTTP comparison on M4 Max at `e540d5ff64`
+
+The production Metal server was compared with the frozen issue baseline
+`9e4af7f847`. The restored fixture archive and baseline binary matched
+the earlier SHA-256 receipts. Each phase measured 16 requests per side
+after three warmups per arm. The eight workloads below matched output
+hashes across all AA, ABBA and BB controls.
+
+| Workload | Baseline p50 / p95 (ms) | Candidate p50 / p95 (ms) |
+| --- | ---: | ---: |
+| Whisper Small | 492.37 / 494.56 | 373.47 / 377.57 |
+| EmbeddingGemma 2 text | 10.99 / 11.23 | 11.15 / 11.39 |
+| EmbeddingGemma 2 grouped audio | 39.77 / 43.26 | 36.67 / 41.38 |
+| LightOnOCR-3-0.8B | 353.50 / 358.92 | 353.60 / 355.93 |
+| GLiNER 2.5 | 9.79 / 10.08 | 9.73 / 10.33 |
+| DECIDE | 30.37 / 30.91 | 30.76 / 31.39 |
+| Qwen3 | 864.00 / 872.56 | 852.99 / 865.12 |
+| Gemma 4 E4B video | 1,049.55 / 1,051.21 | 709.04 / 711.68 |
+
+The frozen baseline returned retryable capacity errors for Gemma 4 E4B
+text, image and audio in all six baseline arms of the mixed workload.
+The candidate completed those cases. The mixed run provides no paired
+latency for those three modalities.
+
 ### Released Inkling Metal checkpoint at `7f0ff56ff8`
 
 Five focused checks passed on M4 Max with zero skips. The released
