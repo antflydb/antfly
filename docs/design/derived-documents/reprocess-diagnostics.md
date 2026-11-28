@@ -34,8 +34,11 @@ GET /db/v1/tables/{table}/documents/{key}/artifacts/{artifact}
 For a specific attempt, the existing source-fetch log includes the document key
 (prefix limited to 256 bytes), producer, replay sequence, and target generation.
 The log omits the source URL. The accepted sequence also appears on explicit
-retry deferral and publication interruption events. Check the repair ledger for
-terminal failures.
+retry deferral and publication interruption events. Each publication window
+checks the source captured by extraction. If the source was replaced while a
+fetch was running, the old output cannot complete the receipt. Replay can
+publish the extraction of the replacement source. Check the repair ledger
+for terminal failures.
 An extraction timeout reason on the published generation identifies the reported
 stage for that generation.
 

@@ -21909,6 +21909,18 @@ fn processDocumentExtractionAsset(
         )) return;
     }
 
+    // Capture the physical source authority before external work. Relational
+    // inputs use logical JSON for inference and packed bytes for the write
+    // fence. Both digests must describe the same observed source.
+    const observed = (try ScopedReplay.stampFor(runtime, request, sourceRecordDigest(raw_doc))) orelse return error.EnrichmentSourceChanged;
+    const primary_key = try documentSourceStoreKeyAlloc(runtime, request.doc_key);
+    defer runtime.alloc.free(primary_key);
+    const source_guard = GeneratedSourceGuard{
+        .key = primary_key,
+        .expected_digest = observed.digest,
+        .document_key = request.doc_key,
+        .source_sequence = request.sequence,
+    };
     // Past this point the declared digest (if any) did not already prove
     // this extraction unnecessary: the source is about to be fetched for
     // real. Logged (not just counted) so a real run can confirm a provider
@@ -22596,7 +22608,7 @@ fn processDocumentExtractionAsset(
     // thread constraint.
     const publication_result: anyerror!void = blk: {
         extraction_lease_guard.check() catch |err| break :blk err;
-        publication_spool.replay(runtime, window, max_window_items, &resource_tracker) catch |err|
+        publication_spool.replay(runtime, window, max_window_items, &resource_tracker, source_guard) catch |err|
             break :blk scope.publicationFailure(err);
         break :blk scope.publish(runtime, window, false);
     };
@@ -29231,9 +29243,11 @@ const RuntimeDocumentPublicationSpool = struct {
         window: *GeneratedReplayWindow,
         max_window_items: usize,
         resource_tracker: *RuntimeDocumentExtractionResourceTracker,
+        source_guard: GeneratedSourceGuard,
     ) !void {
         try self.seal();
         var record_index: u64 = 0;
+        var needs_source_guard = true;
         while (record_index < self.record_count) {
             var segment = try self.readReplaySegment(runtime.alloc, resource_tracker.manager, record_index);
             defer segment.deinit();
@@ -29245,6 +29259,10 @@ const RuntimeDocumentPublicationSpool = struct {
             // run. Process the owned segment in order and preserve the same
             // bounded publication-window semantics as the old record loop.
             for (segment.items) |*item| {
+                if (needs_source_guard) {
+                    try appendGeneratedSourceGuard(runtime, window, source_guard.key, source_guard.expected_digest, source_guard.document_key, source_guard.source_sequence);
+                    needs_source_guard = false;
+                }
                 switch (item.record.value.action) {
                     .upsert => try appendRuntimeDocumentPublicationUpsert(
                         runtime.alloc,
@@ -29268,6 +29286,7 @@ const RuntimeDocumentPublicationSpool = struct {
                     // Publication can succeed while later OCR pages fail.
                     // Only the enclosing request lane may retire retry debt.
                     try flushGeneratedReplayWindowWithIdentity(runtime, window, 0);
+                    needs_source_guard = true;
                     // reserveAdditional is conservative while a window is being
                     // assembled. Reconcile after every durable flush so a large
                     // document is bounded by one window rather than accumulating
