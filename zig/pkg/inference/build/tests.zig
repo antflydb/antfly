@@ -490,7 +490,8 @@ pub fn addDefault(ctx: Context, suite: Suite, checks: Checks) *std.Build.Step {
     var microbatch_imports = suite.tests.root_module.import_table.iterator();
     while (microbatch_imports.next()) |entry| microbatch_root.addImport(entry.key_ptr.*, entry.value_ptr.*);
     microbatch_root.link_libc = true;
-    // Native ARM macOS peaks: ReleaseSafe CPU 5,713,297,408 bytes and Metal
+    // Native ARM macOS peaks: Debug Metal 5,225,381,888 bytes,
+    // ReleaseSafe CPU 5,713,297,408 bytes and Metal
     // 7,442,055,168 bytes, ReleaseFast CPU 5,376,081,920 bytes and Metal
     // 6,102,368,256 bytes.
     // Native ARM Linux ReleaseFast CUDA peaked at 10,340,761,600 bytes.
@@ -501,7 +502,9 @@ pub fn addDefault(ctx: Context, suite: Suite, checks: Checks) *std.Build.Step {
     const measured_microbatch_spark = b.graph.host.result.os.tag == .linux and b.graph.host.result.cpu.arch == .aarch64 and
         ctx.target.result.os.tag == .linux and ctx.target.result.cpu.arch == .aarch64 and
         ctx.backend.enable_cuda and !ctx.backend.enable_metal and !ctx.backend.enable_pjrt and ctx.optimize == .fast;
-    const microbatch_compile_mib: usize = if (measured_microbatch_macos and ctx.optimize == .safe)
+    const microbatch_compile_mib: usize = if (measured_microbatch_macos and ctx.optimize == .debug and ctx.backend.enable_metal)
+        5504
+    else if (measured_microbatch_macos and ctx.optimize == .safe)
         if (ctx.backend.enable_metal) 7808 else 6016
     else if (measured_microbatch_macos and ctx.optimize == .fast)
         if (ctx.backend.enable_metal) 6528 else 5760
