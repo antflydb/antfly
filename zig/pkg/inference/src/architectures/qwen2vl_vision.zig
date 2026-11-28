@@ -254,7 +254,8 @@ fn patchEmbed(
     const patch_dim = 3 * temporal_patch_size * patch_size * patch_size;
     if (trace_enabled) stage_start_ns = try nowNs();
     const patch_shape = [_]i32{ @intCast(seq_len), @intCast(patch_dim) };
-    const patch_ct = try cb.fromFloat32Shape(patch_rows, &patch_shape);
+    // Patch rows remain live through the projection and tensor release.
+    const patch_ct = try cb.fromBorrowedFloat32Shape(patch_rows, &patch_shape);
     defer cb.free(patch_ct);
     if (trace_enabled) {
         std.debug.print("vision_trace stage=patch_embed.from_input elapsed_ms={d}\n", .{nsToMs(try elapsedSince(stage_start_ns))});
@@ -269,6 +270,7 @@ fn patchEmbed(
         try cb.primReshape(patch_w, &.{ @intCast(embed_dim), @intCast(patch_dim) });
     defer cb.free(weight_ct);
     const out = try cb.linearNoBias(patch_ct, weight_ct, seq_len, patch_dim, embed_dim);
+    errdefer cb.free(out);
     if (trace_enabled) {
         std.debug.print("vision_trace stage=patch_embed.linear elapsed_ms={d}\n", .{nsToMs(try elapsedSince(stage_start_ns))});
     }

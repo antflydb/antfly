@@ -922,7 +922,7 @@ fn embedSpatialPatchRows(cb: *const ComputeBackend, allocator: std.mem.Allocator
         defer cb.free(input);
         return cb.linear(input, weight, bias, geometry.patchCount(), patch_dim * 2, cfg.vision_hidden);
     }
-    const input = try cb.fromFloat32Shape(patches, &.{ @intCast(geometry.patchCount()), @intCast(patch_dim) });
+    const input = try cb.fromBorrowedFloat32Shape(patches, &.{ @intCast(geometry.patchCount()), @intCast(patch_dim) });
     defer cb.free(input);
     const w0 = try weights.patch("v.patch_embd.weight", cfg);
     const w1 = try weights.patch("v.patch_embd.weight.1", cfg);

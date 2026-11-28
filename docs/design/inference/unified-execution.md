@@ -461,6 +461,12 @@ preparation API do not by themselves complete these remaining requirements:
   and the prepared image keeps cleanup responsibility if shape allocation
   fails. Four focused checks passed, including pointer identity at the
   session callback, allocation failure and Native/Metal output parity.
+  Qwen2-VL and the Qwen3-VL split patch projection now borrow their
+  host patch rows through the shared compute input contract on Native.
+  The patch row owner outlives the input handle and projection call.
+  Six focused checks passed, including the Native no-copy contract,
+  actual ColQwen projection parity on Native and Metal, and allocation
+  failure and cancellation cleanup.
 
 - Imported ONNX and architecture graphs share the bounded specialization owner
   in `execution/specialization_cache.zig`, with stable executable handles,
