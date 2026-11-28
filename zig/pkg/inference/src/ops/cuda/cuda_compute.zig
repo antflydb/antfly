@@ -21210,7 +21210,7 @@ fn audioInputStamp(tensor: *const CudaTensor) ?AudioArena.AudioInputStamp {
     return .{ .allocation = owner.buffer.allocation_token orelse return null, .address = owner.buffer.ptr };
 }
 
-fn stageAudioGraphInputs(self: *CudaCompute, arena: *AudioArena, input_bank: buffer_mod.DeviceBuffer, inputs: []const CT, spans: []const CudaCompute.AudioInputSpan) !void {
+fn stageAudioGraphInputs(self: *CudaCompute, arena: *AudioArena, input_bank: buffer_mod.DeviceBuffer, inputs: []const CT, spans: []const CudaCompute.AudioInputSpan) !@import("../../execution/runtime_observation.zig").AudioInputStaging {
     // The caller proves every source is outside the arena and the placement
     // gives each destination a separate slice. A batch has no internal order.
     var next_stamps = arena.audio_staged_inputs;
@@ -21221,7 +21221,7 @@ fn stageAudioGraphInputs(self: *CudaCompute, arena: *AudioArena, input_bank: buf
     var sources: [CudaCompute.AudioPlan.max_inputs]driver_mod.CUdeviceptr = undefined;
     var sizes: [CudaCompute.AudioPlan.max_inputs]usize = undefined;
     var count: usize = 0;
-    var bytes: usize = 0;
+    var receipt: @import("../../execution/runtime_observation.zig").AudioInputStaging = .{};
     for (inputs, spans, 0..) |ct, span, index| {
         const tensor = tensorFromCt(ct);
         const stamp = if (span.bytes == 0) null else audioInputStamp(tensor);
@@ -21230,7 +21230,9 @@ fn stageAudioGraphInputs(self: *CudaCompute, arena: *AudioArena, input_bank: buf
             sources[count] = tensor.buffer.ptr;
             sizes[count] = span.bytes;
             count += 1;
-            bytes += span.bytes;
+            receipt.copied_bytes += span.bytes;
+        } else {
+            receipt.reused_bytes += span.bytes;
         }
         next_stamps[index] = stamp;
     }
@@ -21238,7 +21240,7 @@ fn stageAudioGraphInputs(self: *CudaCompute, arena: *AudioArena, input_bank: buf
         try self.ctx.makeCurrent();
         const submit = if (self.ctx.stream != null and count > 1) self.ctx.driver.fns.cuMemcpyBatchAsync else null;
         if (submit) |copy| {
-            try submitUnorderedDeviceCopies(self, copy, destinations[0..count], sources[0..count], sizes[0..count], bytes);
+            try submitUnorderedDeviceCopies(self, copy, destinations[0..count], sources[0..count], sizes[0..count], receipt.copied_bytes);
         } else {
             for (destinations[0..count], sources[0..count], sizes[0..count]) |destination_ptr, source_ptr, size| {
                 const destination: buffer_mod.DeviceBuffer = .{ .ptr = destination_ptr, .len = size };
@@ -21249,6 +21251,7 @@ fn stageAudioGraphInputs(self: *CudaCompute, arena: *AudioArena, input_bank: buf
         }
     }
     arena.audio_staged_inputs = next_stamps;
+    return receipt;
 }
 
 test "CUDA audio graph staging refreshes mutable inputs and retains completed constants" {
@@ -21273,11 +21276,17 @@ test "CUDA audio graph staging refreshes mutable inputs and retains completed co
     var arena: AudioArena = .{ .kind = .audio };
     const spans = [_]CudaCompute.AudioInputSpan{ .{ .bytes = span }, .{ .offset = alignment, .bytes = span } };
     const start = compute.stats.d2d_bytes;
-    try stageAudioGraphInputs(&compute, &arena, bank, &.{ input, constant }, &spans);
+    const first = try stageAudioGraphInputs(&compute, &arena, bank, &.{ input, constant }, &spans);
+    try std.testing.expectEqual(2 * span, first.copied_bytes);
+    try std.testing.expectEqual(@as(usize, 0), first.reused_bytes);
     try std.testing.expectEqual(start + 2 * span, compute.stats.d2d_bytes);
-    try stageAudioGraphInputs(&compute, &arena, bank, &.{ replacement, constant }, &spans);
+    const reused = try stageAudioGraphInputs(&compute, &arena, bank, &.{ replacement, constant }, &spans);
+    try std.testing.expectEqual(span, reused.copied_bytes);
+    try std.testing.expectEqual(span, reused.reused_bytes);
     try std.testing.expectEqual(start + 3 * span, compute.stats.d2d_bytes);
-    try stageAudioGraphInputs(&compute, &arena, bank, &.{ replacement, new_constant }, &spans);
+    const replaced = try stageAudioGraphInputs(&compute, &arena, bank, &.{ replacement, new_constant }, &spans);
+    try std.testing.expectEqual(2 * span, replaced.copied_bytes);
+    try std.testing.expectEqual(@as(usize, 0), replaced.reused_bytes);
     try std.testing.expectEqual(start + 5 * span, compute.stats.d2d_bytes);
     var result: [2]f32 = undefined;
     for (spans) |copy| {
@@ -21615,10 +21624,11 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
             };
         }
     }
+    var staged_inputs: ?observation.AudioInputStaging = null;
     if (replay or capture) {
         // Capture only records the stable addresses. Stage bytes after a
         // successful recording and immediately before the common launch.
-        try stageAudioGraphInputs(self, arena, input_bank, inputs, spans);
+        staged_inputs = try stageAudioGraphInputs(self, arena, input_bank, inputs, spans);
         try arena.launch(&self.ctx);
         if (replay) self.audio_graph_replays += 1;
     }
@@ -21642,6 +21652,7 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
         .repacked_scratch_savings_bytes = if (storage.external_output) plan.external_scratch_savings_bytes else 0,
         .bound_arena_bytes = arena.buffers[0].len,
         .bound_input_bytes = input_bank.len,
+        .staged_inputs = staged_inputs,
         .planned_terminal_bytes = output.bytes,
         .bound_terminal_bytes = output_bank.len,
         .terminal_outside_arena = published_directly or storage.external_output,
@@ -63035,6 +63046,14 @@ test "public source audio linear recreates input bank through actual learning ca
             try std.testing.expect(workspace.planned_terminal_bytes <= workspace.bound_terminal_bytes);
             if (iteration == 3 or iteration == 6) try std.testing.expect(workspace.bound_input_bytes != 0);
             if (iteration == 4 or iteration == 5) try std.testing.expectEqual(@as(usize, 0), workspace.bound_input_bytes);
+            if (expected_workspace_route == .eager_assigned) {
+                try std.testing.expect(workspace.staged_inputs == null);
+            } else {
+                const staged = workspace.staged_inputs orelse return error.TestUnexpectedResult;
+                const expected_bytes = (tensorFromCt(projected).elem_count + tensorFromCt(identity).elem_count) * @sizeOf(f32);
+                try std.testing.expectEqual(expected_bytes, staged.copied_bytes);
+                try std.testing.expectEqual(@as(usize, 0), staged.reused_bytes);
+            }
         } else try std.testing.expect(workspace_observation.cuda_audio_workspace == null);
         if (iteration == 2) {
             try std.testing.expectEqual(ordinary_pointer, compute.source_linear_scratch.buffer.ptr);

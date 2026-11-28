@@ -475,9 +475,17 @@ pub const CudaAudioWorkspace = struct {
     repacked_scratch_savings_bytes: usize,
     bound_arena_bytes: usize,
     bound_input_bytes: usize,
+    /// Logical bytes copied or reused for the accepted graph launch.
+    /// Eager assigned execution borrows its caller inputs.
+    staged_inputs: ?AudioInputStaging = null,
     planned_terminal_bytes: usize,
     bound_terminal_bytes: usize,
     terminal_outside_arena: bool,
+};
+
+pub const AudioInputStaging = struct {
+    copied_bytes: usize = 0,
+    reused_bytes: usize = 0,
 };
 
 pub inline fn cudaAudioWorkspace(workspace: CudaAudioWorkspace) void {
