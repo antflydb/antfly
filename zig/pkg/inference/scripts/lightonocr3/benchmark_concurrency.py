@@ -90,6 +90,18 @@ def retirement_capacity_retries(text):
     ]
 
 
+def graph_recording_terminals(text):
+    return [
+        dict(eos_rows=int(eos), rows=int(rows), minimum_remaining_tokens=int(remaining))
+        for eos, rows, remaining in re.findall(
+            r"^LIGHTONOCR3 cuda_model_graph_recorded_eos_rows=(\d+) "
+            r"rows=(\d+) minimum_remaining_tokens=(\d+)$",
+            text,
+            re.MULTILINE,
+        )
+    ]
+
+
 def graph_retirements(text):
     return [
         dict(
@@ -755,6 +767,8 @@ def run(args, model, label, mode, concurrency, output):
                         default=0,
                     )
                     sample["model_graph_max_declared_replay_rows"] = max_declared_rows
+                    if recordings := graph_recording_terminals(section):
+                        sample["model_graph_recording_terminals"] = recordings
                     if retirements := graph_retirements(section):
                         sample["model_graph_retirements"] = retirements
                         sample["recorded_graphs_retired_before_completed_replay"] = [

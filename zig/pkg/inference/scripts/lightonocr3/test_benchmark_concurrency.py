@@ -21,6 +21,7 @@ from benchmark_concurrency import (
     apply_token_burst_overrides,
     graph_first_replays,
     graph_funding_denials,
+    graph_recording_terminals,
     graph_retirements,
     recurrent_placement_observation,
     retirement_capacity_retries,
@@ -56,6 +57,22 @@ class GraphFundingTests(unittest.TestCase):
 
 
 class GraphReplayTests(unittest.TestCase):
+    def test_recording_terminal_receipts_distinguish_zero_from_absent(self):
+        self.assertEqual(graph_recording_terminals("older reader"), [])
+        text = (
+            "LIGHTONOCR3 cuda_model_graph_recorded_eos_rows=0 rows=113 "
+            "minimum_remaining_tokens=101\n"
+            "LIGHTONOCR3 cuda_model_graph_recorded_eos_rows=3 rows=29 "
+            "minimum_remaining_tokens=78\n"
+        )
+        self.assertEqual(
+            graph_recording_terminals(text),
+            [
+                dict(eos_rows=0, rows=113, minimum_remaining_tokens=101),
+                dict(eos_rows=3, rows=29, minimum_remaining_tokens=78),
+            ],
+        )
+
     def test_distinguishes_dense_fused_and_uninstrumented_scratch(self):
         prefix = "LIGHTONOCR3 cuda_model_graph_first_replay_rows="
         text = "\n".join(
