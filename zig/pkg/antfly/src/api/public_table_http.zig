@@ -2856,6 +2856,7 @@ pub fn handleDocumentArtifactManifest(
         last_error_message: ?[]const u8,
         manifest_json: ?[]const u8 = null,
         state_json: ?[]const u8,
+        reprocess: ?db_mod.types.DocumentArtifactReprocessStatus,
     };
     const child_ranges = try alloc.alloc(ChildRangeResponse, manifest.child_ranges.len);
     defer alloc.free(child_ranges);
@@ -2907,7 +2908,8 @@ pub fn handleDocumentArtifactManifest(
             .merge_operation_count = manifest.merge_operation_count,
             .last_error_code = manifest.last_error_code,
             .last_error_message = manifest.last_error_message,
-            .manifest_json = if (opts.detail == .raw) manifest.manifest_json else null,
+            .reprocess = manifest.reprocess,
+            .manifest_json = if (opts.detail == .raw and (manifest.manifest_json.len != 0 or manifest.reprocess == null)) manifest.manifest_json else null,
             .state_json = if (opts.detail == .raw) manifest.state_json else null,
         }, .{ .emit_null_optional_fields = false }),
     };
@@ -6630,6 +6632,7 @@ test "public document artifact manifest handler returns summary and raw state" {
                 .child_range_count = 1,
                 .merge_status = alloc.dupe(u8, "converged") catch return error.InternalFailure,
                 .merge_operation_count = 4,
+                .reprocess = .{ .requested_generation = 8, .status = .pending },
             };
         }
 
@@ -6695,6 +6698,7 @@ test "public document artifact manifest handler returns summary and raw state" {
         unit_count: usize,
         manifest_json: []const u8,
         state_json: ?[]const u8,
+        reprocess: db_mod.types.DocumentArtifactReprocessStatus,
     };
     var parsed = try std.json.parseFromSlice(Parsed, std.testing.allocator, resp.body, .{
         .ignore_unknown_fields = true,
@@ -6704,6 +6708,8 @@ test "public document artifact manifest handler returns summary and raw state" {
     try std.testing.expectEqual(@as(u16, 200), resp.status);
     try std.testing.expectEqualStrings("doc:a", parsed.value.document_id);
     try std.testing.expectEqual(@as(u64, 7), parsed.value.generation);
+    try std.testing.expectEqual(@as(u64, 8), parsed.value.reprocess.requested_generation);
+    try std.testing.expectEqual(.pending, parsed.value.reprocess.status);
     try std.testing.expectEqualStrings("text", parsed.value.route_type);
     try std.testing.expectEqual(@as(usize, 2), parsed.value.unit_count);
     try std.testing.expectEqualStrings("{\"manifest_version\":2}", parsed.value.manifest_json);

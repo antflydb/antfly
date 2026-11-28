@@ -403,6 +403,9 @@ from .document_artifact_reprocess_job_start_request_selection import DocumentArt
 from .document_artifact_reprocess_response import DocumentArtifactReprocessResponse
 from .document_artifact_reprocess_response_reprocess import DocumentArtifactReprocessResponseReprocess
 from .document_artifact_reprocess_shard_cursor import DocumentArtifactReprocessShardCursor
+from .document_artifact_reprocess_status import DocumentArtifactReprocessStatus
+from .document_artifact_reprocess_status_status import DocumentArtifactReprocessStatusStatus
+from .document_artifact_reprocess_worker import DocumentArtifactReprocessWorker
 from .document_artifact_table_reprocess_request import DocumentArtifactTableReprocessRequest
 from .document_artifact_table_reprocess_request_selection import DocumentArtifactTableReprocessRequestSelection
 from .document_artifact_table_reprocess_response import DocumentArtifactTableReprocessResponse
@@ -3244,6 +3247,9 @@ __all__ = (
     "DocumentArtifactReprocessResponse",
     "DocumentArtifactReprocessResponseReprocess",
     "DocumentArtifactReprocessShardCursor",
+    "DocumentArtifactReprocessStatus",
+    "DocumentArtifactReprocessStatusStatus",
+    "DocumentArtifactReprocessWorker",
     "DocumentArtifactTableReprocessRequest",
     "DocumentArtifactTableReprocessRequestSelection",
     "DocumentArtifactTableReprocessResponse",

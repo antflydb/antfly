@@ -1091,6 +1091,25 @@ pub const DocumentArtifactChildRangePlacementUpdate = struct {
     split_eligible: ?bool = null,
 };
 
+/// Durable intent read alongside the currently published artifact. Worker
+/// progress is scoped to the owning shard and is sampled independently.
+pub const DocumentArtifactReprocessStatus = struct {
+    pub const Worker = struct {
+        scanned_sequence: u64,
+        applied_sequence: u64,
+        target_sequence: u64,
+        retry_queue_full: bool,
+        retrying: bool,
+        next_retry_at_ms: ?u64,
+        failed: bool,
+        background_running: bool,
+    };
+
+    requested_generation: u64,
+    status: enum { pending, published, superseded },
+    worker: ?Worker = null,
+};
+
 pub const DocumentArtifactManifest = struct {
     document_id: []u8,
     artifact_name: []u8,
@@ -1121,6 +1140,8 @@ pub const DocumentArtifactManifest = struct {
     merge_operation_count: usize = 0,
     last_error_code: ?[]u8 = null,
     last_error_message: ?[]u8 = null,
+
+    reprocess: ?DocumentArtifactReprocessStatus = null,
 
     pub fn deinit(self: *DocumentArtifactManifest, alloc: Allocator) void {
         alloc.free(self.document_id);

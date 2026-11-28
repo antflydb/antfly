@@ -799,6 +799,16 @@ pub const resource_manager_layout = blk: {
     @setEvalBranchQuota(100_000);
     break :blk native.TypeContract.of(@import("resource_manager.zig").ResourceManager);
 };
+const pipeline_metrics = @import("antfly_platform").document_pipeline_metrics;
+
+extern fn antfly_storage_engine_pipeline_metrics_v1(out: *pipeline_metrics.Snapshot) callconv(.c) void;
+
+pub fn pipelineMetricsSnapshot() pipeline_metrics.Snapshot {
+    var snapshot: pipeline_metrics.Snapshot = undefined;
+    antfly_storage_engine_pipeline_metrics_v1(&snapshot);
+    return snapshot;
+}
+
 extern fn antfly_storage_engine_get_descriptor_v37() callconv(.c) *const Descriptor;
 fn Result(comptime name: []const u8) type {
     const Function = @typeInfo(@FieldType(VTable, name)).pointer.child;

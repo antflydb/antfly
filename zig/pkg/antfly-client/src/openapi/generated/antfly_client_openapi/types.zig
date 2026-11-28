@@ -12984,6 +12984,7 @@ pub const DocumentArtifactManifest = struct {
     last_error_code: OpenApiOptionalNullable([]const u8) = .absent,
     /// Human-readable last extraction or materialization error summary, when available.
     last_error_message: OpenApiOptionalNullable([]const u8) = .absent,
+    reprocess: ?DocumentArtifactReprocessStatus = null,
     /// Opaque JSON manifest for the artifact units and provenance. Present only for raw detail responses. Newly produced document-extraction generations include the declared execution policy under execution, including on failed generations; it is not a measured provider budget. Older manifests may omit it.
     manifest_json: ?[]const u8 = null,
     /// Optional opaque JSON state for incremental processing. Present only for raw detail responses.
@@ -13018,6 +13019,7 @@ pub const DocumentArtifactManifest = struct {
         .{ "merge_operation_count", "merge_operation_count", false },
         .{ "last_error_code", "last_error_code", false },
         .{ "last_error_message", "last_error_message", false },
+        .{ "reprocess", "reprocess", true },
         .{ "manifest_json", "manifest_json", true },
         .{ "state_json", "state_json", false },
     };
@@ -13124,6 +13126,10 @@ pub const DocumentArtifactManifest = struct {
                 try jw.objectField("last_error_message");
                 try jw.write(value);
             },
+        }
+        if (self.reprocess) |value| {
+            try jw.objectField("reprocess");
+            try jw.write(value);
         }
         if (self.manifest_json) |value| {
             try jw.objectField("manifest_json");
@@ -13423,6 +13429,106 @@ pub const DocumentArtifactReprocessShardCursor = struct {
         try jw.write(self.failed);
         try jw.objectField("limit");
         try jw.write(self.limit);
+        try jw.endObject();
+    }
+};
+
+/// Latest explicit native document-extraction reprocess intent for this artifact. Present on single-artifact inspection when an intent exists. When the first publication is pending, the summary has generation zero and no raw manifest.
+pub const DocumentArtifactReprocessStatus = struct {
+    /// Target generation recorded by the accepted request.
+    requested_generation: u64,
+    /// Pending is an unfulfilled intent. Published means the target generation is visible and can itself contain extraction failures. Superseded means the intent no longer matches the configured producer.
+    status: []const u8,
+    worker: ?DocumentArtifactReprocessWorker = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "requested_generation", "requested_generation", false },
+        .{ "status", "status", false },
+        .{ "worker", "worker", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("requested_generation");
+        try jw.write(self.requested_generation);
+        try jw.objectField("status");
+        try jw.write(self.status);
+        if (self.worker) |value| {
+            try jw.objectField("worker");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Sample of the owning shard's enrichment worker, when present. The worker services multiple documents and producers. Sequence values use the shard's enrichment replay sequence space.
+pub const DocumentArtifactReprocessWorker = struct {
+    /// Replay scan watermark, which can run ahead of the contiguous applied watermark while requests wait.
+    scanned_sequence: u64,
+    /// Contiguous applied enrichment watermark.
+    applied_sequence: u64,
+    /// Latest enrichment replay watermark requested of the worker.
+    target_sequence: u64,
+    /// Whether parked requests have filled the worker's bounded retry queue.
+    retry_queue_full: bool,
+    /// Whether the worker has retry work.
+    retrying: bool,
+    /// Unix timestamp in milliseconds for the worker's next scheduled retry, when available. This is shard-wide.
+    next_retry_at_ms: ?u64 = null,
+    /// Whether the shard's worker has failed.
+    failed: bool,
+    /// Whether a background worker has started. Embedded callers can also drive replay inline.
+    background_running: bool,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "scanned_sequence", "scanned_sequence", false },
+        .{ "applied_sequence", "applied_sequence", false },
+        .{ "target_sequence", "target_sequence", false },
+        .{ "retry_queue_full", "retry_queue_full", false },
+        .{ "retrying", "retrying", false },
+        .{ "next_retry_at_ms", "next_retry_at_ms", true },
+        .{ "failed", "failed", false },
+        .{ "background_running", "background_running", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("scanned_sequence");
+        try jw.write(self.scanned_sequence);
+        try jw.objectField("applied_sequence");
+        try jw.write(self.applied_sequence);
+        try jw.objectField("target_sequence");
+        try jw.write(self.target_sequence);
+        try jw.objectField("retry_queue_full");
+        try jw.write(self.retry_queue_full);
+        try jw.objectField("retrying");
+        try jw.write(self.retrying);
+        if (self.next_retry_at_ms) |value| {
+            try jw.objectField("next_retry_at_ms");
+            try jw.write(value);
+        }
+        try jw.objectField("failed");
+        try jw.write(self.failed);
+        try jw.objectField("background_running");
+        try jw.write(self.background_running);
         try jw.endObject();
     }
 };

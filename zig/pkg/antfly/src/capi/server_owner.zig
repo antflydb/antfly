@@ -10341,6 +10341,7 @@ pub fn storageOwnerPipelineMetricsJson(context: ?*anyopaque, version: u32, out_j
     _ = asStorageOwnerContext(context) orelse return .invalid_argument;
     const metrics = @import("antfly_platform").document_pipeline_metrics;
     var snapshot = metrics.snapshot();
+    antfly.db.DB.mergePhysicalPipelineMetrics(&snapshot) catch return .invalid_abi;
     // Native PDF compute belongs to another compiled unit. Read its counters
     // through its owning ABI, never through a host-side duplicate global.
     if (comptime !builtin.is_test) {

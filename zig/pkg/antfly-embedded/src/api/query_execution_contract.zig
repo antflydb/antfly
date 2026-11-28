@@ -3202,6 +3202,7 @@ pub const RemoteDocumentArtifactManifest = struct {
     merge_operation_count: usize = 0,
     last_error_code: ?[]const u8 = null,
     last_error_message: ?[]const u8 = null,
+    reprocess: ?db_mod.types.DocumentArtifactReprocessStatus = null,
     manifest_json: []const u8,
     state_json: ?[]const u8 = null,
 };
@@ -3311,6 +3312,7 @@ pub fn remoteDocumentArtifactManifestAlloc(alloc: std.mem.Allocator, remote: Rem
         .merge_operation_count = remote.merge_operation_count,
         .last_error_code = last_error_code,
         .last_error_message = last_error_message,
+        .reprocess = remote.reprocess,
     };
 }
 
@@ -3319,6 +3321,17 @@ pub fn parseStorageKernelDocumentArtifactManifestResponse(alloc: std.mem.Allocat
     defer parsed.deinit();
 
     return try remoteDocumentArtifactManifestAlloc(alloc, parsed.value);
+}
+
+test "storage artifact inspection carries the reprocess intent across the owner boundary" {
+    const a = std.testing.allocator;
+    var manifest = try parseStorageKernelDocumentArtifactManifestResponse(a,
+        \\{"document_id":"doc","artifact_name":"ocr","artifact_id":"asset","manifest_json":"{}","generation":1,"reprocess":{"requested_generation":2,"status":"pending"}}
+    );
+    defer manifest.deinit(a);
+    try std.testing.expectEqual(@as(u64, 1), manifest.generation);
+    try std.testing.expectEqual(@as(u64, 2), manifest.reprocess.?.requested_generation);
+    try std.testing.expectEqual(.pending, manifest.reprocess.?.status);
 }
 
 pub fn parseStorageKernelDocumentArtifactManifestsResponse(alloc: std.mem.Allocator, body: []const u8) !db_mod.types.DocumentArtifactManifestList {

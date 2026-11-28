@@ -10229,6 +10229,22 @@ const PlatformEnrichmentRuntime = struct {
         return self.applied_sequence;
     }
 
+    pub fn reprocessWorkerProgress(self: *EnrichmentRuntime) types.DocumentArtifactReprocessStatus.Worker {
+        const maybe_io = if (self.io_impl) |io_impl| io_impl.io() else null;
+        if (maybe_io) |io| self.mutex.lockUncancelable(io);
+        defer if (maybe_io) |io| self.mutex.unlock(io);
+        return .{
+            .scanned_sequence = self.scoped_retry_scan_sequence,
+            .applied_sequence = self.applied_sequence,
+            .target_sequence = self.target_sequence,
+            .retry_queue_full = self.scoped_retry_full,
+            .retrying = self.retrying,
+            .next_retry_at_ms = if (self.retrying and self.next_retry_at_ms != 0) self.next_retry_at_ms else null,
+            .failed = self.worker_failed,
+            .background_running = self.future != null,
+        };
+    }
+
     pub fn stats(self: *EnrichmentRuntime) types.EnrichmentStats {
         const maybe_io = if (self.io_impl) |io_impl| io_impl.io() else null;
         if (maybe_io) |io| self.mutex.lockUncancelable(io);
@@ -21800,7 +21816,9 @@ fn processDocumentExtractionAsset(
     // change triggered zero of these, the same way skip_by_hash_count
     // confirms the skip path did fire, without adding a new stats field to
     // the table status aggregation pipeline for a one-off verification.
-    std.log.info("document extraction fetching source: doc_key={s} artifact={s}", .{ request.doc_key, artifact_name });
+    std.log.info("document extraction fetching source: doc_key={s} artifact={s} replay_sequence={d} generation={d} reprocess={}", .{
+        request.doc_key[0..@min(request.doc_key.len, 256)], artifact_name, request.sequence, to_generation, force_reprocess,
+    });
     var resource_tracker = RuntimeDocumentExtractionResourceTracker.init(runtime);
     defer resource_tracker.deinit();
     const fetched = fetchEnrichmentSource(runtime, prepared_sources, source_url, if (config.credentials.len > 0) config.credentials else null, request, raw_doc) catch |raw_err| {

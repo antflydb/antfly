@@ -158,6 +158,8 @@ type (
 	DocumentArtifactReprocessJobStartRequest = oapi.DocumentArtifactReprocessJobStartRequest
 	DocumentArtifactReprocessResponse        = oapi.DocumentArtifactReprocessResponse
 	DocumentArtifactReprocessShardCursor     = oapi.DocumentArtifactReprocessShardCursor
+	DocumentArtifactReprocessStatus          = oapi.DocumentArtifactReprocessStatus
+	DocumentArtifactReprocessWorker          = oapi.DocumentArtifactReprocessWorker
 	DocumentArtifactTableReprocessRequest    = oapi.DocumentArtifactTableReprocessRequest
 	DocumentArtifactTableReprocessResponse   = oapi.DocumentArtifactTableReprocessResponse
 	TableArtifactEnrichmentList              = oapi.TableArtifactEnrichmentList

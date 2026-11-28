@@ -3843,6 +3843,8 @@ components:
           type: string
           nullable: true
           description: Human-readable last extraction or materialization error summary, when available.
+        reprocess:
+          $ref: "#/components/schemas/DocumentArtifactReprocessStatus"
         manifest_json:
           type: string
           description: "Opaque JSON manifest for the artifact units and provenance. Present only for raw detail responses. Newly produced document-extraction generations include the declared execution policy under execution, including on failed generations; it is not a measured provider budget. Older manifests may omit it."
@@ -3850,6 +3852,54 @@ components:
           type: string
           nullable: true
           description: Optional opaque JSON state for incremental processing. Present only for raw detail responses.
+    DocumentArtifactReprocessStatus:
+      type: object
+      description: Latest explicit native document-extraction reprocess intent for this artifact. Present on single-artifact inspection when an intent exists. When the first publication is pending, the summary has generation zero and no raw manifest.
+      required: [requested_generation, status]
+      properties:
+        requested_generation:
+          type: integer
+          format: uint64
+          description: Target generation recorded by the accepted request.
+        status:
+          type: string
+          enum: [pending, published, superseded]
+          description: Pending is an unfulfilled intent. Published means the target generation is visible and can itself contain extraction failures. Superseded means the intent no longer matches the configured producer.
+        worker:
+          $ref: "#/components/schemas/DocumentArtifactReprocessWorker"
+    DocumentArtifactReprocessWorker:
+      type: object
+      description: Sample of the owning shard's enrichment worker, when present. The worker services multiple documents and producers. Sequence values use the shard's enrichment replay sequence space.
+      required: [scanned_sequence, applied_sequence, target_sequence, retry_queue_full, retrying, failed, background_running]
+      properties:
+        scanned_sequence:
+          type: integer
+          format: uint64
+          description: Replay scan watermark, which can run ahead of the contiguous applied watermark while requests wait.
+        applied_sequence:
+          type: integer
+          format: uint64
+          description: Contiguous applied enrichment watermark.
+        target_sequence:
+          type: integer
+          format: uint64
+          description: Latest enrichment replay watermark requested of the worker.
+        retry_queue_full:
+          type: boolean
+          description: Whether parked requests have filled the worker's bounded retry queue.
+        retrying:
+          type: boolean
+          description: Whether the worker has retry work.
+        next_retry_at_ms:
+          type: integer
+          format: uint64
+          description: Unix timestamp in milliseconds for the worker's next scheduled retry, when available. This is shard-wide.
+        failed:
+          type: boolean
+          description: Whether the shard's worker has failed.
+        background_running:
+          type: boolean
+          description: Whether a background worker has started. Embedded callers can also drive replay inline.
     DocumentArtifactManifestList:
       type: object
       description: Available derived document artifact manifests for a source document.
@@ -18534,9 +18584,9 @@ paths:
         reprocessing regenerates vectors even when the source chunks are unchanged.
         Embedding requests and document-extraction requests on servers with an
         enrichment runtime are committed durably and queued for supervised
-        inference. Acceptance does not wait for inference. For extraction, inspect
-        the artifact generation, merge status and per-page failures; for embeddings,
-        inspect index coverage and repair issues. Embedded databases without an
+        inference. Acceptance does not wait for inference. For native extraction,
+        inspect the artifact's reprocess intent and its published generation, merge
+        status and per-page failures. For embeddings, inspect index coverage and repair issues. Embedded databases without an
         enrichment runtime execute document extraction inline.
       tags:
         - data_operations

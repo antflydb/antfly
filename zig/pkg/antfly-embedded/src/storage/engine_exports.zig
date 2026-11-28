@@ -2579,7 +2579,14 @@ fn getCAllocator() callconv(.c) ?*const Allocator {
 fn getDescriptor() callconv(.c) *const engine.Descriptor {
     return &descriptor;
 }
+const pipeline_metrics = @import("antfly_platform").document_pipeline_metrics;
+
+fn pipelineMetricsSnapshot(out: *pipeline_metrics.Snapshot) callconv(.c) void {
+    out.* = pipeline_metrics.snapshot();
+}
+
 comptime {
+    @export(&pipelineMetricsSnapshot, .{ .name = "antfly_storage_engine_pipeline_metrics_v1", .visibility = .hidden });
     for (@typeInfo(engine.VTable).@"struct".field_names) |name| {
         const Accessor = struct {
             fn get() callconv(.c) *const anyopaque {

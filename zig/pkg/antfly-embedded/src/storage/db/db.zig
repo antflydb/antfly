@@ -14971,6 +14971,12 @@ pub const DB = struct {
         return artifact;
     }
 
+    /// Metrics recorded by replay belong to the physical engine, which is
+    /// independently compiled in native server builds.
+    pub fn mergePhysicalPipelineMetrics(output: *@import("antfly_platform").document_pipeline_metrics.Snapshot) !void {
+        if (comptime storage_engine.enabled) try output.merge(storage_engine.pipelineMetricsSnapshot());
+    }
+
     pub fn getDocumentArtifactManifest(
         self: *DB,
         alloc: Allocator,
@@ -15010,6 +15016,22 @@ pub const DB = struct {
             stored_manifest = try self.core.getStoreValue(alloc, manifest_key);
         }
 
+        if (stored_manifest == null) {
+            if (try self.documentArtifactReprocessStatus(alloc, doc_key, artifact_name, 0)) |reprocess| {
+                if (reprocess.status == .pending) {
+                    self.core.unlockApplyShared();
+                    apply_locked = false;
+                    if (replay_capture) |*lease| lease.release();
+                    if (primary_capture) |*lease| lease.release();
+                    var result = try producedAssetManifestAlloc(alloc, doc_key, artifact_name, try alloc.dupe(u8, ""), null, "");
+                    errdefer result.deinit(alloc);
+                    result.reprocess = reprocess;
+                    result.reprocess.?.worker = self.documentArtifactReprocessWorker();
+                    try row_policy_lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
+                    return result;
+                }
+            }
+        }
         const manifest = stored_manifest orelse {
             var captured = (@import("dense_index_inspection.zig").capture(self, alloc, doc_key, artifact_name) catch |err| {
                 if (@import("privacy_read.zig").pending(err) or err == error.IndexRebuilding or err == error.DeadlineExceeded) return error.StorageReadTemporarilyUnavailable;
@@ -15043,8 +15065,55 @@ pub const DB = struct {
         state_owned = false;
         var result = try self.documentArtifactInspectionAlloc(alloc, doc_key, artifact_name, manifest, state);
         errdefer result.deinit(alloc);
+        result.reprocess = try self.documentArtifactReprocessStatus(alloc, doc_key, artifact_name, result.generation);
+        self.core.unlockApplyShared();
+        apply_locked = false;
+        if (result.reprocess) |*reprocess| {
+            if (reprocess.status == .pending) reprocess.worker = self.documentArtifactReprocessWorker();
+        }
         try row_policy_lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
         return result;
+    }
+
+    fn documentArtifactReprocessStatus(
+        self: *DB,
+        alloc: Allocator,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+        published_generation: u64,
+    ) !?types.DocumentArtifactReprocessStatus {
+        const intent = @import("artifact_reprocess_intent.zig");
+        const key = try intent.keyAlloc(alloc, doc_key, artifact_name);
+        defer alloc.free(key);
+        const raw = (try self.core.getStoreValue(alloc, key)) orelse return null;
+        defer alloc.free(raw);
+        const target = try intent.generation(raw);
+        const matches_config = blk: {
+            self.core.index_manager.catalog_mutex.lockShared();
+            defer self.core.index_manager.catalog_mutex.unlockShared();
+            const cfg = self.core.index_manager.getEnrichment(.asset, artifact_name) orelse break :blk false;
+            break :blk try intent.generationForConfig(raw, cfg.producer_json) != 0;
+        };
+        if (!matches_config) return .{
+            .requested_generation = target,
+            .status = .superseded,
+        };
+        if (published_generation >= target) return .{ .requested_generation = target, .status = .published };
+        return .{ .requested_generation = target, .status = .pending };
+    }
+
+    fn documentArtifactReprocessWorker(self: *DB) ?types.DocumentArtifactReprocessStatus.Worker {
+        // Retain the owner across concurrent provider reconfiguration, and
+        // sample it outside the apply lock. This is shard-level telemetry.
+        var owner = blk: {
+            const mutex = &self.async_context.enrichment_lifecycle_mutex;
+            while (!mutex.tryLock()) spinOrYield();
+            defer mutex.unlock();
+            break :blk self.enrichment_owner.bundle.retain();
+        };
+        defer owner.deinit(self.runtime_alloc);
+        const runtime = owner.runtime orelse return null;
+        return runtime.reprocessWorkerProgress();
     }
 
     /// Builds the inspection entry for one stored asset value. Only document
@@ -100928,6 +100997,11 @@ test "db public artifact reprocess accepts durable work despite unrelated provid
         var accepted = (try db.getDocumentArtifactManifest(alloc, "doc:repair", "document_units_v1")) orelse return error.TestUnexpectedResult;
         defer accepted.deinit(alloc);
         try std.testing.expectEqual(before.generation, accepted.generation);
+        const reprocess = accepted.reprocess orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(.pending, reprocess.status);
+        try std.testing.expectEqual(before.generation + 1, reprocess.requested_generation);
+        try std.testing.expect(!reprocess.worker.?.background_running);
+        try std.testing.expect(reprocess.worker.?.target_sequence > reprocess.worker.?.applied_sequence);
     }
     // Public acceptance commits the request without entering inference. Neither
     // unrelated retries nor rejection by the requested provider can erase it.
@@ -100940,6 +101014,20 @@ test "db public artifact reprocess accepts durable work despite unrelated provid
     try std.testing.expect(!try db.reprocessDocumentArtifact(alloc, "doc:repair", "missing"));
     try std.testing.expect(!try db.reprocessDocumentEmbeddingArtifact(alloc, "missing", "dense_v1"));
 
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:first", .value = "{\"url\":\"data:text/plain;base64,YWxwaGE=\"}" }},
+        .sync_level = .write,
+    });
+    try std.testing.expect((try db.getDocumentArtifactManifest(alloc, "doc:first", "document_units_v1")) == null);
+    try std.testing.expect(try db.reprocessDocumentArtifact(alloc, "doc:first", "document_units_v1"));
+    {
+        var accepted = (try db.getDocumentArtifactManifest(alloc, "doc:first", "document_units_v1")) orelse return error.TestUnexpectedResult;
+        defer accepted.deinit(alloc);
+        try std.testing.expectEqual(@as(u64, 0), accepted.generation);
+        try std.testing.expectEqual(@as(u64, 1), accepted.reprocess.?.requested_generation);
+        try std.testing.expectEqual(.pending, accepted.reprocess.?.status);
+    }
+
     // Provider recovery lets the queued work finish; success did not discard it.
     gated.allowed_successes.store(100, .release);
     sleepNs(550 * std.time.ns_per_ms);
@@ -100947,6 +101035,9 @@ test "db public artifact reprocess accepts durable work despite unrelated provid
     var after = (try db.getDocumentArtifactManifest(alloc, "doc:repair", "document_units_v1")) orelse return error.TestUnexpectedResult;
     defer after.deinit(alloc);
     try std.testing.expectEqual(before.generation + 1, after.generation);
+    try std.testing.expectEqual(.published, after.reprocess.?.status);
+    try std.testing.expectEqual(after.generation, after.reprocess.?.requested_generation);
+    try std.testing.expect(after.reprocess.?.worker == null);
     const embedding_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:retry", "dense_v1");
     defer alloc.free(embedding_key);
     const embedding = try db.core.store.get(alloc, embedding_key);

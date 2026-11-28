@@ -21,6 +21,7 @@ const time = @import("time.zig");
 pub const Phase = enum { source_fetch, pdf_prepare, pdf_render, media_encode, reader_http, vision_prepare, vision, prefill, decode, mixed_step, publication, prefetch_wait };
 const bounds = [_]u64{ 1_000_000, 10_000_000, 100_000_000, 1_000_000_000, 10_000_000_000, 60_000_000_000 };
 const Counter = atomic.Value(u64);
+const phase_count = @typeInfo(Phase).@"enum".field_names.len;
 pub const Histogram = struct {
     // One short lock per phase makes count, sum and cumulative buckets one
     // observation. Independent atomics can export bucket > count during a scrape.
@@ -52,26 +53,31 @@ var prefetch_events: [@typeInfo(PrefetchEvent).@"enum".field_names.len]Counter =
 pub fn prefetch(event: PrefetchEvent) void {
     _ = prefetch_events[@backingInt(event)].fetchAdd(1, .monotonic);
 }
-var phases: [@typeInfo(Phase).@"enum".field_names.len]Histogram = @splat(.{});
+var phases: [phase_count]Histogram = @splat(.{});
+var in_flight: [phase_count]Counter = @splat(.init(0));
 pub const Timer = struct {
     phase: Phase,
     started_ns: u64,
     pub fn finish(self: @This()) void {
         observe(self.phase, time.monotonicNs() -| self.started_ns);
+        _ = in_flight[@backingInt(self.phase)].fetchSub(1, .monotonic);
     }
 };
 pub fn start(phase: Phase) Timer {
+    _ = in_flight[@backingInt(phase)].fetchAdd(1, .monotonic);
     return .{ .phase = phase, .started_ns = time.monotonicNs() };
 }
 pub fn observe(phase: Phase, ns: u64) void {
     phases[@backingInt(phase)].observe(ns);
 }
-pub const Snapshot = struct {
+/// Fixed-size versioned snapshot shared by the statically linked runtime owners.
+pub const Snapshot = extern struct {
     version: u32 = 1,
-    counts: [@typeInfo(Phase).@"enum".field_names.len]u64 = @splat(0),
-    totals_ns: [@typeInfo(Phase).@"enum".field_names.len]u64 = @splat(0),
-    buckets: [@typeInfo(Phase).@"enum".field_names.len][bounds.len]u64 = @splat(@splat(0)),
+    counts: [phase_count]u64 = @splat(0),
+    totals_ns: [phase_count]u64 = @splat(0),
+    buckets: [phase_count][bounds.len]u64 = @splat(@splat(0)),
     events: [@typeInfo(PrefetchEvent).@"enum".field_names.len]u64 = @splat(0),
+    in_flight: [phase_count]u64 = @splat(0),
     pub fn merge(self: *@This(), other: @This()) !void {
         if (self.version != 1 or other.version != 1) return error.InvalidPipelineMetricsVersion;
         for (&self.counts, other.counts) |*a, b| a.* +|= b;
@@ -80,13 +86,16 @@ pub const Snapshot = struct {
             x.* +|= y;
         };
         for (&self.events, other.events) |*a, b| a.* +|= b;
+        for (&self.in_flight, other.in_flight) |*a, b| a.* +|= b;
     }
     pub fn writePrometheus(self: @This(), w: *std.Io.Writer) !void {
         if (self.version != 1) return error.InvalidPipelineMetricsVersion;
         try w.writeAll("# HELP antfly_document_pipeline_phase_duration_ns Wall duration of document pipeline phases, including failed attempts; phases can overlap\n# TYPE antfly_document_pipeline_phase_duration_ns histogram\n");
         try w.writeAll("# HELP antfly_document_prefetch_events_total Bounded cross-document preparation outcomes\n# TYPE antfly_document_prefetch_events_total counter\n");
         inline for (@typeInfo(PrefetchEvent).@"enum".field_names, 0..) |name, i| try w.print("antfly_document_prefetch_events_total{{event=\"{s}\"}} {d}\n", .{ name, self.events[i] });
+        try w.writeAll("# HELP antfly_document_pipeline_phase_in_flight Document pipeline operations currently in progress by phase (phases can overlap)\n# TYPE antfly_document_pipeline_phase_in_flight gauge\n");
         inline for (@typeInfo(Phase).@"enum".field_names, 0..) |field, i| {
+            try w.print("antfly_document_pipeline_phase_in_flight{{phase=\"{s}\"}} {d}\n", .{ field, self.in_flight[i] });
             for (bounds, 0..) |bound, b| try w.print("antfly_document_pipeline_phase_duration_ns_bucket{{phase=\"{s}\",le=\"{d}\"}} {d}\n", .{ field, bound, self.buckets[i][b] });
             try w.print("antfly_document_pipeline_phase_duration_ns_bucket{{phase=\"{s}\",le=\"+Inf\"}} {d}\nantfly_document_pipeline_phase_duration_ns_count{{phase=\"{s}\"}} {d}\nantfly_document_pipeline_phase_duration_ns_sum{{phase=\"{s}\"}} {d}\n", .{ field, self.counts[i], field, self.counts[i], field, self.totals_ns[i] });
         }
@@ -101,6 +110,7 @@ pub fn snapshot() Snapshot {
         buckets.* = view.buckets;
     }
     for (&result.events, &prefetch_events) |*out, *in| out.* = in.load(.monotonic);
+    for (&result.in_flight, &in_flight) |*out, *in| out.* = in.load(.monotonic);
     return result;
 }
 pub fn writePrometheus(w: *std.Io.Writer) !void {
@@ -130,10 +140,13 @@ test "pipeline metric owner snapshots merge and reject unknown versions" {
     second.counts[0] = 2;
     second.buckets[0][0] = 2;
     second.events[0] = 3;
+    first.in_flight[0] = 1;
+    second.in_flight[0] = 3;
     try first.merge(second);
     try std.testing.expectEqual(@as(u64, 3), first.counts[0]);
     try std.testing.expectEqual(@as(u64, 3), first.buckets[0][0]);
     try std.testing.expectEqual(@as(u64, 3), first.events[0]);
+    try std.testing.expectEqual(@as(u64, 4), first.in_flight[0]);
     second.version = 2;
     try std.testing.expectError(error.InvalidPipelineMetricsVersion, first.merge(second));
 }
@@ -166,4 +179,19 @@ test "pipeline histogram snapshots stay coherent with concurrent writers" {
     try std.testing.expectEqual(@as(u64, 40000), final.count);
     try std.testing.expectEqual(final.count, final.total_ns);
     for (final.buckets) |bucket| try std.testing.expectEqual(final.count, bucket);
+}
+
+test "pipeline metrics expose live phases before timing is recorded" {
+    const phase = @backingInt(Phase.source_fetch);
+    const before = snapshot();
+    {
+        const timer = start(.source_fetch);
+        defer timer.finish();
+        const active = snapshot();
+        try std.testing.expectEqual(before.in_flight[phase] + 1, active.in_flight[phase]);
+        try std.testing.expectEqual(before.counts[phase], active.counts[phase]);
+    }
+    const done = snapshot();
+    try std.testing.expectEqual(before.in_flight[phase], done.in_flight[phase]);
+    try std.testing.expectEqual(before.counts[phase] + 1, done.counts[phase]);
 }
