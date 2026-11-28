@@ -60398,6 +60398,43 @@ test "CUDA grouped audio admission rejects an impossible mandatory workspace bef
     try std.testing.expect(!try CudaCompute.audioWorkspaceLowerBoundFits(recipe, &clips, 37, bindings));
 }
 
+test "CUDA audio capacity decline leaves the learned plan cache untouched" {
+    const Run = struct {
+        fn call(_: *anyopaque, _: []const CT) !CT {
+            return error.UnexpectedAudioDispatch;
+        }
+    };
+    var compute = metadataOnlyTestCompute();
+    compute.capability_profile = .embedding_gemma2;
+    compute.embedding_gemma2_policy = .{ .audio_graph = true };
+    compute.ctx.driver.fns.cuStreamIsCapturing = null;
+    const rows = 8192;
+    const width = 1024;
+    var dimensions = [_]i64{ rows, width };
+    var hidden: CudaTensor = .{
+        .buffer = .{ .ptr = 0x1000, .len = rows * width * @sizeOf(f32) },
+        .dtype = .f32,
+        .shape = &dimensions,
+        .elem_count = rows * width,
+    };
+    var recipe: CudaCompute.CacheFunding.AudioRecipe = undefined;
+    recipe.source_bf16 = true;
+    recipe.hidden = width;
+    recipe.heads = 8;
+    recipe.chunk = 12;
+    recipe.context_left = 13;
+    recipe.context_right = 0;
+    const geometry: ops.ComputeBackend.GroupedAudioGeometry = .{
+        .recipe = &recipe,
+        .segments = &.{ rows / 2, rows / 2 },
+        .rows = rows,
+    };
+    const inputs = [_]CT{@ptrCast(&hidden)};
+    try std.testing.expect((try audioExecutionOp(&compute, 1, &inputs, &compute, Run.call, .{}, false, geometry)) == null);
+    try std.testing.expectEqual(@as(u64, 0), compute.audio_plans.clock);
+    try std.testing.expect(!compute.audio_execution_active);
+}
+
 test "CUDA audio declines local capture ownership before any SDK query" {
     const Run = struct {
         fn call(_: *anyopaque, _: []const CT) !CT {
