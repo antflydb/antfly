@@ -3142,6 +3142,13 @@ precision-specific operations. The same twelve released-model cases
 passed on Spark with exact eager parity and the same arena capacities as
 the preceding check. Four local Native and Metal audio checks passed.
 
+Cold F32 audio prepares eligible packed QKV weights before binding the
+workspace plan's weight generation. Admission and dispatch share the
+same packed-weight identity. A Spark device check verified stable packed
+addresses, no projection launch during preparation, and exact projection
+output. The twelve released-model audio cases also passed with the
+packing policy enabled and matched eager CUDA exactly.
+
 ### Isolated Metal E4B HTTP comparison at `58b3917a89`
 
 The local M4 Max used the same pinned binaries as the mixed serving

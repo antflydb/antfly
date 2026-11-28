@@ -8287,8 +8287,7 @@ pub const CudaCompute = struct {
             if (try self.audioDepthwiseCacheRequest(recipe, layer)) |request| try builder.add(request);
             if (self.embedding_gemma2_policy.packed_projections and recipe.packed_layers & (@as(u16, 1) << @intCast(layer)) != 0) {
                 var storage: [3][128]u8 = undefined;
-                var names: [3][]const u8 = undefined;
-                for (&names, 0..) |*name, component| name.* = try CacheFunding.AudioRecipe.qkvWeightName(&storage[component], layer, component);
+                const names = try audioPackedQkvNames(&storage, layer);
                 try builder.add(try packedNamedCacheRequest(&names, &.{ recipe.hidden, recipe.hidden, recipe.hidden }, recipe.hidden));
             }
         }
@@ -16251,6 +16250,18 @@ fn embeddingGemma2PackedNamed(ctx: *anyopaque, input: CT, names: []const []const
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     if (self.capability_profile != .embedding_gemma2 or !self.embedding_gemma2_policy.packed_projections) return null;
     if (names.len < 2 or names.len > 3 or names.len != widths.len or in_dim == 0) return error.InvalidTensorShape;
+    var width: usize = 0;
+    for (widths) |value| width = try checkedAdd(width, value);
+    if (try checkedMul(try checkedMul(rows, width), 4) > 64 * 1024 * 1024) return null;
+    const packed_weights = (try preparePackedNamedWeights(self, names, widths, in_dim, width)) orelse return null;
+    var shape = [_]i64{ @intCast(width), @intCast(in_dim) };
+    var weight = CudaTensor{ .buffer = packed_weights, .dtype = .bf16, .shape = &shape, .elem_count = width * in_dim, .owns_buffer = false, .owns_shape = false };
+    const result = try linearNoBias(ctx, input, @ptrCast(&weight), rows, in_dim, width);
+    (try self.encoderMultimodalModule()).notePackedProjection();
+    return result;
+}
+
+fn preparePackedNamedWeights(self: *CudaCompute, names: []const []const u8, widths: []const usize, in_dim: usize, width: usize) !?buffer_mod.DeviceBuffer {
     const cache_request: ?@import("prepared_cache.zig").Request = @import("prepared_cache.zig").Request.joinedPackedSpan(names, widths, in_dim) catch |err| switch (err) {
         error.InvalidPreparedCacheName, error.NoSpaceLeft => null,
         else => return err,
@@ -16259,15 +16270,12 @@ fn embeddingGemma2PackedNamed(ctx: *anyopaque, input: CT, names: []const []const
     defer if (legacy_joined) |text| self.allocator.free(text);
     var legacy_key: ?[]u8 = null;
     defer if (legacy_key) |text| self.allocator.free(text);
-    var width: usize = 0;
-    for (widths) |value| width = try checkedAdd(width, value);
     const key = if (cache_request) |*request| request.packed_weight.name.slice() else legacy: {
         if (self.ctx.prepared_cache_funding != null) return null; // Unknown prepared metadata declines before work.
         legacy_joined = try std.mem.join(self.allocator, "|", names);
         legacy_key = try std.fmt.allocPrint(self.allocator, "audio-packed-f32-output:{d}:{d}:{s}", .{ in_dim, width, legacy_joined.? });
         break :legacy legacy_key.?;
     };
-    if (try checkedMul(try checkedMul(rows, width), 4) > 64 * 1024 * 1024) return null;
     const bytes = try checkedMul(try checkedMul(width, in_dim), 2);
     const packed_weights = self.embedding_gemma2_execution.findPacked(key) orelse create: {
         if (self.ctx.debug_graph_capture_active) return null;
@@ -16291,11 +16299,27 @@ fn embeddingGemma2PackedNamed(ctx: *anyopaque, input: CT, names: []const []const
         break :create output;
     };
     if (packed_weights.len != bytes) return error.InvalidTensorShape;
-    var shape = [_]i64{ @intCast(width), @intCast(in_dim) };
-    var weight = CudaTensor{ .buffer = packed_weights, .dtype = .bf16, .shape = &shape, .elem_count = width * in_dim, .owns_buffer = false, .owns_shape = false };
-    const result = try linearNoBias(ctx, input, @ptrCast(&weight), rows, in_dim, width);
-    (try self.encoderMultimodalModule()).notePackedProjection();
-    return result;
+    return packed_weights;
+}
+
+fn audioPackedQkvNames(storage: *[3][128]u8, layer: usize) ![3][]const u8 {
+    var names: [3][]const u8 = undefined;
+    for (&names, storage, 0..) |*name, *buffer, component|
+        name.* = try CudaCompute.CacheFunding.AudioRecipe.qkvWeightName(buffer, layer, component);
+    return names;
+}
+
+fn prepareAudioPackedWeights(self: *CudaCompute, recipe: CudaCompute.CacheFunding.AudioRecipe) !bool {
+    if (recipe.source_bf16 or !self.embedding_gemma2_policy.packed_projections or recipe.packed_layers == 0) return true;
+    const widths = [3]usize{ recipe.hidden, recipe.hidden, recipe.hidden };
+    const width = try checkedMul(recipe.hidden, widths.len);
+    for (0..recipe.blocks) |layer| {
+        if (recipe.packed_layers & (@as(u16, 1) << @intCast(layer)) == 0) continue;
+        var storage: [3][128]u8 = undefined;
+        const names = try audioPackedQkvNames(&storage, layer);
+        if (try preparePackedNamedWeights(self, &names, &widths, recipe.hidden, width) == null) return false;
+    }
+    return true;
 }
 
 const Bf16MatmulProgram = struct {
@@ -21852,23 +21876,13 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
     var input_spans: [CudaCompute.AudioPlan.max_inputs]CudaCompute.AudioInputSpan = undefined;
     const spans = input_spans[0..inputs.len];
     const plan_key = if (dispatch.workspace) |workspace| workspace.cacheKey(key) else key;
-    const cache_base = try self.audioCacheBase(plan_key, input_metadata[0..inputs.len], spans);
+    var cache_base = try self.audioCacheBase(plan_key, input_metadata[0..inputs.len], spans);
     for (inputs, spans) |ct, span| {
         _ = try buffer_mod.validateRegion(tensorFromCt(ct).buffer, span.bytes, @alignOf(f32));
     }
     const first_input = tensorFromCt(inputs[0]);
     const output_bytes = cache_base.output_bytes;
     if (!cache_base.fitsArena()) return null;
-    if (dispatch.geometry) |group| {
-        // A matching sealed plan is the complete capacity proof for replay.
-        const existing = self.audioPlanFor(cache_base);
-        const sealed = if (existing) |entry| entry.executableFor(cache_base) != null else false;
-        if (!sealed and !try CudaCompute.audioWorkspaceLowerBoundFits(group.recipe.*, group.segments, group.rows, cache_base)) {
-            observation.cudaAudioResult(.workspace_preflight_declined);
-            return null;
-        }
-    }
-    const base_key = cache_base.key;
     // Use the receiving invocation's cleanup when available. An installed
     // prepared funding scope supplies its own live epoch for legacy callers.
     var plan_cleanup = cleanup;
@@ -21878,6 +21892,23 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
                 return error.BackendOperationCleanupChanged;
         } else plan_cleanup.boundary = epoch;
     };
+    if (dispatch.geometry) |group| {
+        // A matching sealed plan is the complete capacity proof for replay.
+        const existing = self.audioPlanFor(cache_base);
+        const sealed = if (existing) |entry| entry.executableFor(cache_base) != null else false;
+        if (!sealed and !try CudaCompute.audioWorkspaceLowerBoundFits(group.recipe.*, group.segments, group.rows, cache_base)) {
+            observation.cudaAudioResult(.workspace_preflight_declined);
+            return null;
+        }
+        if (existing == null) {
+            const weight_generation = self.embedding_gemma2_execution.weight_generation;
+            if (!try prepareAudioPackedWeights(self, group.recipe.*)) return null;
+            // Warm the plan for the addresses used by the numerical callback.
+            if (weight_generation != self.embedding_gemma2_execution.weight_generation)
+                cache_base = try self.audioCacheBase(plan_key, input_metadata[0..inputs.len], null);
+        }
+    }
+    const base_key = cache_base.key;
     const entry = try self.audio_plans.getWithCleanup(base_key, plan_cleanup);
     if (!entry.disabled and entry.owner == null) if (dispatch.workspace) |workspace| {
         if (workspace.events.len == 0) return null;
@@ -41243,8 +41274,17 @@ test "embeddinggemma2 CUDA packed audio projections retain F32 output across pai
     for (&values, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 9)) - 4)) / 16;
     const input = try cb.fromFloat32Shape(&values, &.{ 5, 32 });
     defer cb.free(input);
+    const widths = [_]usize{ 16, 16, 16 };
+    const before_weights = compute.embedding_gemma2_execution.weight_generation;
+    const before_linear = compute.stats.launch_linear;
+    const prepared = (try preparePackedNamedWeights(&compute, &names, &widths, 32, 48)) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(before_weights + 1, compute.embedding_gemma2_execution.weight_generation);
+    try std.testing.expectEqual(before_linear, compute.stats.launch_linear);
+    const repeated = (try preparePackedNamedWeights(&compute, &names, &widths, 32, 48)) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(prepared.ptr, repeated.ptr);
+    try std.testing.expectEqual(before_weights + 1, compute.embedding_gemma2_execution.weight_generation);
     for ([_]usize{ 2, 3, 3 }) |count| {
-        const result = (try cb.linearPackedNamed(input, names[0..count], (&[_]usize{ 16, 16, 16 })[0..count], 5, 32)) orelse return error.UnsupportedTensorType;
+        const result = (try cb.linearPackedNamed(input, names[0..count], widths[0..count], 5, 32)) orelse return error.UnsupportedTensorType;
         defer cb.free(result);
         try std.testing.expectEqual(tensor_mod.DType.f32, tensorFromCt(result).dtype);
         const actual = try cb.toFloat32(result, a);
