@@ -48002,7 +48002,9 @@ test "LightOnOCR3 CUDA graph warm input and wide head write their assigned buffe
     const norm_offset = std.mem.alignForward(usize, mirror_offset + mirror_bytes, 256);
     const norm_bytes = 6 * @sizeOf(f32);
     const output_offset = std.mem.alignForward(usize, norm_offset + norm_bytes, 256);
-    var metadata = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, output_offset + 2 * norm_bytes);
+    const projection_offset = std.mem.alignForward(usize, output_offset + 2 * norm_bytes, 256);
+    const split_offset = std.mem.alignForward(usize, projection_offset + 4 * norm_bytes, 256);
+    var metadata = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, split_offset + 3 * norm_bytes);
     defer metadata.free(&compute.ctx);
     owner.storage_layout = layout;
     owner.metadata = metadata;
@@ -48135,6 +48137,42 @@ test "LightOnOCR3 CUDA graph warm input and wide head write their assigned buffe
         defer a.free(second_values);
         try std.testing.expectEqualSlices(f32, &.{ 4, 6, 10, 14, 22, 26 }, first_values);
         try std.testing.expectEqualSlices(f32, &.{ 6, 9, 15, 21, 33, 39 }, second_values);
+
+        owner.storage_layout.?.attention_projections = .{ .offset = projection_offset, .bytes = 4 * norm_bytes };
+        owner.storage_layout.?.attention_projection_bytes = .{ 2 * norm_bytes, norm_bytes, norm_bytes };
+        owner.storage_layout.?.attention_inputs = .{ .offset = split_offset, .bytes = 3 * norm_bytes };
+        defer {
+            owner.storage_layout.?.attention_projections = null;
+            owner.storage_layout.?.attention_projection_bytes = @splat(0);
+            owner.storage_layout.?.attention_inputs = null;
+        }
+        const q_weights = try cb.fromFloat32Shape(&.{ 1, 0, 0, 1, 1, 1, 1, -1 }, &.{ 4, 2 });
+        defer cb.free(q_weights);
+        const before_qkv = compute.stats.device_alloc_calls;
+        const q = (try tryCapturedQkvProjection(&cb, input, q_weights, 3, 2, 4, .query)) orelse return error.TestUnexpectedResult;
+        defer cb.free(q);
+        const k = (try tryCapturedQkvProjection(&cb, input, weight, 3, 2, 2, .key)) orelse return error.TestUnexpectedResult;
+        defer cb.free(k);
+        const v = (try tryCapturedQkvProjection(&cb, input, weight, 3, 2, 2, .value)) orelse return error.TestUnexpectedResult;
+        defer cb.free(v);
+        const q_and_gate = (try tryCapturedSplitQueryGate(&cb, q, 3, 2, 1)) orelse return error.TestUnexpectedResult;
+        defer for (q_and_gate) |tensor_value| cb.free(tensor_value);
+        try std.testing.expectEqual(before_qkv, compute.stats.device_alloc_calls);
+        const outputs = [_]CT{ q, k, v, q_and_gate[0], q_and_gate[1] };
+        const offsets = [_]usize{ projection_offset, projection_offset + 2 * norm_bytes, projection_offset + 3 * norm_bytes, split_offset, split_offset + 2 * norm_bytes };
+        const expected = [_][]const f32{
+            &.{ 2, 3, 5, -1, 5, 7, 12, -2, 11, 13, 24, -2 },
+            &.{ 2, 3, 5, 7, 11, 13 },
+            &.{ 2, 3, 5, 7, 11, 13 },
+            &.{ 2, 5, 5, 12, 11, 24 },
+            &.{ 3, -1, 7, -2, 13, -2 },
+        };
+        for (outputs, offsets, expected) |result, offset, values| {
+            try std.testing.expectEqual(metadata.ptr + offset, tensorFromCt(result).buffer.ptr);
+            const actual_values = try cb.toFloat32(result, a);
+            defer a.free(actual_values);
+            try std.testing.expectEqualSlices(f32, values, actual_values);
+        }
     }
 
     var observation = @import("../../execution/runtime_observation.zig").Scope.init();
