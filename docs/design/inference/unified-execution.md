@@ -2892,6 +2892,23 @@ custody. The ninth verified nested decoder timing totals. The initial
 sandboxed run skipped the eight Metal cases and supplied no hardware
 evidence.
 
+The larger Spark repeat compared the same baseline with `fd867e8e5a`
+in both run orders. All 320 measured requests matched exactly, with no
+failures. Every phase reached two-row CUDA replay on all measured requests
+and warmups.
+
+| Order | Baseline p50 / p95 (ms) | Candidate p50 / p95 (ms) |
+| --- | ---: | ---: |
+| ABBA | 465.29 / 474.14 | 465.17 / 494.34 |
+| BAAB | 469.31 / 481.01 | 469.68 / 482.48 |
+| Pooled | 467.67 / 478.52 | 467.12 / 491.54 |
+
+The baseline-only p95 controls were 476.99 and 498.00 ms. The
+candidate-only p95 controls were 477.22 and 478.43 ms. The paired p95
+difference changed from 20.20 to 1.47 ms with run order. The 21.01 ms
+baseline control spread prevents isolating a revision effect from this
+comparison. Decoder phase attribution remains open.
+
 ### Isolated Metal E4B HTTP comparison at `58b3917a89`
 
 The local M4 Max used the same pinned binaries as the mixed serving
