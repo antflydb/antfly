@@ -3011,3 +3011,12 @@ released T5-small merged ONNX decoder retained all 12 self-cache and
 12 cross-cache slots independently at prefixes 1, 8, 32 and 64. The
 released microbatch fixture fused suffixes after encoder retirement.
 Native also passed the DECIDE HTTP classification fixture.
+
+The same executable also passed the released prefill sweep at all 16
+combinations of batch widths 1, 2, 4 and 8 and prefix lengths 1, 8, 32
+and 64 on each provider. Each final vocabulary row matched its
+provider's batch-one reference within `1e-3`. Median of the final three
+calls, including the final-row readback, was 1.87 ms on Native and
+9.95 ms on Metal at batch one and one token. At batch eight and
+64 tokens, the corresponding medians were 166.42 and 16.06 ms.
+These are within-revision shape measurements.
