@@ -549,6 +549,7 @@ pub const CudaDecoderWorkspace = struct {
     declared_ffn_scratch_bytes: usize = 0,
     declared_ffn_output_bank_bytes: usize = 0,
     declared_projection_staging_bytes: usize = 0,
+    declared_final_norm_mirror_bytes: usize = 0,
     /// Bytes in the independently admitted bank. Arena-backed packets are
     /// already accounted for by bound_scratch_bytes.
     head_bytes: usize,

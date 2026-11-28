@@ -4002,6 +4002,7 @@ pub const CudaCompute = struct {
                     .declared_ffn_scratch_bytes = if (layout.ffn_workspace) |span| span.bytes else 0,
                     .declared_ffn_output_bank_bytes = if (layout.ffn_outputs) |span| span.bytes else 0,
                     .declared_projection_staging_bytes = if (layout.projection_staging) |span| span.bytes else 0,
+                    .declared_final_norm_mirror_bytes = if (layout.final_norm_mirror) |span| span.bytes else 0,
                     .head_bytes = layout.head_bytes,
                     .shared_head_scratch_bytes = if (layout.shared_head_workspace) |span| span.bytes else 0,
                     .head_packet_rows = layout.headPacketRows(owner.rows, owner.vocab),
