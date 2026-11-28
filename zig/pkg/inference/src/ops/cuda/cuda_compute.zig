@@ -21213,10 +21213,14 @@ fn audioInputStamp(tensor: *const CudaTensor) ?AudioArena.AudioInputStamp {
 fn stageAudioGraphInputs(self: *CudaCompute, arena: *AudioArena, input_bank: buffer_mod.DeviceBuffer, inputs: []const CT, spans: []const CudaCompute.AudioInputSpan) !@import("../../execution/runtime_observation.zig").AudioInputStaging {
     // The caller proves every source is outside the arena and the placement
     // gives each destination a separate slice. A batch has no internal order.
-    var next_stamps = arena.audio_staged_inputs;
+    const same_bank = input_bank.ptr == arena.audio_staged_bank;
+    var next_stamps: @TypeOf(arena.audio_staged_inputs) = @splat(null);
     // A failed batch can have submitted part of its work. Clear all receipts
     // so the next request restages every source regardless of old identity.
-    errdefer arena.audio_staged_inputs = @splat(null);
+    errdefer {
+        arena.audio_staged_bank = 0;
+        arena.audio_staged_inputs = @splat(null);
+    }
     var destinations: [CudaCompute.AudioPlan.max_inputs]driver_mod.CUdeviceptr = undefined;
     var sources: [CudaCompute.AudioPlan.max_inputs]driver_mod.CUdeviceptr = undefined;
     var sizes: [CudaCompute.AudioPlan.max_inputs]usize = undefined;
@@ -21225,7 +21229,7 @@ fn stageAudioGraphInputs(self: *CudaCompute, arena: *AudioArena, input_bank: buf
     for (inputs, spans, 0..) |ct, span, index| {
         const tensor = tensorFromCt(ct);
         const stamp = if (span.bytes == 0) null else audioInputStamp(tensor);
-        if (span.bytes != 0 and (stamp == null or !std.meta.eql(arena.audio_staged_inputs[index], stamp))) {
+        if (span.bytes != 0 and (!same_bank or stamp == null or !std.meta.eql(arena.audio_staged_inputs[index], stamp))) {
             destinations[count] = (try input_bank.borrowRange(span.offset, span.bytes)).ptr;
             sources[count] = tensor.buffer.ptr;
             sizes[count] = span.bytes;
@@ -21250,6 +21254,7 @@ fn stageAudioGraphInputs(self: *CudaCompute, arena: *AudioArena, input_bank: buf
             }
         }
     }
+    arena.audio_staged_bank = input_bank.ptr;
     arena.audio_staged_inputs = next_stamps;
     return receipt;
 }
@@ -21294,9 +21299,14 @@ test "CUDA audio graph staging refreshes mutable inputs and retains completed co
     const reset = try stageAudioGraphInputs(&compute, &arena, bank, &.{ replacement, new_constant }, &spans);
     try std.testing.expectEqual(2 * span, reset.copied_bytes);
     try std.testing.expectEqual(@as(usize, 0), reset.reused_bytes);
+    var other_bank = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, bank.len);
+    defer other_bank.free(&compute.ctx);
+    const rebound = try stageAudioGraphInputs(&compute, &arena, other_bank, &.{ replacement, new_constant }, &spans);
+    try std.testing.expectEqual(2 * span, rebound.copied_bytes);
+    try std.testing.expectEqual(@as(usize, 0), rebound.reused_bytes);
     var result: [2]f32 = undefined;
     for (spans) |copy| {
-        try (try bank.borrowRange(copy.offset, copy.bytes)).copyToHost(&compute.ctx, std.mem.asBytes(&result));
+        try (try other_bank.borrowRange(copy.offset, copy.bytes)).copyToHost(&compute.ctx, std.mem.asBytes(&result));
         try std.testing.expectEqualSlices(f32, &.{ 3, 4 }, &result);
     }
 }

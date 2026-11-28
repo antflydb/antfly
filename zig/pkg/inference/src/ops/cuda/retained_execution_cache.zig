@@ -103,6 +103,7 @@ pub fn Program(comptime Recipe: type) type {
             quota: CacheQuota = .none,
             output_quota: CacheQuota = .none,
             retained_output: ?RetainedOutput = null,
+            audio_staged_bank: driver.CUdeviceptr = 0,
             audio_staged_inputs: [@import("audio_execution_plan.zig").max_inputs]?AudioInputStamp = @splat(null),
             graph: driver.CUgraphExec = null,
             warm: bool = false,
