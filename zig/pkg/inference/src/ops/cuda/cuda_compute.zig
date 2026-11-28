@@ -63459,7 +63459,14 @@ test "CUDA cold audio declaration dispatches before any learning invocation" {
             const backend: *const ops.ComputeBackend = @ptrCast(@alignCast(raw));
             const projected = (try backend.tryBf16SourceOperation(&.{ .linear = .{ .input = inputs[0], .weight = inputs[1], .rows = 2, .width = 2, .columns = 2 } })) orelse return error.SourceArithmeticUnavailable;
             defer backend.free(projected);
-            return (try backend.tryBf16SourceOperation(&.{ .clamp = .{ .input = projected, .max = 0.5 } })) orelse error.SourceArithmeticUnavailable;
+            const publication = (try backend.tryBf16SourceOperation(&.{ .clamp = .{ .input = projected, .max = 0.5 } })) orelse return error.SourceArithmeticUnavailable;
+            errdefer backend.free(publication);
+            const bounded = (try backend.tryBf16SourceOperation(&.{ .clamp = .{ .input = publication, .min = 0.25, .reuse_owned_input = true } })) orelse return error.SourceArithmeticUnavailable;
+            if (bounded != publication) {
+                backend.free(bounded);
+                return error.InvalidExecutionPlan;
+            }
+            return publication;
         }
     };
     const cold_key = 0x304;
@@ -63472,6 +63479,7 @@ test "CUDA cold audio declaration dispatches before any learning invocation" {
     const steps = [_]Workspace.Step{
         .{ .output_bytes = publication_bytes, .scratch_bytes = layout.bytes },
         .{ .output_bytes = publication_bytes, .reads = &.{0} },
+        .{ .reads = &.{ 1, 0 } },
     };
     const workspace = try Workspace.compile(std.testing.allocator, &steps, 1);
     defer std.testing.allocator.free(workspace.events);
@@ -63486,7 +63494,7 @@ test "CUDA cold audio declaration dispatches before any learning invocation" {
     defer cb.free(first);
     const values = try cb.toFloat32(first, std.testing.allocator);
     defer std.testing.allocator.free(values);
-    try std.testing.expectEqualSlices(f32, &.{ 0.5, 0, 0, 0.5 }, values);
+    try std.testing.expectEqualSlices(f32, &.{ 0.5, 0.25, 0.25, 0.5 }, values);
     try std.testing.expect(!entry.warmed);
     try std.testing.expect(entry.owner.?.plan.origin == .declared);
     try std.testing.expectEqual(executes_before + 1, compute.audio_arena_executes);
