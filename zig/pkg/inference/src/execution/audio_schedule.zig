@@ -118,7 +118,8 @@ pub const ExecutionInputs = struct {
 };
 
 pub const WorkspaceDeclaration = struct {
-    const Event = @import("stream_workspace.zig").Plan.Declaration;
+    const Workspace = @import("stream_workspace.zig");
+    const Event = Workspace.Plan.Declaration;
 
     /// Events remain immutable throughout the synchronous Stage lifetime.
     events: []const Event,
@@ -149,11 +150,17 @@ pub const WorkspaceDeclaration = struct {
     /// Compile an output-producing audio program with operation-local scratch.
     /// The caller owns the result's events and frees them after the Stage ends.
     pub fn compile(a: std.mem.Allocator, steps: []const Step, publication: u15) !WorkspaceDeclaration {
-        if (publication >= steps.len) return error.InvalidExecutionPlan;
+        if (publication >= steps.len or steps.len > Workspace.Plan.slot_capacity) return error.InvalidExecutionPlan;
+        var slot_count = steps.len;
+        for (steps) |step| {
+            if (step.output_bytes == 0 or step.output_bytes > Workspace.limit or step.scratch_bytes > Workspace.limit)
+                return error.InvalidExecutionPlan;
+            slot_count += @intFromBool(step.scratch_bytes != 0);
+        }
+        if (slot_count > Workspace.Plan.slot_capacity) return error.InvalidExecutionPlan;
         const temporaries = try a.alloc(struct { last_use: usize, slot: u15 }, steps.len);
         defer a.free(temporaries);
         for (steps, temporaries, 0..) |step, *temporary, index| {
-            if (step.output_bytes == 0) return error.InvalidExecutionPlan;
             temporary.* = .{ .last_use = index, .slot = undefined };
             for (step.reads) |input| {
                 if (input >= index) return error.InvalidExecutionPlan;
@@ -162,24 +169,25 @@ pub const WorkspaceDeclaration = struct {
         }
         var events: std.ArrayList(Event) = .empty;
         defer events.deinit(a);
+        try events.ensureTotalCapacityPrecise(a, slot_count * 2 - 1);
         var next_slot: usize = 0;
         for (steps, temporaries, 0..) |step, *temporary, index| {
             temporary.slot = std.math.cast(u15, next_slot) orelse return error.InvalidExecutionPlan;
             next_slot += 1;
-            try events.append(a, .{ .allocate = step.output_bytes });
+            events.appendAssumeCapacity(.{ .allocate = step.output_bytes });
             if (step.scratch_bytes != 0) {
                 const scratch = std.math.cast(u15, next_slot) orelse return error.InvalidExecutionPlan;
                 next_slot += 1;
-                try events.append(a, .{ .allocate_scratch = step.scratch_bytes });
-                try events.append(a, .{ .release = scratch });
+                events.appendAssumeCapacity(.{ .allocate_scratch = step.scratch_bytes });
+                events.appendAssumeCapacity(.{ .release = scratch });
             }
             for (step.reads) |input| if (input != publication and temporaries[input].last_use == index) {
-                try events.append(a, .{ .release = temporaries[input].slot });
+                events.appendAssumeCapacity(.{ .release = temporaries[input].slot });
                 // Repeated reads are legal, but retire the producing slot once.
                 temporaries[input].last_use = steps.len;
             };
             if (index != publication and temporary.last_use == index)
-                try events.append(a, .{ .release = temporary.slot });
+                events.appendAssumeCapacity(.{ .release = temporary.slot });
         }
         return init(try events.toOwnedSlice(a), temporaries[publication].slot);
     }

@@ -64,6 +64,8 @@ comptime {
 pub const Origin = enum { observed, declared };
 
 pub const Plan = struct {
+    pub const slot_capacity = max_allocations;
+
     origin: Origin = .observed,
     allocations: [max_allocations]Allocation = undefined,
     events: [max_allocations * 2]Event = undefined,
