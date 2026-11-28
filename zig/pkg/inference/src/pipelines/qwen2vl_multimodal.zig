@@ -294,8 +294,9 @@ pub fn prepareExpandedPromptEmbeddings(
     var prepared_images = try allocator.alloc(PreparedImage, images.len);
     defer allocator.free(prepared_images);
     var prepared_count: usize = 0;
+    var consumed_count: usize = 0;
     defer {
-        for (prepared_images[0..prepared_count]) |*prepared| prepared.deinit();
+        for (prepared_images[consumed_count..prepared_count]) |*prepared| prepared.deinit();
     }
     for (images, 0..) |image_bytes, idx| {
         debugQwenVlStage("prepare image {d} bytes={d}", .{ idx, image_bytes.len });
@@ -321,7 +322,8 @@ pub fn prepareExpandedPromptEmbeddings(
     defer composition.deinit();
     for (prepared_images, 0..) |prepared, idx| {
         debugQwenVlStage("encode projected image {d}", .{idx});
-        const projected = try qwen2vl_vision.encodePreparedImageTokensTensor(cb, allocator, config, prep_cfg, prepared);
+        consumed_count += 1;
+        const projected = try qwen2vl_vision.encodeOwnedPreparedImageTokensTensor(cb, allocator, config, prep_cfg, prepared);
         defer cb.free(projected);
         const shape = try cb.tensorShape(projected, allocator);
         defer allocator.free(shape);

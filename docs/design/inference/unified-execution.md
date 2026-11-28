@@ -442,7 +442,13 @@ preparation API do not by themselves complete these remaining requirements:
   input, including earlier prepared images in both phases. Codec
   allocations above the forecast still acquire credit through the
   runtime allocator. Eighteen focused checks passed, covering retained
-  inputs, late growth, denial, cancellation and refunds.
+  inputs, late growth, denial, cancellation and refunds. Generation
+  transfers each prepared image to the encoder after validating the
+  full prompt. Normalized pixels retire after patch-row construction
+  and host patch rows retire after patch embedding. The borrowed encoder
+  callers share the same short patch-row lifetime. Seven Native and
+  Metal checks passed locally, and Spark passed all four CUDA and
+  cleanup checks, including parity against the Native image producer.
 
 - Imported ONNX and architecture graphs share the bounded specialization owner
   in `execution/specialization_cache.zig`, with stable executable handles,

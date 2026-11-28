@@ -1440,7 +1440,10 @@ const StreamingDocumentFixture = struct {
         defer a.free(held);
         // Independent original produce-all/assembly path, not another invocation
         // of the streaming helper. Partial runs consume 2/4 and 1/4 image rows.
-        const one = try qwen2vl_vision.encodePreparedImageTokensTensor(reference, a, cfg, prep, first);
+        var owned_first = first;
+        owned_first.allocator = a;
+        owned_first.pixel_values = try a.dupe(f32, first.pixel_values);
+        const one = try qwen2vl_vision.encodeOwnedPreparedImageTokensTensor(reference, a, cfg, prep, owned_first);
         defer reference.free(one);
         const two = try qwen2vl_vision.encodePreparedImageTokensTensor(reference, a, cfg, prep, second);
         defer reference.free(two);
