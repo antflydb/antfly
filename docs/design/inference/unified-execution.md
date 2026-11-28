@@ -3068,3 +3068,13 @@ classification fixture with CUDA required. Released T5-small passed
 the ONNX Runtime reference, kept all 24 cache slots independently
 owned at prefixes 1, 8, 32 and 64, and fused suffixes after encoder
 retirement. CUDA captured and replayed at each of those prefixes.
+
+The same Spark revision completed 256 LightOnOCR-3-4B pages across
+four concurrent 64-page requests with a 128-row registration limit.
+Every output matched the serial reference. The measured round took
+41.30 seconds at 6.20 pages/second, with 16-row head packets and
+separate graph replays at 60 and 98 rows. The benchmark recorded
+replay width but had disabled the verbose reader profile and did
+not identify the workspace origin. The first-replay receipt now
+includes the workspace origin, event count, and bytes under the
+existing benchmark switch.

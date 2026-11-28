@@ -63,17 +63,24 @@ def graph_first_replays(text):
     replays = re.findall(
         r"LIGHTONOCR3 cuda_model_graph_first_replay_rows=(\d+)"
         r"(?: capture=\d+ head_packet_rows=(\d+) head_bank_bytes=(\d+)"
-        r"(?: fused_head_scratch_bytes=(\d+))?)?",
+        r"(?: fused_head_scratch_bytes=(\d+))?"
+        r"(?: workspace_plan_origin=(observed|declared) workspace_events=(\d+) workspace_bytes=(\d+))?)?",
         text,
     )
     banks = []
-    for rows, packet, bank, fused in replays:
+    for rows, packet, bank, fused, origin, events, workspace in replays:
         if packet:
             entry = dict(rows=int(rows), packet_rows=int(packet), bank_bytes=int(bank))
             if fused:
                 entry["fused_head_scratch_bytes"] = int(fused)
+            if origin:
+                entry.update(
+                    workspace_plan_origin=origin,
+                    workspace_events=int(events),
+                    workspace_bytes=int(workspace),
+                )
             banks.append(entry)
-    return [int(rows) for rows, _, _, _ in replays], banks
+    return [int(rows) for rows, *_ in replays], banks
 
 
 def graph_retirements(text):
@@ -619,6 +626,7 @@ def run(args, model, label, mode, concurrency, output):
                 "ANTFLY_CUDA_ENABLE_LIGHTON_MODEL_GRAPH",
                 "ANTFLY_CUDA_LIGHTON_GRAPH_HEAD_PACKETS",
                 "ANTFLY_CUDA_LIGHTON_GRAPH_SHARE_HEAD_ARENA",
+                "ANTFLY_CUDA_LIGHTON_GRAPH_DECLARED_WARMUP",
                 "ANTFLY_CUDA_ENABLE_LIGHTON_PREFIX_SHARED_QK",
                 "ANTFLY_CUDA_ENABLE_LIGHTON_STATE_POOL",
                 "ANTFLY_CUDA_ENABLE_LIGHTON_SHARED_RECURRENT_WEIGHTS",

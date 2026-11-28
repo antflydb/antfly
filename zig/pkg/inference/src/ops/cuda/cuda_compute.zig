@@ -3902,8 +3902,11 @@ pub const CudaCompute = struct {
                     const layout = owner.storage_layout.?;
                     const packet_rows = layout.headPacketRows(owner.rows, owner.vocab);
                     const fused_scratch = if (layout.fused_head_workspace) |span| span.bytes else 0;
-                    std.debug.print("LIGHTONOCR3 cuda_model_graph_first_replay_rows={d} capture={d} head_packet_rows={d} head_bank_bytes={d} fused_head_scratch_bytes={d}\n", .{
-                        owner.rows, owner.captures, packet_rows, owner.head.len, fused_scratch,
+                    const plan_origin = if (owner.plan) |plan| @tagName(plan.origin) else "unknown";
+                    const workspace_events = if (owner.admitted_arena_layout) |arena| arena.events else 0;
+                    const workspace_bytes = if (owner.admitted_arena_layout) |arena| arena.bytes else 0;
+                    std.debug.print("LIGHTONOCR3 cuda_model_graph_first_replay_rows={d} capture={d} head_packet_rows={d} head_bank_bytes={d} fused_head_scratch_bytes={d} workspace_plan_origin={s} workspace_events={d} workspace_bytes={d}\n", .{
+                        owner.rows, owner.captures, packet_rows, owner.head.len, fused_scratch, plan_origin, workspace_events, workspace_bytes,
                     });
                 }
                 return;

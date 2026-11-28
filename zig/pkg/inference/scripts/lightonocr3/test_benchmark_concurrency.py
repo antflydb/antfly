@@ -64,7 +64,8 @@ class GraphReplayTests(unittest.TestCase):
                 prefix
                 + "64 capture=1 head_packet_rows=64 head_bank_bytes=0 fused_head_scratch_bytes=0",
                 prefix
-                + "64 capture=1 head_packet_rows=64 head_bank_bytes=0 fused_head_scratch_bytes=496640",
+                + "64 capture=1 head_packet_rows=64 head_bank_bytes=0 fused_head_scratch_bytes=496640"
+                + " workspace_plan_origin=declared workspace_events=0 workspace_bytes=0",
             )
         )
         rows, banks = graph_first_replays(text)
@@ -72,6 +73,10 @@ class GraphReplayTests(unittest.TestCase):
         self.assertNotIn("fused_head_scratch_bytes", banks[0])
         self.assertEqual(banks[1]["fused_head_scratch_bytes"], 0)
         self.assertEqual(banks[2]["fused_head_scratch_bytes"], 496640)
+        self.assertNotIn("workspace_plan_origin", banks[1])
+        self.assertEqual(banks[2]["workspace_plan_origin"], "declared")
+        self.assertEqual(banks[2]["workspace_events"], 0)
+        self.assertEqual(banks[2]["workspace_bytes"], 0)
 
 
 class GraphRetirementTests(unittest.TestCase):
