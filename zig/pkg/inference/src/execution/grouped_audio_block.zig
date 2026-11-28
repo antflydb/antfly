@@ -57,6 +57,8 @@ fn feedForward(ctx: anytype, input: @TypeOf(ctx.*).Value, second: bool) !@TypeOf
 }
 
 fn attend(ctx: anytype, input: @TypeOf(ctx.*).Value) !@TypeOf(ctx.*).Value {
+    const relative = try ctx.relativeKey();
+    defer ctx.releaseRelativeKey(relative);
     const attended = attention: {
         const q = try ctx.linear(.query, false, input);
         defer ctx.release(q);
@@ -64,7 +66,7 @@ fn attend(ctx: anytype, input: @TypeOf(ctx.*).Value) !@TypeOf(ctx.*).Value {
         defer ctx.release(k);
         const v = try ctx.linear(.value, false, input);
         defer ctx.release(v);
-        break :attention try ctx.attention(q, k, v);
+        break :attention try ctx.attention(q, k, v, relative);
     };
     defer ctx.release(attended);
     return ctx.linear(.attention_out, false, attended);

@@ -6655,6 +6655,18 @@ test "embeddinggemma2 CUDA original grouped Stage output escrow preserves instru
         max_declared_operation_scratch_intervals: usize = 0,
         max_captured_arena_bytes: usize = 0,
         max_repacked_scratch_savings_bytes: usize = 0,
+        fn setGraphPolicy(actual: Session, supplied: Control, enabled: bool) !bool {
+            var waiter = Scheduler.Waiter{};
+            try actual.enterExecutionCohort(actual.execution_gate, supplied, &waiter);
+            defer actual.leaveExecutionCohort(actual.execution_gate, &waiter);
+            const target = (try actual.coldComputeTarget(supplied)) orelse return error.MissingActualCudaTarget;
+            if (target != .cuda) return error.MissingActualCudaTarget;
+            const cuda = @import("../ops/cuda/cuda_compute.zig");
+            const compute: *cuda.CudaCompute = @ptrCast(@alignCast(target.cuda.implementation_context));
+            const previous = compute.embedding_gemma2_policy.audio_graph;
+            compute.embedding_gemma2_policy.audio_graph = enabled;
+            return previous;
+        }
         fn read(actual: Session, supplied: Control) !@This() {
             // Metadata only, under the SAME actual model cohort. Attest the
             // canonical full published CUDA table before inspecting its ctx;
@@ -6740,6 +6752,25 @@ test "embeddinggemma2 CUDA original grouped Stage output escrow preserves instru
             audio_after.replays - audio_before.replays,
             audio_after.max_declared_operation_scratch_intervals,
         });
+    }
+    if (audio_optin) {
+        stage = "compare eager grouped audio with captured execution";
+        const previous = try AudioWitness.setGraphPolicy(session, control, false);
+        const eager_audio = try embedAudios(a, session, hf.tokenizer(), &clips, options, session.execution_gate, control, null);
+        defer {
+            for (eager_audio.vectors) |vector| a.free(vector);
+            a.free(eager_audio.vectors);
+            a.free(eager_audio.input_tokens);
+        }
+        const eager_witness = try AudioWitness.read(session, control);
+        _ = try AudioWitness.setGraphPolicy(session, control, previous);
+        try std.testing.expectEqual(audio_after.executions, eager_witness.executions);
+        try std.testing.expectEqual(audio_after.replays, eager_witness.replays);
+        try std.testing.expectEqualSlices(usize, first_audio.input_tokens, eager_audio.input_tokens);
+        try std.testing.expectEqual(first_audio.vectors.len, eager_audio.vectors.len);
+        for (first_audio.vectors, eager_audio.vectors) |expected, actual| {
+            try std.testing.expectEqualSlices(f32, expected, actual);
+        }
     }
     // Existing six-second closed.mp4 naturally selects six unique frames:
     // image_batch uses one full4 +one final2 flush, without changing cadence.

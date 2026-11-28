@@ -5045,7 +5045,11 @@ const GroupedAudioDeclaration = struct {
         return self.allocate(lhs.width, 0);
     }
 
-    pub fn attention(self: *GroupedAudioDeclaration, _: Value, _: Value, _: Value) !Value {
+    pub fn relativeKey(_: *GroupedAudioDeclaration) !void {}
+
+    pub fn releaseRelativeKey(_: *GroupedAudioDeclaration, _: void) void {}
+
+    pub fn attention(self: *GroupedAudioDeclaration, _: Value, _: Value, _: Value, _: void) !Value {
         const recipe = self.recipe;
         return self.allocate(recipe.hidden, try self.scratch(.{ .attention = .{
             .rows = self.rows,
@@ -5169,19 +5173,31 @@ const GroupedAudioBlock = struct {
         return audioSourceRoundOwned(self.cb, self.cfg, try self.cb.add(lhs, rhs));
     }
 
-    pub fn attention(self: *const GroupedAudioBlock, q: CT, k: CT, v: CT) !CT {
-        const relative = self.inputs.relative_keys[self.layer - self.inputs.relative_key_start];
+    pub fn relativeKey(self: *const GroupedAudioBlock) !CT {
+        if (self.inputs.relative_keys.len != 0)
+            return self.inputs.relative_keys[self.layer - self.inputs.relative_key_start];
+        return (try audioRelativeKey(self.cb, self.allocator, self.store, self.cfg, self.inputs.rel_in, self.layer, false)).?;
+    }
+
+    pub fn releaseRelativeKey(self: *const GroupedAudioBlock, relative: CT) void {
+        if (self.inputs.relative_keys.len == 0) self.cb.free(relative);
+    }
+
+    pub fn attention(self: *const GroupedAudioBlock, q: CT, k: CT, v: CT, relative: CT) !CT {
         return audioLocalAttention(self.cb, self.allocator, self.cfg, q, k, v, relative, self.layer, self.inputs);
     }
 };
 
 fn runAudioLayers(cb: *const ComputeBackend, a: std.mem.Allocator, store: *ProjectorWeights, cfg: AudioConfig, hidden: CT, inputs: *AudioLayerInputs, start: usize, end: usize) !CT {
+    const shared_block = cfg.source_scalar_storage == .bf16 and (inputs.relative_keys.len != 0 or
+        (cb.kind() == .cuda and store.huggingface and store.gguf == null and inputs.segments.len > 1 and
+            std.meta.eql(audioHostOps(), AudioHostOps{}) and platform.env.getenv("ANTFLY_EMBEDDINGGEMMA2_STAGES") == null));
     var state = hidden;
     var owned = false;
     errdefer if (owned) cb.free(state);
     for (start..end) |layer| {
         try cb.checkExecutionControl();
-        const next = if (cfg.source_scalar_storage == .bf16 and inputs.relative_keys.len != 0)
+        const next = if (shared_block)
             try grouped_audio_block.run(&GroupedAudioBlock{ .cb = cb, .allocator = a, .store = store, .cfg = cfg, .inputs = inputs, .layer = layer }, state)
         else
             try audioLayer(cb, a, store, cfg, state, inputs, layer);
@@ -5567,12 +5583,8 @@ fn audioSelfAttention(
     const valid_mask = inputs.valid_mask;
     const rows = valid_mask.len;
     var buf: [128]u8 = undefined;
-    const prepared = inputs.relative_keys.len != 0;
-    const rel = if (prepared)
-        inputs.relative_keys[layer - inputs.relative_key_start]
-    else
-        (try audioRelativeKey(cb, allocator, store, cfg, inputs.rel_in, layer, false)).?;
-    defer if (!prepared) cb.free(rel);
+    const rel = (try audioRelativeKey(cb, allocator, store, cfg, inputs.rel_in, layer, false)).?;
+    defer cb.free(rel);
     const choice = if (cfg.source_scalar_storage == .bf16) null else try packedAudioQkv(cb, allocator, store, input, rows, cfg.audio_hidden, layer);
     const packed_rows: ?ops.LinearTripleResult = if (choice) |value| switch (value) {
         .separate => |triple| triple,
