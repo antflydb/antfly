@@ -51947,7 +51947,9 @@ test "LightOnOCR3 mixed decoder envelope admits the prefill and physical decode 
     var grouped = Node.LightOnCohortMemory{ .share_decoder_scratch = true, .decoder_rows = 64, .packed_mixed = true, .max_prefill_batch_items = 2 };
     try grouped.add(cfg, 432, 256, decoder, .{});
     try std.testing.expectEqualDeep(mixed.amounts, grouped.amounts);
-    try std.testing.expect(grouped.decoder_backend_peak >= 2 * required + 64 * cfg.vocab_size * @sizeOf(f32));
+    const grouped_required = required + 2 * decoder.backend_scratch_bytes + 64 * cfg.vocab_size * @sizeOf(f32);
+    try std.testing.expectEqual(grouped_required, try grouped.decoder_workspace.requiredBytes(2));
+    try std.testing.expect(grouped.decoder_backend_peak >= grouped_required);
     var invalid = Node.LightOnCohortMemory{ .share_decoder_scratch = true, .decoder_rows = 64, .packed_mixed = true, .max_prefill_batch_items = 9 };
     try std.testing.expectError(error.ResourceLimitExceeded, invalid.add(cfg, 432, 256, decoder, .{}));
 }
@@ -51968,7 +51970,7 @@ test "LightOnOCR3 chunk groups retain complete pages and admit both bounded work
             var grouped = Node.LightOnCohortMemory{ .share_decoder_scratch = true, .packed_mixed = true, .decoder_rows = 64, .max_prefill_batch_items = 4, .prefill_query_chunk_rows = chunk };
             try grouped.add(cfg, prompt, 256, decoder, vision);
             try std.testing.expectEqualDeep(whole.amounts, grouped.amounts);
-            const two_sets = try std.math.divCeil(usize, bounded.scratch_bytes * 8 * (rows + 63), rows);
+            const two_sets = bounded.scratch_bytes * 8 + try std.math.divCeil(usize, bounded.scratch_bytes * 2 * 63, rows);
             try std.testing.expect(grouped.decoder_backend_peak >= two_sets + 64 * 248320 * @sizeOf(f32));
             try std.testing.expect(grouped.decoder_backend_peak <= whole.decoder_backend_peak);
             const complete = try grouped.finish();
