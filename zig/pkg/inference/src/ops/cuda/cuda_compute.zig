@@ -30088,20 +30088,12 @@ pub fn tryCapturedAttentionGate(cb: *const ops.ComputeBackend, attention: CT, ga
     return true;
 }
 
-pub fn tryCapturedQkvProjection(cb: *const ops.ComputeBackend, input: CT, weight: CT, rows: usize, in_dim: usize, out_dim: usize, kind: @import("bounded_decode_graph.zig").Module.AttentionProjection) !?CT {
-    if (!acceptsPhysicalImplementation(cb.vtable)) return null;
-    const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
-    const owner = &self.bounded_decode_graph;
-    if (!owner.active or self.capability_profile != .lightonocr3 or rows != owner.rows or in_dim != owner.hidden) return null;
-    const lhs = tensorFromCt(input);
-    const rhs = tensorFromCt(weight);
-    const bytes = try lightOnLinearOutputBytes(self, rhs, rows, out_dim);
-    const destination = (try owner.bindAttentionProjection(kind, bytes)) orelse return null;
-    if (kernel_geometry.byteRangesOverlap(destination.ptr, destination.len, lhs.bf16_mirror.ptr, lhs.bf16_mirror.len)) return error.InvalidAssignedAlias;
-    return try cb.observeBackendEntry(.linear_no_bias, &linearNoBiasWithDestination, .{ self, input, weight, rows, in_dim, out_dim, false, @as(?buffer_mod.DeviceBuffer, destination) });
-}
+const DecoderInputProjection = union(enum) {
+    attention: @import("bounded_decode_graph.zig").Module.AttentionProjection,
+    recurrent: @import("bounded_decode_graph.zig").Module.RecurrentProjection,
+};
 
-pub fn tryCapturedRecurrentProjection(cb: *const ops.ComputeBackend, input: CT, weight: CT, rows: usize, in_dim: usize, out_dim: usize, kind: @import("bounded_decode_graph.zig").Module.RecurrentProjection) !?CT {
+pub fn tryCapturedInputProjection(cb: *const ops.ComputeBackend, input: CT, weight: CT, rows: usize, in_dim: usize, out_dim: usize, kind: DecoderInputProjection) !?CT {
     if (!acceptsPhysicalImplementation(cb.vtable)) return null;
     const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
     const owner = &self.bounded_decode_graph;
@@ -30109,7 +30101,10 @@ pub fn tryCapturedRecurrentProjection(cb: *const ops.ComputeBackend, input: CT, 
     const lhs = tensorFromCt(input);
     const rhs = tensorFromCt(weight);
     const bytes = try lightOnLinearOutputBytes(self, rhs, rows, out_dim);
-    const destination = (try owner.bindRecurrentProjection(kind, bytes)) orelse return null;
+    const destination = (try switch (kind) {
+        .attention => |part| owner.bindAttentionProjection(part, bytes),
+        .recurrent => |part| owner.bindRecurrentProjection(part, bytes),
+    }) orelse return null;
     if (kernel_geometry.byteRangesOverlap(destination.ptr, destination.len, lhs.bf16_mirror.ptr, lhs.bf16_mirror.len)) return error.InvalidAssignedAlias;
     return try cb.observeBackendEntry(.linear_no_bias, &linearNoBiasWithDestination, .{ self, input, weight, rows, in_dim, out_dim, false, @as(?buffer_mod.DeviceBuffer, destination) });
 }
@@ -48274,11 +48269,11 @@ test "LightOnOCR3 CUDA graph warm input and wide head write their assigned buffe
         const q_weights = try cb.fromFloat32Shape(&.{ 1, 0, 0, 1, 1, 1, 1, -1 }, &.{ 4, 2 });
         defer cb.free(q_weights);
         const before_qkv = compute.stats.device_alloc_calls;
-        const q = (try tryCapturedQkvProjection(&cb, input, q_weights, 3, 2, 4, .query)) orelse return error.TestUnexpectedResult;
+        const q = (try tryCapturedInputProjection(&cb, input, q_weights, 3, 2, 4, .{ .attention = .query })) orelse return error.TestUnexpectedResult;
         defer cb.free(q);
-        const k = (try tryCapturedQkvProjection(&cb, input, weight, 3, 2, 2, .key)) orelse return error.TestUnexpectedResult;
+        const k = (try tryCapturedInputProjection(&cb, input, weight, 3, 2, 2, .{ .attention = .key })) orelse return error.TestUnexpectedResult;
         defer cb.free(k);
-        const v = (try tryCapturedQkvProjection(&cb, input, weight, 3, 2, 2, .value)) orelse return error.TestUnexpectedResult;
+        const v = (try tryCapturedInputProjection(&cb, input, weight, 3, 2, 2, .{ .attention = .value })) orelse return error.TestUnexpectedResult;
         defer cb.free(v);
         const q_and_gate = (try tryCapturedSplitQueryGate(&cb, q, 3, 2, 1)) orelse return error.TestUnexpectedResult;
         defer for (q_and_gate) |tensor_value| cb.free(tensor_value);
@@ -48341,7 +48336,7 @@ test "LightOnOCR3 CUDA graph warm input and wide head write their assigned buffe
         }
         const before_recurrent = compute.stats.device_alloc_calls;
         for ([_]@import("bounded_decode_graph.zig").Module.RecurrentProjection{ .mixed, .gate, .beta, .decay }, 0..) |kind, index| {
-            const result = (try tryCapturedRecurrentProjection(&cb, input, weight, 3, 2, 2, kind)) orelse return error.TestUnexpectedResult;
+            const result = (try tryCapturedInputProjection(&cb, input, weight, 3, 2, 2, .{ .recurrent = kind })) orelse return error.TestUnexpectedResult;
             defer cb.free(result);
             try std.testing.expectEqual(metadata.ptr + projection_offset + index * norm_bytes, tensorFromCt(result).buffer.ptr);
             const values = try cb.toFloat32(result, a);

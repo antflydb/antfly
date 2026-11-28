@@ -9051,7 +9051,7 @@ fn qwen35OutputProjection(cb: *const ComputeBackend, core: CT, weight: CT, resid
 fn recurrentInputProjection(cb: *const ComputeBackend, input: CT, weight: CT, rows: usize, hidden: usize, width: usize, kind: @import("../ops/cuda/bounded_decode_graph.zig").Module.RecurrentProjection) !CT {
     if (comptime build_options.enable_cuda) {
         const cuda = @import("../ops/cuda/cuda_compute.zig");
-        if (try cuda.tryCapturedRecurrentProjection(cb, input, weight, rows, hidden, width, kind)) |result| return result;
+        if (try cuda.tryCapturedInputProjection(cb, input, weight, rows, hidden, width, .{ .recurrent = kind })) |result| return result;
     }
     return cb.linearNoBias(input, weight, rows, hidden, width);
 }
@@ -13145,7 +13145,7 @@ fn attnProject(
                 if (config.hasQwen35VisionArchitectureContract() and cb.kind() == .cuda) {
                     const projection: @import("../ops/cuda/bounded_decode_graph.zig").Module.AttentionProjection =
                         if (std.mem.eql(u8, proj, "q")) .query else if (std.mem.eql(u8, proj, "k")) .key else .value;
-                    if (try @import("../ops/cuda/cuda_compute.zig").tryCapturedQkvProjection(cb, input, w, total, in_dim, out_dim, projection)) |assigned| return assigned;
+                    if (try @import("../ops/cuda/cuda_compute.zig").tryCapturedInputProjection(cb, input, w, total, in_dim, out_dim, .{ .attention = projection })) |assigned| return assigned;
                 }
             }
             return cb.linearNoBias(input, w, total, in_dim, out_dim);
