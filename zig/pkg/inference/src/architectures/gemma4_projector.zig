@@ -3946,6 +3946,18 @@ pub fn embeddingGemma2PreparedScratch(images: []const PreparedImage, limit: usiz
     return @min(sum, limit);
 }
 
+/// Minimum tower budget for one source-padded image. The batch slicer can
+/// split a cohort, but cannot split the source GEMM rows of an individual image.
+pub fn embeddingGemma2SourceVisionScratch(images: []const PreparedImage) !usize {
+    const cfg = embeddingGemma2ImageConfig();
+    var peak: usize = 0;
+    for (images) |item| {
+        const physical = try sourceVisionPhysicalRows(cfg, item.geometry);
+        peak = @max(peak, try imageScratchBytes(cfg, physical));
+    }
+    return peak;
+}
+
 /// Additional CUDA source pooling bank: physical source rows, full pooled
 /// output and original BLAS workspace. Serialized images reuse one bank.
 pub fn embeddingGemma2SourcePoolScratch(images: []const PreparedImage, selected: bool) !usize {
@@ -6901,6 +6913,10 @@ fn sourceVisionSequence(cb: *const ComputeBackend, cfg: Config, geometry: Geomet
     if (sourcePixelStorage(cb.kind(), cfg) == .f32) return null;
     if (try cb.sourceVisionGeometry() != .source_padded) return null;
     _ = try cb.sourceScalarStorage(.linear);
+    return try sourceVisionPhysicalRows(cfg, geometry);
+}
+
+fn sourceVisionPhysicalRows(cfg: Config, geometry: Geometry) !usize {
     const rows = try @import("../ops/kernel_geometry.zig").SourceGemmRows.resolve(try std.math.mul(usize, geometry.grid_x, geometry.grid_y), cfg.maxPatchCount());
     return rows.physical;
 }

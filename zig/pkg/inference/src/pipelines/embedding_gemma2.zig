@@ -3690,21 +3690,25 @@ fn boundedGroupPlanning(backend: @import("../backends/backends.zig").BackendType
 fn preparedVisionScratch(session: Session, images: []const projector.PreparedImage, limit: usize, control: Control) !usize {
     const backend = session.backend();
     const tower = if (boundedVision(backend)) try projector.embeddingGemma2PreparedPlanScratch(images) else try projector.embeddingGemma2PreparedScratch(images, limit);
-    // CPU/Metal retain their existing arithmetic and memory admission. CUDA's
-    // source pooling bank is live in addition to the already retained tower.
-    // Unknown custom cold receivers retain a conservative source-bank bound.
-    // Authenticated full-F32 receivers keep their original footprint exactly.
+    // CUDA source projections may pad tower rows and keep a separate pooling
+    // bank live. Use both bounds for receivers without an authenticated policy.
     var source_pool = backend == .cuda;
+    var source_padded = source_pool;
     if (comptime @import("build_options").enable_cuda) if (source_pool) {
         if (try @import("../backends/cold_compute_target.zig").Retained.acquire(session, control)) |value| {
             var retained = value;
             defer retained.deinit();
-            if (try @import("../ops/cuda/cuda_compute.zig").CudaCompute.sourceScalarStorageForTarget(retained.target, .linear)) |linear|
+            const CudaCompute = @import("../ops/cuda/cuda_compute.zig").CudaCompute;
+            if (try CudaCompute.sourceVisionGeometryForTarget(retained.target)) |geometry|
+                source_padded = geometry == .source_padded;
+            if (try CudaCompute.sourceScalarStorageForTarget(retained.target, .linear)) |linear|
                 source_pool = projector.embeddingGemma2SourcePoolSelected(.cuda, linear);
         }
     };
     const pool = try projector.embeddingGemma2SourcePoolScratch(images, source_pool);
-    return std.math.add(usize, tower, pool);
+    const source_tower = if (source_padded) try projector.embeddingGemma2SourceVisionScratch(images) else 0;
+    if (source_tower > limit) return error.ImageBatchBudgetExceeded;
+    return std.math.add(usize, @max(tower, source_tower), pool);
 }
 
 pub fn boundedVision(backend: @import("../backends/backends.zig").BackendType) bool {
@@ -5580,6 +5584,21 @@ test "embeddinggemma2 CUDA prepared mixed cohorts preserve singleton vectors and
         try std.testing.expectEqual(count, raw_count);
         try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(vector), std.mem.sliceAsBytes(raw_vector));
     }
+    // A single image needs the full padded CUDA source-row reservation.
+    const single_control = Control{ .native_call_policy = .in_process };
+    var single_errors: [1]?anyerror = @splat(null);
+    const single = try embedGroupCohort(a, session, hf.tokenizer(), groups[0..1], .{}, null, single_control, &single_errors);
+    defer {
+        for (single.vectors) |row| a.free(row);
+        a.free(single.vectors);
+        a.free(single.input_tokens);
+    }
+    try std.testing.expectEqual(@as(?anyerror, null), single_errors[0]);
+    const single_expected = try embed(a, session, hf.tokenizer(), groups[0], .{}, null, single_control);
+    defer a.free(single_expected.vector);
+    try std.testing.expectEqual(single_expected.input_tokens, single.input_tokens[0]);
+    try std.testing.expectEqualSlices(f32, single_expected.vector, single.vectors[0]);
+
     for (groups, actual.vectors, actual.input_tokens, errors) |group, vector, count, err| {
         try std.testing.expectEqual(@as(?anyerror, null), err);
         const expected = try embed(a, session, hf.tokenizer(), group, .{}, null, .{ .native_call_policy = .in_process });
