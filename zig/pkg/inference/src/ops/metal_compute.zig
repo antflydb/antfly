@@ -4665,19 +4665,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         buf.view_base_offset = 0;
     }
 
-    fn logicalValueAtFlat(buf: *const Buf, flat: usize) !f32 {
+    fn rawHostSliceForLogicalRead(buf: *Buf) ![]const f32 {
         if (buf.quantized_storage != null) return error.UnsupportedTensorType;
-        // Resolve the raw physical bytes first; view metadata (if any)
-        // then remaps the logical address into them. A metal-backed buf
-        // carrying view metadata previously short-circuited here and
-        // returned the RAW mirror bytes — the host-route elementwise
-        // fallbacks (hostFallbackBinary) then consumed a silently
-        // PERMUTED operand (identical abs-sum, wrong order): the GLiNER2
-        // LoRA batch-tile divergence class.
-        const source: []const f32 = if (buf.metal_tensor) |metal_tensor| blk: {
-            var tensor_mut = metal_tensor;
-            break :blk try tensor_mut.toHostSlice();
-        } else buf.data;
+        // Keep a Private-storage mirror on the owning tensor so Buf teardown
+        // can free it. Leave view metadata intact for logical indexing.
+        return if (buf.metal_tensor) |*tensor| try tensor.toHostSlice() else buf.data;
+    }
+
+    fn logicalValueAtFlat(buf: *const Buf, source: []const f32, flat: usize) !f32 {
         if (!hasHostView(buf)) {
             return source[wrapRepeatedBufferIndex(flat, source.len)];
         }
@@ -10839,35 +10834,20 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             const output = try self.allocator.alloc(f32, big_len);
             errdefer self.allocator.free(output);
 
-            if (small_len == big_len) {
-                for (0..big_len) |i| {
-                    const va = if (a_is_big) try logicalValueAtFlat(a_buf, i) else try logicalValueAtFlat(b_buf, i);
-                    const vb = if (a_is_big) try logicalValueAtFlat(b_buf, i) else try logicalValueAtFlat(a_buf, i);
-                    const a_val = if (a_is_big) va else vb;
-                    const b_val = if (a_is_big) vb else va;
-                    output[i] = switch (op_kind) {
-                        .add => a_val + b_val,
-                        .multiply => a_val * b_val,
-                        .subtract => a_val - b_val,
-                        .divide => a_val / b_val,
-                        .less_than => if (a_val < b_val) 1.0 else 0.0,
-                        else => return error.UnsupportedPrimitiveOp,
-                    };
-                }
-            } else {
-                for (0..big_len) |i| {
-                    const bi = i % small_len;
-                    const a_val = if (a_is_big) try logicalValueAtFlat(a_buf, i) else try logicalValueAtFlat(a_buf, bi);
-                    const b_val = if (a_is_big) try logicalValueAtFlat(b_buf, bi) else try logicalValueAtFlat(b_buf, i);
-                    output[i] = switch (op_kind) {
-                        .add => a_val + b_val,
-                        .multiply => a_val * b_val,
-                        .subtract => a_val - b_val,
-                        .divide => a_val / b_val,
-                        .less_than => if (a_val < b_val) 1.0 else 0.0,
-                        else => return error.UnsupportedPrimitiveOp,
-                    };
-                }
+            const a_source: []const f32 = if (big_len == 0) &.{} else try rawHostSliceForLogicalRead(a_buf);
+            const b_source: []const f32 = if (big_len == 0) &.{} else try rawHostSliceForLogicalRead(b_buf);
+            for (0..big_len) |i| {
+                const small_idx = i % small_len;
+                const a_val = try logicalValueAtFlat(a_buf, a_source, if (a_is_big) i else small_idx);
+                const b_val = try logicalValueAtFlat(b_buf, b_source, if (a_is_big) small_idx else i);
+                output[i] = switch (op_kind) {
+                    .add => a_val + b_val,
+                    .multiply => a_val * b_val,
+                    .subtract => a_val - b_val,
+                    .divide => a_val / b_val,
+                    .less_than => if (a_val < b_val) 1.0 else 0.0,
+                    else => return error.UnsupportedPrimitiveOp,
+                };
             }
 
             if (a_len == b_len) {
@@ -10946,6 +10926,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const output = try self.allocator.alloc(f32, out_numel);
         errdefer self.allocator.free(output);
 
+        const a_source: []const f32 = if (out_numel == 0) &.{} else try rawHostSliceForLogicalRead(a_buf);
+        const b_source: []const f32 = if (out_numel == 0) &.{} else try rawHostSliceForLogicalRead(b_buf);
         for (0..out_numel) |flat| {
             var rem = flat;
             var a_idx: usize = 0;
@@ -10956,8 +10938,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 if (a_aligned[axis] != 1) a_idx += coord * a_strides[axis];
                 if (b_aligned[axis] != 1) b_idx += coord * b_strides[axis];
             }
-            const a_val = if (tryDirectDenseHostValue(a_buf, a_idx)) |value| value else try logicalValueAtFlat(a_buf, a_idx);
-            const b_val = if (tryDirectDenseHostValue(b_buf, b_idx)) |value| value else try logicalValueAtFlat(b_buf, b_idx);
+            const a_val = try logicalValueAtFlat(a_buf, a_source, a_idx);
+            const b_val = try logicalValueAtFlat(b_buf, b_source, b_idx);
             output[flat] = switch (op_kind) {
                 .add => a_val + b_val,
                 .multiply => a_val * b_val,
@@ -42484,8 +42466,9 @@ test "metal_compute: batch-tile broadcast of metal-backed view goes through view
     // see the logical contents BEFORE any destructive materialization.
     {
         const x_buf = MetalCompute.toBuf(x);
+        const source = try MetalCompute.rawHostSliceForLogicalRead(x_buf);
         for (0..24) |flat| {
-            const got = try MetalCompute.logicalValueAtFlat(x_buf, flat);
+            const got = try MetalCompute.logicalValueAtFlat(x_buf, source, flat);
             try std.testing.expectApproxEqAbs(logical_expected[flat], got, 0.0);
         }
     }
@@ -43497,6 +43480,47 @@ test "embeddinggemma2 BF16 row slice converts only the requested rows" {
     try std.testing.expectEqualSlices(f32, &@as([128]f32, @splat(1)), values);
     try std.testing.expect(source.native_dense_host_cache == null);
     try std.testing.expect(fixed.end_index < backing.len);
+}
+
+test "metal_compute: host binary fallback downloads each private operand once and releases its mirror" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var store = testMetalWeightStoreInit(allocator);
+    defer store.lazy_weights.deinit(allocator);
+    defer deinitSharedNativeProvider(&store);
+    var compute = try MetalCompute.init(allocator, &store, null);
+    defer compute.deinit();
+    var cb = compute.computeBackend();
+    const raw_runtime = compute.provider_impl.raw_decode_runtime orelse return error.SkipZigTest;
+    const lhs = try cb.fromFloat32Shape(&.{ 10, 20, 30, 40, 50, 60 }, &.{ 2, 3 });
+    defer cb.free(lhs);
+    const rhs_values = [_]f32{ 1, 2, 3 };
+
+    const initial = metal_tensor_mod.memoryStatsSnapshot();
+    for ([_]?[]const i64{ null, &.{ -1, 3 } }) |lhs_shape| {
+        {
+            const rhs = blk: {
+                var tensor = try MetalTensor.deviceAllocateTyped(allocator, @ptrCast(raw_runtime), .f32, .private, &.{3});
+                errdefer tensor.deinit();
+                try tensor.uploadBytes(std.mem.asBytes(&rhs_values));
+                break :blk try compute.ctFromOwnedMetalTensor(tensor);
+            };
+            defer cb.free(rhs);
+            const before = metal_tensor_mod.memoryStatsSnapshot();
+            const result = try compute.hostFallbackBinary(lhs, rhs, lhs_shape, null, .subtract);
+            defer cb.free(result);
+            const after = metal_tensor_mod.memoryStatsSnapshot();
+            try std.testing.expectEqual(before.to_host_device_calls + 1, after.to_host_device_calls);
+            try std.testing.expectEqual(before.host_mirror_allocations + 1, after.host_mirror_allocations);
+            try std.testing.expectEqual(before.host_mirror_live_bytes + @sizeOf(@TypeOf(rhs_values)), after.host_mirror_live_bytes);
+
+            const actual = try cb.toFloat32(result, allocator);
+            defer allocator.free(actual);
+            try std.testing.expectEqualSlices(f32, &.{ 9, 18, 27, 39, 48, 57 }, actual);
+        }
+        try std.testing.expectEqual(initial.host_mirror_live_bytes, metal_tensor_mod.memoryStatsSnapshot().host_mirror_live_bytes);
+    }
 }
 
 test "metal_compute: row slice wrapper allocation failures release retained backing and retry" {
