@@ -3789,6 +3789,57 @@ const ScopedReplay = struct {
         };
         try self.state.parkBounded(runtime.alloc, group, deadline, budget, digest, stamp, location, scoped_retries.max_bytes, Publisher{ .scheduler = self, .runtime = runtime, .publication = publication });
     }
+    fn firstSleepingDocument(self: *const @This(), document: []const u8) ?usize {
+        const sleeping = self.state.sleeping;
+        if (sleeping.entries.items.len == 0) return null;
+        const id = scoped_retries.backlog.Identity.init(document, 0);
+        const index = sleeping.lowerBound(id);
+        if (index == sleeping.entries.items.len or !std.mem.eql(u8, &sleeping.entries.items[index].id.document, &id.document)) return null;
+        return index;
+    }
+
+    fn loadSleepingDeadlines(
+        self: *@This(),
+        runtime: *EnrichmentRuntime,
+        document: []const u8,
+        observed: retry_source.Observation,
+        definitions: []const u64,
+    ) !std.AutoHashMapUnmanaged(u64, u64) {
+        const snapshot = snapshot: {
+            const io = concurrencyIo(runtime);
+            self.mutex.lockUncancelable(io);
+            defer self.mutex.unlock(io);
+            const first = self.firstSleepingDocument(document) orelse return .empty;
+            const entries = self.state.sleeping.entries.items;
+            const identity = entries[first].id.document;
+            var end = first + 1;
+            while (end < entries.len and std.mem.eql(u8, &entries[end].id.document, &identity)) : (end += 1) {}
+            break :snapshot try runtime.alloc.dupe(scoped_retries.backlog.Entry, entries[first..end]);
+        };
+        defer runtime.alloc.free(snapshot);
+        var deadlines: std.AutoHashMapUnmanaged(u64, u64) = .empty;
+        errdefer deadlines.deinit(runtime.alloc);
+        // A due ticket can encounter another producer for the same primary.
+        // Cold entries remain stable during lane execution. Check the owner
+        // and read their clocks outside the scheduler mutex.
+        for (snapshot) |entry| {
+            try runtime.active_provider_guard.check();
+            const raw = try enrichment_state.loadScopedRetryBacklogRow(runtime.alloc, runtime.store, entry);
+            defer runtime.alloc.free(raw);
+            var decoded = try scoped_retries.State.readSleeping(runtime.alloc, entry, raw);
+            defer decoded.ticket.deinit(runtime.alloc);
+            if (!ticketCurrent(decoded.ticket, observed)) continue;
+            for (decoded.ticket.budgets.items) |budget| {
+                if (std.mem.indexOfScalar(u64, definitions, budget.logical_fingerprint) == null) continue;
+                const saved = try deadlines.getOrPut(runtime.alloc, budget.logical_fingerprint);
+                if (!saved.found_existing) saved.value_ptr.* = 0;
+                saved.value_ptr.* = @max(saved.value_ptr.*, budget.deadline_ms);
+            }
+        }
+        try runtime.active_provider_guard.check();
+        return deadlines;
+    }
+
     /// Dependency priming precedes ordinary document replay. Consult the same
     /// source/incarnation/definition-bound tickets before invoking a root.
     /// Healthy roots do one indexed lookup and no additional primary read.
@@ -3796,12 +3847,21 @@ const ScopedReplay = struct {
         const logical = logicalRequestFingerprint(root);
         const io = concurrencyIo(runtime);
         self.mutex.lockUncancelable(io);
-        const present = self.state.hasLogical(runtime.alloc, logical) catch |err| {
+        const active = self.state.hasLogical(runtime.alloc, logical) catch |err| {
             self.mutex.unlock(io);
             return err;
         };
+        const has_sleepers = self.state.sleeping.entries.items.len != 0;
         self.mutex.unlock(io);
-        if (!present) return false;
+        if (!active and !has_sleepers) return false;
+        if (!active) {
+            const key = try documentKey(runtime.alloc, group.doc_key);
+            defer runtime.alloc.free(key);
+            self.mutex.lockUncancelable(io);
+            const sleeping = self.firstSleepingDocument(key) != null;
+            self.mutex.unlock(io);
+            if (!sleeping) return false;
+        }
         const planned = try prepareDocumentRequests(runtime, group, templates);
         defer runtime.alloc.free(planned);
         const delayed = try self.prepareDocument(runtime, group, planned);
@@ -3813,7 +3873,7 @@ const ScopedReplay = struct {
         defer runtime.alloc.free(key);
         const io = concurrencyIo(runtime);
         self.mutex.lockUncancelable(io);
-        const present = self.state.hasDocument(key);
+        const present = self.state.hasDocument(key) or self.firstSleepingDocument(key) != null;
         self.mutex.unlock(io);
         if (!present) return runtime.alloc.alloc(u64, 0);
         const observed = try observeSource(runtime, group.doc_key, null, true);
@@ -3821,6 +3881,9 @@ const ScopedReplay = struct {
         const definitions = try runtime.alloc.alloc(u64, planned.len);
         defer runtime.alloc.free(definitions);
         for (planned, definitions) |request, *definition| definition.* = logicalRequestFingerprint(request);
+        const now_ms = runtime.clock.nowRealtimeMs();
+        var sleeping_deadlines = try self.loadSleepingDeadlines(runtime, key, observed, definitions);
+        defer sleeping_deadlines.deinit(runtime.alloc);
         var publication = try RuntimePublicationStore.initRetryWrite(runtime);
         defer publication.deinit();
         self.mutex.lockUncancelable(io);
@@ -3840,12 +3903,23 @@ const ScopedReplay = struct {
                 removed = true;
             } else index += 1;
         }
-        const delayed = try self.state.prepareDocument(runtime.alloc, key, digest, definitions, runtime.clock.nowRealtimeMs());
-        errdefer runtime.alloc.free(delayed.delayed);
-        // Definition pruning precedes the next invocation, under the same
-        // live namespace and catalog fence as ticket publication.
-        if (removed or delayed.changed) try self.saveAssumeLocked(runtime, publication.store(runtime).*, publication.retry_fence);
-        return delayed.delayed;
+        const active = try self.state.prepareDocument(runtime.alloc, key, digest, definitions, now_ms);
+        var delayed = std.ArrayListUnmanaged(u64).fromOwnedSlice(active.delayed);
+        defer delayed.deinit(runtime.alloc);
+        if (removed or active.changed) self.unsaved = true;
+        var deadlines = sleeping_deadlines.iterator();
+        while (deadlines.next()) |entry| {
+            const logical = entry.key_ptr.*;
+            const deadline_ms = entry.value_ptr.*;
+            if (deadline_ms <= now_ms and self.state.hasActiveDocumentBudget(key, digest, logical)) continue;
+            // Even once its deadline matures, a cold-only producer still
+            // owns its retry accounting. Let promotion make it runnable.
+            if (std.mem.indexOfScalar(u64, delayed.items, logical) == null) try delayed.append(runtime.alloc, logical);
+            if (try self.state.extendDocumentDeadline(key, digest, logical, deadline_ms)) self.unsaved = true;
+        }
+        // Definition pruning and clock inheritance precede the invocation.
+        if (self.unsaved) try self.saveAssumeLocked(runtime, publication.store(runtime).*, publication.retry_fence);
+        return delayed.toOwnedSlice(runtime.alloc);
     }
     const discovery_wave = scoped_retries.max_documents / 2;
 
@@ -55970,6 +56044,32 @@ test "durable enrichment scoped retry permits healthy targets and restores exact
     const ready = try restarted.state.due(a, deadline);
     defer ready.deinit(a);
     try std.testing.expectEqualStrings("bad", ready.groups[0].doc_key);
+    // The due ticket owns one producer. A different producer for the same
+    // primary has a sleeping ticket under another sequence and must wait.
+    {
+        var sibling = request;
+        sibling.index_name = "separate-producer";
+        sibling.sequence = 3;
+        const sibling_logical = logicalRequestFingerprint(sibling);
+        const observed = try ScopedReplay.observeSource(&runtime, request.doc_key, null, true);
+        try restarted.state.parkStamped(a, .{ .doc_key = sibling.doc_key, .sequence = sibling.sequence }, deadline + 60_000, .{
+            .fingerprint = requestFailureFingerprint(sibling),
+            .logical_fingerprint = sibling_logical,
+        }, observed.logical_digest, observed.stamp);
+        try std.testing.expect(try restarted.state.spill(a, restarted.state.tickets.items.len - 1, ScopedReplay.documentResolver(&runtime)));
+        try restarted.saveAssumeLocked(&runtime, erased, null);
+        clock.setRealtimeNs(deadline * std.time.ns_per_ms);
+        defer clock.setRealtimeNs(1_000 * std.time.ns_per_ms);
+        const delayed = try restarted.prepareDocument(&runtime, ready.groups[0], &.{ request, sibling });
+        defer a.free(delayed);
+        try std.testing.expectEqualSlices(u64, &.{sibling_logical}, delayed);
+        clock.setRealtimeNs((deadline + 60_000) * std.time.ns_per_ms);
+        const waiting_for_promotion = try restarted.prepareDocument(&runtime, ready.groups[0], &.{ request, sibling });
+        defer a.free(waiting_for_promotion);
+        try std.testing.expectEqualSlices(u64, &.{sibling_logical}, waiting_for_promotion);
+        try restarted.state.sleeping.remove(a, 0);
+        try restarted.saveAssumeLocked(&runtime, erased, null);
+    }
     {
         // A lane's terminal extraction receipt must use its restored owner
         // budget even when no scanner-global request identity is installed.

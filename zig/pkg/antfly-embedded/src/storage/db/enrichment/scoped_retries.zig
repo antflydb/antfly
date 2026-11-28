@@ -962,6 +962,35 @@ pub const State = struct {
         }
         return .{ .delayed = try delayed.toOwnedSlice(a), .changed = changed };
     }
+    pub fn hasActiveDocumentBudget(self: State, document: []const u8, source_digest: ?[32]u8, logical: u64) bool {
+        for (self.tickets.items) |ticket| {
+            if (!std.mem.eql(u8, ticket.document, document) or !std.meta.eql(ticket.source_digest, source_digest)) continue;
+            for (ticket.budgets.items) |budget| {
+                if (budget.logical_fingerprint == logical) return true;
+            }
+        }
+        return false;
+    }
+
+    /// Keep a ready token outstanding when a cold sibling owns a later
+    /// provider clock for the same input. This advances no attempt budget.
+    pub fn extendDocumentDeadline(self: *State, document: []const u8, source_digest: ?[32]u8, logical: u64, deadline_ms: u64) !bool {
+        var changed = false;
+        for (self.tickets.items) |*ticket| {
+            if (!std.mem.eql(u8, ticket.document, document) or !std.meta.eql(ticket.source_digest, source_digest)) continue;
+            for (ticket.budgets.items) |*budget| {
+                if (budget.logical_fingerprint != logical or budget.deadline_ms >= deadline_ms) continue;
+                ticket.revision = try std.math.add(u64, ticket.revision, 1);
+                ticket.dirty = true;
+                budget.revision = ticket.revision;
+                budget.deadline_ms = deadline_ms;
+                ticket.refreshDeadline();
+                changed = true;
+            }
+        }
+        return changed;
+    }
+
     pub fn retireSuperseded(self: *State, a: A, group: Group, encoded: []const u8, source_digest: ?[32]u8) void {
         var i: usize = 0;
         while (i < self.tickets.items.len) {
@@ -1268,4 +1297,27 @@ test "explicit retry keeps the scheduling deadline and starts fresh attempt acco
     try std.testing.expectEqualSlices(u64, &.{42}, delayed.delayed);
     try std.testing.expectEqual(@as(u32, 0), state.priorAttempt(encoded, 42, 11, digest).failures);
     try std.testing.expectEqual(@as(u32, 5), state.priorAttempt(encoded, 42, 10, digest).failures);
+}
+
+test "scoped retry workset inherited cold clock fences ready retirement without spending an attempt" {
+    const a = std.testing.allocator;
+    const digest: [32]u8 = @splat(1);
+    var state: State = .{};
+    defer state.deinit(a);
+    try state.park(a, .{ .doc_key = "doc", .sequence = 2 }, 100, .{
+        .fingerprint = 7,
+        .logical_fingerprint = 6,
+        .failures = 3,
+        .waits = 2,
+    }, digest);
+    const token = try state.due(a, 100);
+    defer token.deinit(a);
+    const key = try documentIdentityAlloc(a, "doc");
+    defer a.free(key);
+    try std.testing.expect(try state.extendDocumentDeadline(key, digest, 6, 1_000));
+    state.retire(a, token.tokens);
+    try std.testing.expectEqual(@as(u64, 1), state.appliedThrough(2));
+    try std.testing.expectEqual(@as(u64, 1_000), state.deadline());
+    try std.testing.expectEqual(@as(u32, 3), state.prior(7).failures);
+    try std.testing.expectEqual(@as(u32, 2), state.prior(7).waits);
 }

@@ -71,7 +71,9 @@ process ready retries and scan fresh documents while older tickets wait. The
 worker keeps each ticket's retry deadline, attempt budget, source identity, and
 sequence across restarts. The scan frontier can move after its retry debt is
 durable. The applied frontier remains behind the oldest unresolved ticket, even
-if later documents have already published.
+if later documents have already published. When a due ticket replays a
+document's current recipe, it still honors sleeping deadlines for other
+producers on the same source.
 
 The backlog allows up to 4,096 sleeping tickets subject to a separate
 256 MiB allowance. The byte allowance reserves each ticket's maximum producer
