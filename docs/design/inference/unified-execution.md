@@ -2865,3 +2865,19 @@ the production mask bank and matched isolated clips. The three-clip,
 1,000-frame admission fixture measured 108,101,632 incremental device
 bytes within its 134,217,728-byte ceiling. The frontend submission
 fixture preserved the caller's frame ownership.
+
+### Metal validation of the grouped audio follow-up
+
+The M4 Max production HTTP server built from `78a42df545` served the
+released EmbeddingGemma 2 checkpoint with Metal required. Eight requests
+at each width of two, three, and four unequal-length clips used the
+device batch route, including funded audio arena reuse and replay. The
+largest absolute difference against independent clip requests was below
+`7.4e-7`, within the existing `1e-5` same-backend parity gate. A second
+clip set also exercised the length-bucket split into singleton work.
+
+The 12 focused checks passed without skips. They covered disjoint clamp
+scratch after fused projection declined, audio admission and cancellation,
+Florence cache reuse and token selection, and resident merged ONNX cache
+handoff. The Debug executor microbatch target passed 84 of 86 checks on
+the same Mac, with two skips, after updating its compiler memory bound.
