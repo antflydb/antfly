@@ -10413,6 +10413,28 @@ pub fn configureReservedGenerationWorkspace(
     session.generation_workspace = &self.generation_workspace.?;
 }
 
+fn sharedCacheWeightBaseline(resident: runtime.tier.memory.AdmissionAmounts, shared_bf16: bool) runtime.tier.cache.Budget {
+    // The Metal unified allocation is tracked by the host-visible cache but
+    // covered by the model's backend lease. Private backend cache growth
+    // still needs its own admission.
+    return if (shared_bf16)
+        .{ .host_limit_bytes = resident.backend_weight_bytes }
+    else
+        .{ .host_limit_bytes = resident.host_weight_bytes, .backend_limit_bytes = resident.backend_weight_bytes };
+}
+
+test "Memorilla Metal BF16 cache does not charge shared buffers twice" {
+    const a = std.testing.allocator;
+    var controller = runtime.tier.memory.AdmissionController{};
+    defer controller.deinit();
+    const resident: runtime.tier.memory.AdmissionAmounts = .{ .backend_weight_bytes = 16384 };
+    var cache = runtime.tier.cache.SharedCache.init(.{ .host_limit_bytes = 16384 });
+    defer cache.deinitAdmission();
+    try cache.configureAdmission(a, &controller, .gpu, .{}, sharedCacheWeightBaseline(resident, true));
+    try cache.reserve(.host, 16384);
+    try std.testing.expectEqual(@as(usize, 0), cache.admissionAmounts().host_weight_bytes);
+}
+
 /// Bind a session's lazy residency cache to the serving owner's hard limits
 /// before the session is published. Cache defaults are derived from host/node
 /// capacity during construction and can be much larger than a container or an
@@ -10436,8 +10458,12 @@ pub fn configureSharedCacheAdmissionForSession(
         .limits = limits,
         .device = self.backend_type == .metal,
     });
+    const baseline = sharedCacheWeightBaseline(resident, self.memorilla_metal_bf16);
     const hard_budget = runtime.tier.cache.Budget{
-        .host_limit_bytes = limits.host_limit_bytes,
+        .host_limit_bytes = if (self.memorilla_metal_bf16 and limits.host_limit_bytes != 0)
+            @max(limits.host_limit_bytes, baseline.host_limit_bytes)
+        else
+            limits.host_limit_bytes,
         .backend_limit_bytes = limits.backend_limit_bytes,
     };
     const tier_cache: ?*runtime.tier.cache.SharedCache = switch (self.backend_type) {
@@ -10456,10 +10482,7 @@ pub fn configureSharedCacheAdmissionForSession(
         controller,
         backend_class,
         limits,
-        .{
-            .host_limit_bytes = resident.host_weight_bytes,
-            .backend_limit_bytes = resident.backend_weight_bytes,
-        },
+        baseline,
     );
 }
 
