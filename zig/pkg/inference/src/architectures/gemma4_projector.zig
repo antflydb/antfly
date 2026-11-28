@@ -4957,13 +4957,12 @@ fn tryAudioExecutionRange(cb: *const ComputeBackend, a: std.mem.Allocator, store
     const local_recipe = audioCacheConfig(cfg);
     const key = local_recipe.key(inputs.segments, start, end);
     const recipe = if (admitted_recipe) |candidate| recipe: {
-        if (candidate.key(inputs.segments, start, end) != key) break :recipe &local_recipe;
-        if (candidate.workspace != null) {
-            var admitted_segments: [audio_schedule.GroupedRows.max_clips]usize = undefined;
-            const spans = admitted_segments[0..candidate.count];
-            const rows = try candidate.rowsAndSegments(spans);
-            if (rows != inputs.valid_mask.len or !std.mem.eql(usize, spans, inputs.segments)) break :recipe &local_recipe;
-        }
+        if (candidate.workspace == null or candidate.key(inputs.segments, start, end) != key) break :recipe &local_recipe;
+        var admitted_segments: [audio_schedule.GroupedRows.max_clips]usize = undefined;
+        if (candidate.count > admitted_segments.len) break :recipe &local_recipe;
+        const spans = admitted_segments[0..candidate.count];
+        const rows = try candidate.rowsAndSegments(spans);
+        if (rows != inputs.valid_mask.len or !std.mem.eql(usize, spans, inputs.segments)) break :recipe &local_recipe;
         break :recipe candidate;
     } else &local_recipe;
     const Run = struct {
