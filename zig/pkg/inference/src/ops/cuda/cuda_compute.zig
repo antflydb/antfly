@@ -47874,7 +47874,9 @@ test "LightOnOCR3 CUDA graph warm input and wide head write their assigned buffe
     const packet_bytes = 4 * @sizeOf(f32);
     const mirror_offset = std.mem.alignForward(usize, head_offset + packet_bytes, 256);
     const mirror_bytes = 6 * @sizeOf(u16);
-    var metadata = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, mirror_offset + mirror_bytes);
+    const norm_offset = std.mem.alignForward(usize, mirror_offset + mirror_bytes, 256);
+    const norm_bytes = 6 * @sizeOf(f32);
+    var metadata = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, norm_offset + norm_bytes);
     defer metadata.free(&compute.ctx);
     owner.storage_layout = layout;
     owner.metadata = metadata;
@@ -47960,6 +47962,24 @@ test "LightOnOCR3 CUDA graph warm input and wide head write their assigned buffe
         const assigned_values = try cb.toFloat32(assigned_norm, a);
         defer a.free(assigned_values);
         try std.testing.expectEqualSlices(f32, ordinary_values, assigned_values);
+
+        owner.storage_layout.?.metadata_bytes = metadata.len;
+        owner.storage_layout.?.attention_norm = .{ .offset = norm_offset, .bytes = norm_bytes };
+        defer owner.storage_layout.?.attention_norm = null;
+        if (test_mirror) {
+            owner.storage_layout.?.attention_norm_mirror = .{ .offset = mirror_offset, .bytes = mirror_bytes };
+        }
+        defer owner.storage_layout.?.attention_norm_mirror = null;
+        const layer_allocations = compute.stats.device_alloc_calls;
+        const attention_norm = (try tryCapturedAttentionNorm(&cb, input, gamma, 2, 1e-6)) orelse return error.TestUnexpectedResult;
+        defer cb.free(attention_norm);
+        try std.testing.expectEqual(layer_allocations, compute.stats.device_alloc_calls);
+        try std.testing.expectEqual(metadata.ptr + norm_offset, tensorFromCt(attention_norm).buffer.ptr);
+        try std.testing.expect(!tensorFromCt(attention_norm).owns_buffer);
+        try std.testing.expectError(error.InvalidShape, tryCapturedAttentionNorm(&cb, attention_norm, gamma, 2, 1e-6));
+        const attention_values = try cb.toFloat32(attention_norm, a);
+        defer a.free(attention_values);
+        try std.testing.expectEqualSlices(f32, ordinary_values, attention_values);
     }
 
     var observation = @import("../../execution/runtime_observation.zig").Scope.init();
