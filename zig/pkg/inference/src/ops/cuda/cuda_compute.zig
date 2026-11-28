@@ -21479,13 +21479,7 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
         if (plan_cleanup.boundary != null or self.ctx.prepared_cache_funding != null) return null;
         const owner = try plan_mod.Owner.create(std.heap.c_allocator);
         errdefer owner.destroyUnusedOutsideExecution();
-        var declaration = try owner.beginDeclaration(cache_base);
-        for (workspace.events) |event| switch (event) {
-            .allocate => |bytes| _ = try declaration.events.allocate(bytes),
-            .allocate_scratch => |bytes| _ = try declaration.events.allocateScratch(bytes),
-            .release => |slot| try declaration.events.release(slot),
-        };
-        try declaration.finish(workspace.published_slot);
+        try owner.declare(cache_base, workspace.events, workspace.published_slot);
         _ = try self.audio_plans.publishDeclared(cache_base, owner, plan_cleanup);
     };
     if (entry.disabled) return null;

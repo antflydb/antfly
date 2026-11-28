@@ -112,6 +112,15 @@ pub const Owner = struct {
         return .{ .owner = self, .events = try self.plan.declarationBuilder(), .bindings = bindings };
     }
 
+    pub fn declare(self: *Owner, bindings: Bindings, events: []const Plan.Declaration, published_slot: u15) !void {
+        if (self.executable != null or !bindings.fitsArena()) return error.InvalidExecutionPlan;
+        try self.plan.declare(events, published_slot);
+        if (!self.publishLayout(bindings)) {
+            self.plan = .{};
+            return error.InvalidExecutionPlan;
+        }
+    }
+
     fn publishLayout(self: *Owner, bindings: Bindings) bool {
         const storage = self.plan.layoutWithExternalOutput(bindings.input_bytes) catch self.plan.layout(bindings.input_bytes) catch return false;
         const publication = storage.output orelse return false;
