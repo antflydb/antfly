@@ -458,10 +458,29 @@ drops the packet if the proposal is encoded at an older version, in which case
 replicas accept the seeds at apply as before. `direct_enrichments` writes are
 leader-prepared already: their packet carries the seeded output beside the
 generated one, and a seeded output is never embedded (window prewarming skips
-it). Transactions (including multi-shard 2PC batches), enrichment-level sync
-levels and seeds supplied only through field mappings keep apply-time
-acceptance; mapped text and JSON assets depend on no replica-local state, while
-mapped vectors bind the replica's embedder identity.
+it).
+
+The leader prepares seeds in three further shapes:
+
+- **Transactions and multi-shard 2PC.** A participant's PREPARE carries its
+  seeds packet. `writeTransaction` validates it against the state it was
+  prepared for (guards and catalog), replaces the vote's writes with the
+  packet's, and persists the packet with the prepared intents
+  (`prepared_enrichments_json`). Resolution replays the persisted packet
+  without validating it again: the intents lock the keys, and a commit
+  decision can't be refused afterwards. A retried PREPARE, on the leader or
+  a replica, returns the packet already stored for the transaction. PREPAREs
+  that carry a source-pipeline or publication-capture binding keep
+  apply-time acceptance, because their digests bind the exact intent.
+- **Enrichment-level sync levels.** Preparation never runs inference. An
+  `enrichments` or `full_index` write is prepared like `write`. The packet
+  carries the seeded output and leaves unseeded outputs pending for the
+  leader's worker. The packet digest ignores the sync level.
+- **Seeds from field mappings only.** The shard owner's write-admission
+  preflight reports `write_admission_has_seed_mappings`
+  (`IndexManager.hasSeedMappings`). The leader then prepares every document
+  write to that table. A table with no resident owner on the leader keeps
+  apply-time acceptance.
 
 ### Server batch outcomes
 
@@ -618,16 +637,13 @@ subsystem features of their own:
   distributed and serverless runtime libraries compile; the storage kernel
   library (the data runtime) exceeds this machine's memory to rebuild.
 - An asset producer in the standalone serverless binary.
-- Leader seed preparation for transactions and multi-shard 2PC batches
-  (persist the seeds packet with the prepared transaction, accept
-  `mode: seeds` in the transaction write path and resolution, and relax the
-  `transaction` exclusions in `seedPreparationEligible`, `prepareSeedEnrichments`
-  and the commit's packet check); for enrichment-level sync levels (merge the
-  packet's seeded output with inline generation of the unseeded outputs); and
-  for seeds that come only from field mappings (the leader needs a cached
-  per-table "has seed mappings" flag from its shard owner before proposing).
-  A cross-shard 2PC seed transform test. These writes accept seeds at apply
-  and report no `seeds`.
+- Compiling and running the data runtime's leader-preparation gating
+  (`seedPreparationCandidate`, the owner preflight's seed-mapping flag) and a
+  cross-shard 2PC seed transform test through the server harness. Both need
+  the storage kernel build. The embedded DB tests cover the transaction and
+  sync-level packets. Not yet tested: an `enrichments` write whose packet
+  leaves unseeded outputs pending, and whether the proposer's sync wait
+  covers them.
 - Partial extraction seeds: an end-to-end test with a real PDF (PDF reading
   is compiled out of the DB unit tests; the overlay and the write path are
   tested separately).

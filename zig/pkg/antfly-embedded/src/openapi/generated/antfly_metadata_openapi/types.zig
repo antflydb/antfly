@@ -1978,7 +1978,7 @@ pub const BatchResponse = struct {
     /// Number of documents successfully transformed
     transformed: ?i64 = null,
     failure: ?BatchCommittedFailure = null,
-    /// Per-item outcomes of the artifact seeds the batch carried, when any did. Serverless tables and embedded databases report them. A distributed table reports them for a single-shard write whose seeds the Raft leader prepared (all replicas decode seed preparation); multi-shard transactions, enrichment-level sync levels and other writes accept seeds at apply and omit `seeds` (plan those with `validate_only`).
+    /// Per-item outcomes of the artifact seeds the batch carried, when any did. Serverless tables and embedded databases report them. A distributed table reports them for a single-shard write whose seeds the Raft leader prepared (all replicas decode seed preparation), at any sync level; multi-shard transactions report no outcomes, and writes prepared before every replica decodes seed preparation accept seeds at apply and omit `seeds` (plan those with `validate_only`).
     seeds: ?[]const SeedOutcome = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.

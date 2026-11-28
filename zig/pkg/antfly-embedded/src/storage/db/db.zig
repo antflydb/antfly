@@ -8804,14 +8804,35 @@ pub const DB = struct {
     /// packet's `seeds` are the per-item outcomes for the proposer. Unseeded
     /// outputs stay pending for the leader's worker, as for any write.
     pub fn prepareSeedEnrichments(self: *DB, alloc: Allocator, req: types.BatchRequest) ![]u8 {
-        if (req.commit_requires == .direct_enrichments or req.prepared_enrichments_json != null or req.transaction != null) return error.InvalidBatchRequest;
+        if (req.commit_requires == .direct_enrichments or req.prepared_enrichments_json != null) return error.InvalidBatchRequest;
+        const digest = try execution_resources.PreparedEnrichments.requestDigest(alloc, req);
+        var prepared_req = req;
+        if (req.transaction) |control| {
+            // A 2PC participant's PREPARE: its packet is persisted with the
+            // prepared intents and replayed at resolution, as for a direct
+            // packet. A retried PREPARE returns the packet it already holds.
+            if (control != .prepare) return error.InvalidBatchRequest;
+            var manager = try self.core.initTxnManager();
+            defer manager.deinit();
+            if (try manager.loadPreparedEnrichments(alloc, control.prepare.txn_id)) |bytes| {
+                errdefer alloc.free(bytes);
+                var packet = try std.json.parseFromSlice(execution_resources.PreparedEnrichments, alloc, bytes, .{});
+                defer packet.deinit();
+                if (packet.value.mode != .seeds or !std.mem.eql(u8, &packet.value.request_digest, &digest)) return error.VersionConflict;
+                return bytes;
+            }
+            prepared_req.transaction = null;
+        }
+        // Preparation never runs inference. An enrichment-level sync level
+        // is prepared like a `write`: the packet carries the seeded output
+        // and leaves the unseeded outputs pending for the leader's worker.
         switch (req.sync_level) {
-            .enrichments, .full_index => return error.InvalidBatchRequest,
+            .enrichments, .full_index => prepared_req.sync_level = .write,
             .propose, .write, .full_text => {},
         }
-        var output = execution_resources.PreparationCapture{ .alloc = alloc, .request_digest = try execution_resources.PreparedEnrichments.requestDigest(alloc, req) };
+        var output = execution_resources.PreparationCapture{ .alloc = alloc, .request_digest = digest };
         errdefer if (output.json) |json| alloc.free(json);
-        try self.batchInternal(req, null, .{ .seed_preparation = &output });
+        try self.batchInternal(prepared_req, null, .{ .seed_preparation = &output });
         return output.json orelse error.InvalidBatchRequest;
     }
 
@@ -33192,7 +33213,10 @@ pub const DB = struct {
         defer if (packet) |*value| value.deinit();
         if (req.commit_requires == .direct_enrichments and packet == null) return error.InvalidBatchRequest;
         if (packet) |value| {
-            if (req.commit_requires != .direct_enrichments) return error.InvalidBatchRequest;
+            // A seeds packet (the leader's seed preparation, #1791) serves an
+            // ordinary write; a direct packet only its requirement.
+            const seeds_packet = value.value.mode == .seeds;
+            if (seeds_packet == (req.commit_requires == .direct_enrichments)) return error.InvalidBatchRequest;
             const digest = try execution_resources.PreparedEnrichments.requestDigest(preparation_alloc, transactionPreparationRequest(req));
             if (!std.mem.eql(u8, &digest, &value.value.request_digest)) return error.InvalidBatchRequest;
             {
@@ -33223,13 +33247,23 @@ pub const DB = struct {
             req.transforms = &.{};
             req.graph_writes = value.value.graph_writes;
             req.graph_deletes = value.value.graph_deletes;
-            // Reuse the capture-only admission pipeline to authenticate the
-            // closed producer set and physical key scopes without inference.
-            var capture: execution_resources.PreparationCapture = .{ .alloc = preparation_alloc };
-            defer if (capture.json) |bytes| preparation_alloc.free(bytes);
-            var capture_req = transactionPreparationRequest(req);
-            capture_req.prepared_enrichments_json = req.prepared_enrichments_json;
-            try self.batchInternal(capture_req, null, .{ .preparation_capture = &capture, .wait_for_sync_level = false, .row_policy_principal = row_policy_principal, .row_policy_lease = row_policy_lease });
+            if (seeds_packet) {
+                // Bind the packet to the state it was prepared against now:
+                // resolution replays it after the decision, unvalidated.
+                var plan = try self.core.index_manager.acquireWritePlanSnapshot();
+                defer plan.release();
+                try self.validatePreparedEnrichments(preparation_alloc, value.value, plan.plan());
+                var restored = try local_mutation.restoreSeedPreparation(preparation_alloc, transactionPreparationRequest(req), plan.plan(), value.value);
+                restored.deinit(preparation_alloc);
+            } else {
+                // Reuse the capture-only admission pipeline to authenticate the
+                // closed producer set and physical key scopes without inference.
+                var capture: execution_resources.PreparationCapture = .{ .alloc = preparation_alloc };
+                defer if (capture.json) |bytes| preparation_alloc.free(bytes);
+                var capture_req = transactionPreparationRequest(req);
+                capture_req.prepared_enrichments_json = req.prepared_enrichments_json;
+                try self.batchInternal(capture_req, null, .{ .preparation_capture = &capture, .wait_for_sync_level = false, .row_policy_principal = row_policy_principal, .row_policy_lease = row_policy_lease });
+            }
         }
         defer if (packet != null) preparation_alloc.free(req.writes);
         if (req.relational_index_maintenance != null and
@@ -109129,6 +109163,84 @@ test "db artifact seed preparation on the leader replicates without the replica'
     var direct = prepared;
     direct.commit_requires = .direct_enrichments;
     try std.testing.expectError(error.InvalidBatchRequest, replica.batch(direct));
+}
+
+test "db artifact seed preparation travels with a transaction's prepared intents" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    const writes: []const types.TransactionWrite = &.{.{ .key = "doc:a", .value = "{\"body\":\"same source\",\"_artifacts\":{\"body_dense_v1\":{\"value\":[1,2,3]}}}" }};
+
+    // The participant leader prepares its PREPARE without inference.
+    var counting = CountingDenseEmbedder{};
+    var txn: types.TxnId = undefined;
+    const packet = packet: {
+        var leader = try DB.open(alloc, std.mem.span(path), .{ .enrichment = .{ .owner_id = "worker-a", .dense_embedder = counting.interface() } });
+        defer leader.close();
+        try addSeededDenseTestIndex(&leader);
+        txn = try leader.beginTransaction(100);
+        const req: types.BatchRequest = .{ .writes = @ptrCast(writes), .sync_level = .write, .transaction = .{ .prepare = .{ .txn_id = txn, .topology_epoch = 0 } } };
+        // Never a direct requirement, and never a resolution.
+        var direct = req;
+        direct.commit_requires = .direct_enrichments;
+        try std.testing.expectError(error.InvalidBatchRequest, leader.prepareSeedEnrichments(alloc, direct));
+        var resolve = req;
+        resolve.transaction = .{ .resolve = .{ .txn_id = txn, .status = .committed, .commit_version = 1 } };
+        try std.testing.expectError(error.InvalidBatchRequest, leader.prepareSeedEnrichments(alloc, resolve));
+        break :packet try leader.prepareSeedEnrichments(alloc, req);
+    };
+    defer alloc.free(packet);
+    try std.testing.expect(std.mem.indexOf(u8, packet, "\"mode\":\"seeds\"") != null);
+
+    // A replica with no embedder votes with the packet and resolves it.
+    var replica = try DB.open(alloc, std.mem.span(path), .{ .enrichment = .{ .owner_id = "worker-a" } });
+    defer replica.close();
+    try std.testing.expectError(error.InvalidBatchRequest, replica.writeTransaction(txn, .{ .writes = writes, .prepared_enrichments_json = packet, .commit_requires = .direct_enrichments }));
+    try std.testing.expectError(error.InvalidBatchRequest, replica.writeTransaction(txn, .{ .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"other\"}" }}, .prepared_enrichments_json = packet }));
+    try replica.writeTransaction(txn, .{ .writes = writes, .prepared_enrichments_json = packet });
+    try std.testing.expect((try replica.get(alloc, "doc:a")) == null);
+    // A retried vote is idempotent; a retried preparation returns the
+    // packet already prepared with the vote.
+    try replica.writeTransaction(txn, .{ .writes = writes, .prepared_enrichments_json = packet });
+    {
+        const again = try replica.prepareSeedEnrichments(alloc, .{ .writes = @ptrCast(writes), .transaction = .{ .prepare = .{ .txn_id = txn, .topology_epoch = 0 } } });
+        defer alloc.free(again);
+        try std.testing.expectEqualStrings(packet, again);
+        try std.testing.expectError(error.VersionConflict, replica.prepareSeedEnrichments(alloc, .{ .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"other\"}" }}, .transaction = .{ .prepare = .{ .txn_id = txn, .topology_epoch = 0 } } }));
+    }
+    try replica.commitTransaction(txn, 200);
+    try expectSeededDenseVector(alloc, &replica, "doc:a", "same source", &.{ 1, 2, 3 });
+    try std.testing.expectEqual(@as(usize, 0), counting.calls);
+}
+
+test "db artifact seed preparation serves enrichment sync levels without inference" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    const req: types.BatchRequest = .{ .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"same source\",\"_artifacts\":{\"body_dense_v1\":{\"value\":[1,2,3]}}}" }}, .sync_level = .enrichments };
+    var counting = CountingDenseEmbedder{};
+    const packet = packet: {
+        var leader = try DB.open(alloc, std.mem.span(path), .{ .enrichment = .{ .owner_id = "worker-a", .dense_embedder = counting.interface() } });
+        defer leader.close();
+        try addSeededDenseTestIndex(&leader);
+        break :packet try leader.prepareSeedEnrichments(alloc, req);
+    };
+    defer alloc.free(packet);
+    try std.testing.expectEqual(@as(usize, 0), counting.calls);
+    var replica = try DB.open(alloc, std.mem.span(path), .{ .enrichment = .{ .owner_id = "worker-a" } });
+    defer replica.close();
+    var prepared = req;
+    prepared.prepared_enrichments_json = packet;
+    try replica.batch(prepared);
+    try expectSeededDenseVector(alloc, &replica, "doc:a", "same source", &.{ 1, 2, 3 });
+    // The packet binds the request's digest, not its sync level.
+    var full_index = req;
+    full_index.sync_level = .full_index;
+    try std.testing.expectEqualSlices(u8, &(try execution_resources.PreparedEnrichments.requestDigest(alloc, req)), &(try execution_resources.PreparedEnrichments.requestDigest(alloc, full_index)));
 }
 
 test "db artifact seeds maintain an external asset with no producer" {

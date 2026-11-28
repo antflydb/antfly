@@ -10636,6 +10636,13 @@ pub const ProvisionedKernelOwnerSource = struct {
         return self.batchGroupLocalWithDescriptor(alloc, group_id, table_name, req, null);
     }
 
+    /// Whether the group's table maps document fields to artifact seeds.
+    pub fn hasSeedMappings(self: *ProvisionedKernelOwnerSource, group_id: u64, table_name: []const u8) !bool {
+        var lease = try self.acquire(group_id, table_name);
+        defer lease.deinit();
+        return lease.owner().hasSeedMappings(table_name);
+    }
+
     pub fn prepareEnrichments(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: db_types.BatchRequest, deadline: ?u64, cancellation: db_types.CancellationToken) ![]u8 {
         try cancellation.check();
         const json = try table_writes.encodeStorageKernelBatchRequest(alloc, req);

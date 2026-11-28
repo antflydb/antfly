@@ -405,7 +405,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 // ordinary write; a direct packet serves only its requirement.
                 const seeds_packet = packet.value.mode == .seeds;
                 if (seeds_packet == (req.commit_requires == .direct_enrichments)) return error.InvalidBatchRequest;
-                if (seeds_packet and (req.transaction != null or opts.transaction_resolution != null)) return error.InvalidBatchRequest;
+                // A transaction's seeds packet is consumed at its resolution.
+                if (seeds_packet and req.transaction != null) return error.InvalidBatchRequest;
                 if (opts.transaction_resolution == null) {
                     req.writes = packet.value.writes;
                     req.deletes = packet.value.deletes;
@@ -2747,7 +2748,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     precomputed_generated = preparation.document_generated.?;
                     preparation.document_generated = null;
                 } else if (decoded_prepared) |packet| {
-                    if (packet.value.mode == .seeds) {
+                    if (packet.value.mode == .seeds and opts.transaction_resolution == null) {
                         // The leader's seed preparation: apply its accepted
                         // output; this replica's embedder is never consulted.
                         var plan = try S.ownerField(self, "core").*.index_manager.acquireWritePlanSnapshot();
@@ -6321,7 +6322,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     .deletes = graph_batch.deletes,
                     .graph_writes = graph_writes.items,
                     .graph_deletes = graph_deletes.items,
-                    .commit_requires = if (intents.prepared_enrichments_json != null) .direct_enrichments else null,
+                    .commit_requires = if (intents.prepared_enrichments_json) |json| if (seedsPacket(json)) null else .direct_enrichments else null,
                     .prepared_enrichments_json = intents.prepared_enrichments_json,
                     .timestamp_ns = commit_version,
                     .document_version_scheme = if (intents.document_revisions) .revision_v1 else .legacy,
@@ -7791,4 +7792,40 @@ fn inlineVectorWriteOnlyTouchesItself(batch: anytype, doc_key: []const u8, artif
         if (!std.mem.eql(u8, key, own)) return false;
     }
     return true;
+}
+
+/// Whether a persisted preparation packet is a leader's seed preparation
+/// (`PreparedEnrichments.mode == .seeds`) rather than a direct packet.
+fn seedsPacket(json: []const u8) bool {
+    var buffer: [4096]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&buffer);
+    var scanner = std.json.Scanner.initCompleteInput(fixed.allocator(), json);
+    defer scanner.deinit();
+    if ((scanner.next() catch return false) != .object_begin) return false;
+    var depth: usize = 0;
+    while (true) {
+        const token = scanner.next() catch return false;
+        switch (token) {
+            .end_of_document => return false,
+            .object_begin, .array_begin => depth += 1,
+            .object_end, .array_end => {
+                if (depth == 0) return false;
+                depth -= 1;
+            },
+            .string => |name| if (depth == 0 and std.mem.eql(u8, name, "mode")) {
+                const value = scanner.next() catch return false;
+                return value == .string and std.mem.eql(u8, value.string, "seeds");
+            } else if (depth == 0) {
+                scanner.skipValue() catch return false;
+            },
+            else => {},
+        }
+    }
+}
+
+test "seeds packets are told from direct packets by their mode" {
+    try std.testing.expect(seedsPacket("{\"request_digest\":[1,2],\"mode\":\"seeds\",\"seeds\":[]}"));
+    try std.testing.expect(!seedsPacket("{\"mode\":\"direct\"}"));
+    try std.testing.expect(!seedsPacket("{\"writes\":[{\"mode\":\"seeds\"}]}"));
+    try std.testing.expect(!seedsPacket("not json"));
 }

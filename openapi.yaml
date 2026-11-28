@@ -33688,11 +33688,13 @@ components:
 
             seeds the Raft leader prepared (all replicas decode seed
 
-            preparation); multi-shard transactions, enrichment-level sync
+            preparation), at any sync level; multi-shard transactions report
 
-            levels and other writes accept seeds at apply and omit `seeds`
+            no outcomes, and writes prepared before every replica decodes seed
 
-            (plan those with `validate_only`).
+            preparation accept seeds at apply and omit `seeds` (plan those
+
+            with `validate_only`).
           items:
             $ref: '#/components/schemas/SeedOutcome'
     BatchCommittedFailure:

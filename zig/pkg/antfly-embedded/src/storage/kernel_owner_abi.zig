@@ -2388,6 +2388,12 @@ pub extern fn antfly_storage_owner_configure(
     request: *const ConfigureRequest,
 ) callconv(.c) Status;
 
+/// The table has grouped enrichment sources (request JSON is validated).
+pub const write_admission_has_groups: u8 = 1;
+/// The table has enrichment field mappings (`seed: {field, ...}`): any
+/// document write may carry artifact seeds (#1791).
+pub const write_admission_has_seed_mappings: u8 = 2;
+
 pub extern fn antfly_storage_owner_reconcile(
     owner: ?*anyopaque,
     request: *const ReconcileRequest,
@@ -2396,11 +2402,12 @@ pub extern fn antfly_storage_owner_reconcile(
 
 /// Checks the resident owner's complete write-admission policy before a
 /// distributed leader commits work to Raft. A busy result means the write is
-/// currently backpressured and must not be proposed.
+/// currently backpressured and must not be proposed. `out_flags` carries
+/// `write_admission_has_groups` and `write_admission_has_seed_mappings`.
 pub extern fn antfly_storage_owner_preflight_write_admission(
     owner: ?*anyopaque,
     request: *const WriteAdmissionRequest,
-    out_has_groups: *u8,
+    out_flags: *u8,
 ) callconv(.c) Status;
 
 pub extern fn antfly_storage_owner_prepare_enrichments(

@@ -16391,12 +16391,13 @@ pub const DataServer = struct {
     /// replicas apply the accepted output instead of accepting the seeds
     /// against their own embedder configuration. A false positive only costs
     /// a preparation without seeds.
+    ///
+    /// A 2PC participant's PREPARE is prepared the same way: its packet is
+    /// persisted with the prepared intents and replayed at resolution. An
+    /// enrichment-level sync level is prepared like `write` (no inference);
+    /// the write still waits for its unseeded outputs at apply.
     fn seedPreparationEligible(req: antfly.db.types.BatchRequest) bool {
-        if (req.transaction != null or req.prepared_enrichments_json != null or req.commit_requires == .direct_enrichments) return false;
-        switch (req.sync_level) {
-            .enrichments, .full_index => return false,
-            .propose, .write, .full_text => {},
-        }
+        if (!seedPreparationCandidate(req)) return false;
         for (req.writes) |write| {
             if (std.mem.indexOf(u8, write.value, "\"_artifacts\"") != null or std.mem.indexOf(u8, write.value, "\"_chunks\"") != null) return true;
         }
@@ -16404,6 +16405,29 @@ pub const DataServer = struct {
             if (std.mem.indexOf(u8, operation.path, "_artifacts.") != null or std.mem.indexOf(u8, operation.path, "_chunks.") != null) return true;
         };
         return false;
+    }
+
+    /// The request shapes a leader may prepare seeds for. Seeds that come only
+    /// from enrichment field mappings need the table's mapping signal too
+    /// (`ProvisionedKernelOwnerSource.hasSeedMappings`).
+    fn seedPreparationCandidate(req: antfly.db.types.BatchRequest) bool {
+        if (req.prepared_enrichments_json != null or req.commit_requires == .direct_enrichments) return false;
+        if (req.writes.len == 0 and req.transforms.len == 0) return false;
+        if (req.transaction) |control| switch (control) {
+            // Source-pipeline and publication-capture votes bind digests of
+            // their exact intent; they keep apply-time acceptance.
+            .prepare => |prepare| if (prepare.replication_source_permit != null or prepare.publication_capture != null or
+                prepare.source_purpose != null or prepare.source_scope != null or prepare.source_checkpoint != null) return false,
+            else => return false,
+        };
+        return true;
+    }
+
+    /// A table without a resident owner here keeps apply-time acceptance:
+    /// leader preparation is an optimization, never a write's requirement.
+    fn seedMappingsSignal(self: *DataServer, group_id: u64, table_name: []const u8) bool {
+        const owner_source = self.ensureKernelOwnerSource() catch return false;
+        return owner_source.hasSeedMappings(group_id, table_name) catch false;
     }
 
     /// Whether the proposal carries a leader's seed preparation. Packet
@@ -18055,6 +18079,10 @@ pub const DataServer = struct {
         const source_permit = req.replicationSourcePermit();
         var prepared_json: ?[]u8 = null;
         defer if (prepared_json) |bytes| alloc.free(bytes);
+        // Leader seed preparation (#1791) for explicit seeds, or for any
+        // document write to a table whose enrichments map fields to seeds.
+        // Decided once, on the preflighted leader.
+        var seed_preparation: ?bool = null;
         try @import("../api/sql/execution/graph_vote.zig").require(alloc, self.write_source.catalog, table_name, req, platform_time.monotonicNs() +| leader_wait_ns);
         try @import("antfly_local_sources").storage_db_artifact_publication.validateRequest(alloc, req);
         try @import("antfly_local_sources").storage_db_artifact_publication_transport.validateBatchRequest(req);
@@ -18268,7 +18296,8 @@ pub const DataServer = struct {
                 // Leader seed preparation is an optional upgrade: without it
                 // every replica accepts the seeds at apply, as before.
                 if (comptime linked_storage) {
-                    if (seedPreparationEligible(req))
+                    if (seed_preparation == null) seed_preparation = seedPreparationEligible(req) or (seedPreparationCandidate(req) and seedMappingsSignal(self, group_id, table_name));
+                    if (seed_preparation.?)
                         required_protocol_version = @max(required_protocol_version, @import("../common/data_raft_protocol.zig").batch_seed_preparation_protocol_version);
                 }
                 protocol_activation_entry = activation_entry;
@@ -18388,7 +18417,7 @@ pub const DataServer = struct {
                 // here, without inference, and propose the accepted output.
                 // Only when every applying peer decodes the packet; otherwise
                 // replicas keep accepting the seeds at apply.
-                if (comptime linked_storage) if (seedPreparationEligible(req)) if (protocol_activation_entry) |activation| {
+                if (comptime linked_storage) if (seed_preparation orelse false) if (req.prepared_enrichments_json == null) if (protocol_activation_entry) |activation| {
                     const seed_version = @import("../common/data_raft_protocol.zig").batch_seed_preparation_protocol_version;
                     if (activation.protocol_version.load(.acquire) >= seed_version or protocol_preflight.activatable_version >= seed_version or activation.pending_version.load(.acquire) >= seed_version) {
                         if (batchMutatesDocuments(req)) req.document_version_scheme = .revision_v1;

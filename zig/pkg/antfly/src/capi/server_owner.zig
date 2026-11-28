@@ -5146,8 +5146,9 @@ pub fn storageOwnerPreflightWriteAdmission(
     const handle = asHandle(owner) orelse return .invalid_argument;
     _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
     if (handle.db.denseRepairWriteBackpressured()) return .dense_repair_backpressure;
+    if (handle.db.core.index_manager.hasSeedMappings()) out_has_groups.* |= kernel_owner_abi.write_admission_has_seed_mappings;
     if (!handle.db.core.index_manager.hasGroupSources()) return .ok;
-    out_has_groups.* = 1;
+    out_has_groups.* |= kernel_owner_abi.write_admission_has_groups;
     if (request.request_json.len == 0) return .ok;
     var batch = batch_api.parseInternalBatchRequest(handle.alloc, request.request_json.slice()) catch |err| return storageOwnerStatusFromError(err);
     defer batch.deinit(handle.alloc);

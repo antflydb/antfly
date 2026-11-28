@@ -502,12 +502,22 @@ pub const Owner = struct {
     }
 
     pub fn preflightWriteAdmissionJson(self: *Owner, table_name: []const u8, request_json: []const u8) !bool {
-        var has_groups: u8 = 0;
+        return (try self.writeAdmissionFlags(table_name, request_json)) & abi.write_admission_has_groups != 0;
+    }
+
+    /// Whether the table's enrichments map document fields to seeds, so a
+    /// write may carry seeds without `_artifacts`/`_chunks` (#1791).
+    pub fn hasSeedMappings(self: *Owner, table_name: []const u8) !bool {
+        return (try self.writeAdmissionFlags(table_name, "")) & abi.write_admission_has_seed_mappings != 0;
+    }
+
+    fn writeAdmissionFlags(self: *Owner, table_name: []const u8, request_json: []const u8) !u8 {
+        var flags: u8 = 0;
         try statusToError(abi.antfly_storage_owner_preflight_write_admission(self.handle, &.{
             .table_name = .fromSlice(table_name),
             .request_json = .fromSlice(request_json),
-        }, &has_groups));
-        return has_groups != 0;
+        }, &flags));
+        return flags;
     }
 
     /// Reconstruction uses a shared generation lease. Configuration is a

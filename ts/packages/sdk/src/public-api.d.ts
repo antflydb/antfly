@@ -12430,9 +12430,10 @@ export interface components {
              *     did. Serverless tables and embedded databases report them. A
              *     distributed table reports them for a single-shard write whose
              *     seeds the Raft leader prepared (all replicas decode seed
-             *     preparation); multi-shard transactions, enrichment-level sync
-             *     levels and other writes accept seeds at apply and omit `seeds`
-             *     (plan those with `validate_only`).
+             *     preparation), at any sync level; multi-shard transactions report
+             *     no outcomes, and writes prepared before every replica decodes seed
+             *     preparation accept seeds at apply and omit `seeds` (plan those
+             *     with `validate_only`).
              */
             seeds?: components["schemas"]["SeedOutcome"][];
         };
