@@ -48825,10 +48825,12 @@ test "LightOnOCR3 real checkpoint transcribes the invoice fixture" {
             if (attention_mirror_bytes != 0) try std.testing.expectEqual(norm_bytes / 2, attention_mirror_bytes);
             const layer_and_norm_bytes = std.mem.alignForward(usize, layer_and_outputs_bytes, alignment) + norm_bytes;
             const layer_and_mirror_bytes = if (attention_mirror_bytes != 0) std.mem.alignForward(usize, layer_and_norm_bytes, alignment) + attention_mirror_bytes else layer_and_norm_bytes;
+            try std.testing.expectEqual(norm_bytes, report.declared_attention_residual_bytes);
+            const layer_and_residual_bytes = std.mem.alignForward(usize, layer_and_mirror_bytes, alignment) + report.declared_attention_residual_bytes;
             const layer_and_staging_bytes = if (report.declared_projection_staging_bytes != 0)
-                std.mem.alignForward(usize, @max(layer_and_mirror_bytes, report.shared_head_scratch_bytes), alignment) + report.declared_projection_staging_bytes
+                std.mem.alignForward(usize, @max(layer_and_residual_bytes, report.shared_head_scratch_bytes), alignment) + report.declared_projection_staging_bytes
             else
-                layer_and_mirror_bytes;
+                layer_and_residual_bytes;
             const through_head_bytes = @max(layer_and_staging_bytes, report.shared_head_scratch_bytes, report.fused_head_scratch_bytes);
             const mirror_bytes = report.declared_final_norm_mirror_bytes;
             if (mirror_bytes != 0) try std.testing.expectEqual(report.rows * geometry.hidden_size * @sizeOf(u16), mirror_bytes);

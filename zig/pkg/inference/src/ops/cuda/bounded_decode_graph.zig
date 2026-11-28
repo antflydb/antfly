@@ -67,6 +67,7 @@ pub const StorageLayout = struct {
     ffn_workspace: ?Span = null,
     ffn_outputs: ?Span = null,
     projection_staging: ?Span = null,
+    attention_residual: ?Span = null,
     attention_norm: ?Span = null,
     attention_norm_mirror: ?Span = null,
     final_norm_mirror: ?Span = null,
@@ -187,6 +188,7 @@ pub const StorageLayout = struct {
             self.recurrent_output,
             self.ffn_workspace,
             self.ffn_outputs,
+            self.attention_residual,
             self.attention_norm,
             self.attention_norm_mirror,
         }) |slot| if (slot) |span| {
@@ -391,6 +393,11 @@ pub const GraphPhase = struct {
                 const mirror_offset = try StorageLayout.aligned(try self.storage_layout.layerLiveBytes());
                 self.storage_layout.attention_norm_mirror = try self.storage_layout.declareLayerRegion(mirror_offset, try std.math.mul(usize, elements, @sizeOf(u16)));
             }
+        }
+        if (policy.attention_norm) {
+            const bytes = self.storage_layout.attention_norm.?.bytes;
+            const offset = try StorageLayout.aligned(try self.storage_layout.layerLiveBytes());
+            self.storage_layout.attention_residual = try self.storage_layout.declareLayerRegion(offset, bytes);
         }
         if (policy.projection_staging) try self.declareProjectionStaging();
         if (policy.final_norm_mirror) {
@@ -901,6 +908,13 @@ pub const Module = struct {
         const layout = self.storage_layout orelse return error.InvalidExecutionPlan;
         const span = layout.fused_head_workspace orelse return error.InvalidExecutionPlan;
         return self.bindLayerWorkspace(layout, span, span.bytes);
+    }
+
+    pub fn bindAttentionResidual(self: *const Module, bytes: usize) !?buffer.DeviceBuffer {
+        const layout = self.storage_layout orelse return error.InvalidExecutionPlan;
+        const span = layout.attention_residual orelse return null;
+        if (span.bytes != bytes) return error.InvalidExecutionPlan;
+        return try self.bindLayerWorkspace(layout, span, bytes);
     }
 
     pub const NormStorage = struct { output: buffer.DeviceBuffer, mirror: ?buffer.DeviceBuffer };

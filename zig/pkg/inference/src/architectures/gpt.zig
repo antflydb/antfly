@@ -6878,7 +6878,7 @@ fn decoderBlockImpl(
             false;
         const attn_out = try qwen35LinearAttentionWithResidual(cb, allocator, config, normed, batch, query_seq_len, layer, decode_context, &name_buf, if (fuse_residual) hidden else null);
         defer if (!fuse_residual) freeTensorWithCleanup(cb, attn_out, raw_overrides.cleanup);
-        const attn_res = if (fuse_residual) attn_out else try cb.residualAdd(attn_out, hidden);
+        const attn_res = if (fuse_residual) attn_out else try layerAttentionResidual(cb, attn_out, hidden);
         errdefer freeTensorWithCleanup(cb, attn_res, raw_overrides.cleanup);
 
         compute_region_scope.deinit();
@@ -7792,7 +7792,7 @@ fn decoderBlockImpl(
         }
 
         // Residual
-        break :blk try cb.residualAdd(proj, hidden);
+        break :blk try layerAttentionResidual(cb, proj, hidden);
     };
     var attn_res_owned = true;
     errdefer if (attn_res_owned) freeTensorWithCleanup(cb, attn_res, raw_overrides.cleanup);
@@ -9034,7 +9034,7 @@ fn qwen35OutputProjection(cb: *const ComputeBackend, core: CT, weight: CT, resid
         }
         const projected = try cb.linearNoBias(core, weight, rows, in_dim, hidden);
         defer cb.free(projected);
-        return cb.residualAdd(projected, prior);
+        return layerAttentionResidual(cb, projected, prior);
     }
     return cb.linearNoBias(core, weight, rows, in_dim, hidden);
 }
@@ -12526,6 +12526,15 @@ fn runGroupedExpertBatchTensor(
 }
 
 // --- Normalization helpers ---
+
+fn layerAttentionResidual(cb: *const ComputeBackend, projected: CT, hidden: CT) !CT {
+    if (comptime build_options.enable_cuda) {
+        if (cb.kind() == .cuda) {
+            if (try @import("../ops/cuda/cuda_compute.zig").tryCapturedAttentionResidual(cb, projected, hidden)) |assigned| return assigned;
+        }
+    }
+    return cb.residualAdd(projected, hidden);
+}
 
 fn applyAttnNorm(cb: *const ComputeBackend, allocator: std.mem.Allocator, config: Config, hidden: CT, layer: usize, buf: *[256]u8) !CT {
     return applyNormAt(cb, allocator, config, hidden, layer, "attn", buf);

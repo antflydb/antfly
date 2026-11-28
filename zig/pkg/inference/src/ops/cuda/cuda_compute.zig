@@ -4002,6 +4002,7 @@ pub const CudaCompute = struct {
                     .declared_ffn_scratch_bytes = if (layout.ffn_workspace) |span| span.bytes else 0,
                     .declared_ffn_output_bank_bytes = if (layout.ffn_outputs) |span| span.bytes else 0,
                     .declared_projection_staging_bytes = if (layout.projection_staging) |span| span.bytes else 0,
+                    .declared_attention_residual_bytes = if (layout.attention_residual) |span| span.bytes else 0,
                     .declared_attention_norm_bytes = if (layout.attention_norm) |span| span.bytes else 0,
                     .declared_attention_norm_mirror_bytes = if (layout.attention_norm_mirror) |span| span.bytes else 0,
                     .declared_final_norm_mirror_bytes = if (layout.final_norm_mirror) |span| span.bytes else 0,
@@ -4558,17 +4559,22 @@ pub const CudaCompute = struct {
             weight.buffer.len < try checkedMul(try checkedMul(hidden, in_dim), 2) or
             residual.buffer.len < try checkedMul(try checkedMul(rows, hidden), 4)) return error.InvalidShape;
         const staged = (try stageBf16ActivationForCublasLt(self, input, rows, in_dim)) orelse return null;
-        const shape = try allocShape2(self.allocator, rows, hidden);
-        errdefer self.allocator.free(shape);
-        var output = try allocDeviceBuffer(self, try checkedMul(try checkedMul(rows, hidden), 4));
-        errdefer releaseDeviceBuffer(self, &output);
+        const count = try checkedMul(rows, hidden);
+        const bytes = try checkedMul(count, @sizeOf(f32));
+        const destination = if (self.bounded_decode_graph.active) try self.bounded_decode_graph.bindAttentionResidual(bytes) else null;
+        if (destination) |output| {
+            const regions = [_]buffer_mod.DeviceBuffer{ input.buffer, staged, weight.buffer, residual.buffer, output };
+            try buffer_mod.validateRegions(5, regions, .{ input.buffer.len, staged.len, weight.buffer.len, bytes, bytes }, .{ 4, 2, 2, 4, 4 }, 4);
+        }
+        var output = try OwnedF32Output.fromOwnedShapeDestination(self, try allocShape2(self.allocator, rows, hidden), count, bytes, destination);
+        defer output.deinit();
         errdefer self.ctx.synchronize() catch {};
         var operation_profile = beginOperationProfile(self, .attention_output, .bf16_projection, rows);
         defer if (operation_profile) |*scope| scope.end();
-        try self.cublaslt.?.matmulBf16WeightResidualF32Out(&self.ctx, output, staged, weight.buffer, residual.buffer, cublasLtWorkspace(self), rows, in_dim, hidden);
+        try self.cublaslt.?.matmulBf16WeightResidualF32Out(&self.ctx, output.buffer, staged, weight.buffer, residual.buffer, cublasLtWorkspace(self), rows, in_dim, hidden);
         self.stats.bf16_cublaslt_linear_calls += 1;
         self.lighton_projection_residual_calls += 1;
-        return createTensor(self, output, shape, rows * hidden);
+        return output.intoTensor();
     }
 
     pub const DenseSiluFfnBlockRequest = struct {
@@ -29910,6 +29916,27 @@ pub fn tryCapturedFinalNorm(cb: *const ops.ComputeBackend, input: CT, weight: CT
         try buffer_mod.validateRegions(4, regions, .{ source.buffer.len, gamma.buffer.len, bytes, span.len }, .{ @alignOf(f32), 1, @alignOf(f32), @alignOf(u16) }, 2);
     }
     return try rmsNormWithDestination(cb.ptr, input, weight, dim, eps, destination, mirror);
+}
+
+pub fn tryCapturedAttentionResidual(cb: *const ops.ComputeBackend, a: CT, b: CT) !?CT {
+    if (!acceptsPhysicalImplementation(cb.vtable)) return null;
+    const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
+    const owner = &self.bounded_decode_graph;
+    if (!owner.active or self.capability_profile != .lightonocr3) return null;
+    const lhs = tensorFromCt(a);
+    const rhs = tensorFromCt(b);
+    if (!sameShape(lhs.shape, rhs.shape) or lhs.elem_count != rhs.elem_count) return null;
+    try ensureF32(lhs);
+    try ensureF32(rhs);
+    const bytes = try checkedMul(lhs.elem_count, @sizeOf(f32));
+    const destination = (try owner.bindAttentionResidual(bytes)) orelse return null;
+    try buffer_mod.validateRegions(3, .{ lhs.buffer, rhs.buffer, destination }, @splat(bytes), @splat(@alignOf(f32)), 2);
+    const shape = try dupeShape(self.allocator, lhs.shape);
+    var output = try OwnedF32Output.fromOwnedShapeDestination(self, shape, lhs.elem_count, bytes, destination);
+    defer output.deinit();
+    try self.kernels.launchElementwiseF32(&self.ctx, output.buffer, lhs.buffer, rhs.buffer, lhs.elem_count, .add);
+    self.stats.launch_elementwise += 1;
+    return output.intoTensor();
 }
 
 pub fn tryCapturedAttentionNorm(cb: *const ops.ComputeBackend, input: CT, weight: CT, dim: usize, eps: f32) !?CT {
