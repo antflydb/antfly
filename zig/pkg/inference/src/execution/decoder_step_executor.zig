@@ -866,7 +866,13 @@ pub const Executor = struct {
                     if (future[i] > window) return decline(decline_code, .context_or_page_capacity);
                 // Reject a packet that cannot fit before growing either KV owner.
                 if (i % attention.max_packet_rows == 0) minimum_packet_blocks = 0;
-                const owned = storage.sequenceMut(mixed.state.sequence_id.?) catch return decline(decline_code, .missing_kv_binding);
+                const sequence = mixed.state.sequence_id.?;
+                const owned = storage.sequenceMut(sequence) catch return decline(decline_code, .missing_kv_binding);
+                const manager_table = manager.blockTable(sequence) orelse return decline(decline_code, .missing_kv_binding);
+                if (owned.block_table.shared_prefix_blocks != 0 or manager_table.shared_prefix_blocks != 0)
+                    return decline(decline_code, .context_or_page_capacity);
+                if (!reserve and try manager.reservedTokenCapacity(sequence) < future[i])
+                    return decline(decline_code, .context_or_page_capacity);
                 const existing = try std.math.add(usize, owned.block_table.blocks.items.len, owned.reserved_tail_blocks.items.len);
                 const required = @max(existing, try std.math.divCeil(usize, future[i], page_size));
                 if (required > attention.max_blocks - minimum_packet_blocks) return decline(decline_code, .context_or_page_capacity);
@@ -930,14 +936,10 @@ pub const Executor = struct {
                 if (i % packet_rows == 0) packet_blocks = 0;
                 const state = item.state;
                 const sequence = state.sequence_id.?;
-                const table = storage.blockTable(sequence) orelse return decline(decline_code, .missing_kv_binding);
-                if (table.shared_prefix_blocks != 0) return decline(decline_code, .context_or_page_capacity);
                 if (reserve) {
                     try manager.reserveTokenCapacity(sequence, future[i]);
                     try storage.reserveDeviceTokenCapacity(sequence, future[i], future[i]);
-                } else if (try manager.reservedTokenCapacity(sequence) < future[i]) return decline(decline_code, .context_or_page_capacity);
-                const manager_table = manager.blockTable(sequence) orelse return decline(decline_code, .missing_kv_binding);
-                if (manager_table.shared_prefix_blocks != 0) return decline(decline_code, .context_or_page_capacity);
+                }
                 const owned_sequence = try storage.sequenceMut(sequence);
                 const spans = [_][]const u32{
                     owned_sequence.block_table.blocks.items,
@@ -985,6 +987,7 @@ pub const Executor = struct {
             if (self.context.gpt_config.layerUsesQwen35LinearAttention(layer) and
                 !@import("../ops/cuda/gated_delta.zig").packetGeometrySupported(self.context.gpt_config.qwen35_linear_num_key_heads, self.context.gpt_config.qwen35_linear_num_value_heads, self.context.gpt_config.qwen35_linear_key_head_dim, self.context.gpt_config.qwen35_linear_value_head_dim, self.context.gpt_config.qwen35_linear_conv_kernel_dim)) return self.declineLightOnGraph(.unsupported_geometry);
         }
+        const preparation = self.context.graph_preparation orelse return self.declineLightOnGraph(.admission_or_revalidation);
         try self.context.cb.checkExecutionControl();
         var key_words: [24576]u64 = undefined;
         var key = CapturedGraphRecipe.Key{ .words = &key_words };
@@ -1031,7 +1034,6 @@ pub const Executor = struct {
         var funding_phase: graph_owner.GraphPhase = undefined;
         try funding_phase.initInto(descriptor);
         defer funding_phase.close(.{ .boundary = self.context.cleanupEpoch() }) catch platform.inference_process_supervisor.restartWorker();
-        const preparation = self.context.graph_preparation orelse return self.declineLightOnGraph(.admission_or_revalidation);
         const KvOutside = struct {
             mutex: @TypeOf(kv_lock),
             held: *bool,
