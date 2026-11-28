@@ -2265,9 +2265,6 @@ pub const PersistentIndex = struct {
         /// shared lookup (`version_locations`) with the snapshot they
         /// belong to.
         columns: std.ArrayListUnmanaged(DecodedColumn) = .empty,
-        /// Indexes the install detached from the lookup, freed with this
-        /// delta, after its locks are released.
-        detached: std.ArrayListUnmanaged(*VersionLocations.SegmentVersions) = .empty,
 
         pub const DecodedColumn = struct { seg_id: u64, index: ?*VersionLocations.SegmentVersions };
 
@@ -2285,8 +2282,6 @@ pub const PersistentIndex = struct {
             if (self.mirror) |*mirror| mirror.deinit();
             for (self.columns.items) |column| if (column.index) |index| index.destroy(alloc);
             self.columns.deinit(alloc);
-            for (self.detached.items) |index| index.destroy(alloc);
-            self.detached.deinit(alloc);
             self.base.release();
             self.arena.deinit();
             self.* = undefined;
@@ -2422,18 +2417,9 @@ pub const PersistentIndex = struct {
         {
             @import("antfly_platform").sync.lockYielding(&locations.mutex);
             defer locations.mutex.unlock();
+            locations.advanceLocked(self.alloc);
             for (versions) |version| {
-                const found = found: {
-                    var it = locations.segments.iterator();
-                    while (it.next()) |entry| {
-                        const seg_id = entry.key_ptr.*;
-                        const local = entry.value_ptr.*.by_version.get(version) orelse continue;
-                        if ((try base.segmentIndex(seg_id)) == null or std.mem.indexOfScalar(u64, removed, seg_id) != null) continue;
-                        break :found VersionLocations.Location{ .seg_id = seg_id, .local_id = local };
-                    }
-                    break :found null;
-                };
-                if (found) |location| {
+                if (try locations.lookupLocked(base, version, removed)) |location| {
                     const slot = try by_segment.getOrPut(alloc, location.seg_id);
                     if (!slot.found_existing) slot.value_ptr.* = .empty;
                     try slot.value_ptr.append(alloc, location.local_id);
@@ -2451,7 +2437,7 @@ pub const PersistentIndex = struct {
         for (unindexed.items) |seg_id| {
             const position = (try base.segmentIndex(seg_id)).?;
             try prepared.columns.ensureUnusedCapacity(self.alloc, 1);
-            const index = try VersionLocations.SegmentVersions.build(self.alloc, &base.segments[position]);
+            const index = try VersionLocations.SegmentVersions.build(self.alloc, &base.segments[position], true);
             prepared.columns.appendAssumeCapacity(.{ .seg_id = seg_id, .index = index });
             var missing_it = missing.keyIterator();
             while (missing_it.next()) |version| {
@@ -2518,30 +2504,32 @@ pub const PersistentIndex = struct {
 
     /// After a delta published: the lookup detaches the segments the delta
     /// retired, by id from its own list, and attaches the indexes it built
-    /// for segments still served. Neither touches a version; the detached
-    /// indexes are freed with the delta, after its locks are released.
+    /// for segments still served. Each is O(1); their versions are routed
+    /// in and out in bounded steps (`VersionLocations.advanceLocked`).
     fn installVersionColumns(self: *PersistentIndex, prepared: *PreparedPeerDelta) void {
         const locations = &self.version_locations;
         @import("antfly_platform").sync.lockYielding(&locations.mutex);
         defer locations.mutex.unlock();
-        prepared.detached.ensureUnusedCapacity(self.alloc, prepared.removed.len) catch {
-            // Cannot keep what it detaches: leave the lookup to rebuild.
-            locations.destroySegments(self.alloc);
+        for (prepared.removed) |seg_id| locations.detachLocked(self.alloc, seg_id) catch {
+            // Cannot queue it: drop the lookup, which rebuilds on demand.
+            locations.destroyAll(self.alloc);
+            locations.route.clearRetainingCapacity();
             locations.segments.clearRetainingCapacity();
+            locations.pending.clearRetainingCapacity();
+            locations.retiring.clearRetainingCapacity();
+            locations.pending_cursor = 0;
+            locations.retiring_cursor = 0;
             return;
         };
-        for (prepared.removed) |seg_id| {
-            const entry = locations.segments.fetchRemove(seg_id) orelse continue;
-            prepared.detached.appendAssumeCapacity(entry.value);
-        }
         const snap = @atomicLoad(*index_mod.IndexSnapshot, &self.writer.current, .acquire);
         for (prepared.columns.items) |*column| {
             const index = column.index orelse continue;
             const served = (snap.segmentIndex(column.seg_id) catch null) != null;
             if (!served or locations.segments.contains(column.seg_id)) continue;
-            locations.segments.put(self.alloc, column.seg_id, index) catch continue;
+            locations.attachLocked(self.alloc, index) catch continue;
             column.index = null;
         }
+        locations.advanceLocked(self.alloc);
     }
 
     fn peerDeletionBitmap(
@@ -2801,15 +2789,20 @@ pub const PersistentIndex = struct {
             // the plan.
             try plan.retained.ensureUnusedCapacity(self.alloc, 1);
             var derived = try derivedDeletionBitmap(self.writer.alloc, segment.reader.encoded(), &dead);
+            // Owned here until the plan takes it below.
+            var derived_owned = true;
+            errdefer if (derived_owned) if (derived) |*bitmap| bitmap.deinit();
             var current = try segment.cloneDeletedState(self.writer.alloc);
             defer if (current.bitmap) |*bitmap| bitmap.deinit();
             // Unchanged tombstones keep the segment's own cell and caches.
             const unchanged = if (derived) |*next| (if (current.bitmap) |*now| next.eql(now) else next.isEmpty()) else current.count == 0;
             if (unchanged) {
                 if (derived) |*next| next.deinit();
+                derived_owned = false;
                 continue;
             }
             plan.retained.appendAssumeCapacity(.{ .id = segment.id, .bitmap = derived orelse roaring.RoaringBitmap.init(self.writer.alloc) });
+            derived_owned = false;
         }
         // Segments new here are published with their deletions and readers.
         var tip_it = tip.keyIterator();
@@ -5436,68 +5429,171 @@ pub const PersistentIndex = struct {
     /// is stale (a merge moved or dropped the copy) and is looked up again.
     pub const VersionLocations = struct {
         mutex: std.atomic.Mutex = .unlocked,
-        /// Each indexed segment's version index, built from its version
-        /// column. A segment's index comes and goes whole, so attaching or
-        /// retiring one costs the same whatever the segment's size, and an
-        /// index can be built before it is attached.
+        /// Where each routed version sits: one probe per death.
+        route: std.AutoHashMapUnmanaged(u64, Location) = .empty,
+        /// Indexed segments. One attached by a refresh joins `route` in
+        /// bounded steps (`pending`, looked up through its own index until
+        /// then), and a detached one leaves it the same way (`retiring`), so
+        /// attaching or detaching costs the same whatever the segment's
+        /// size, and no lock holder routes more than `step_budget` versions.
         segments: std.AutoHashMapUnmanaged(u64, *SegmentVersions) = .empty,
+        pending: std.ArrayListUnmanaged(u64) = .empty,
+        pending_cursor: usize = 0,
+        retiring: std.ArrayListUnmanaged(*SegmentVersions) = .empty,
+        retiring_cursor: usize = 0,
         /// Versions a committed death named before their level-0 segment was
         /// installed (a later commit's install ran first). The segment's
         /// install takes them.
         parked: std.AutoHashMapUnmanaged(u64, void) = .empty,
 
         const Location = struct { seg_id: u64, local_id: u32 };
+        const step_budget = 4096;
 
         pub const SegmentVersions = struct {
+            seg_id: u64,
+            /// Local order: routes it in, and later out.
+            column: []u64,
+            /// Until routed: lookups for a pending segment.
             by_version: std.AutoHashMapUnmanaged(u64, u32) = .empty,
 
-            fn build(alloc: Allocator, segment: *const index_mod.SegmentEntry) !*SegmentVersions {
+            /// Decodes the column; `indexed` also builds the lookup a
+            /// pending segment answers through. Needs no lock.
+            fn build(alloc: Allocator, segment: *const index_mod.SegmentEntry, indexed: bool) !*SegmentVersions {
                 const column = (try segment.reader.docVersionsAlloc(alloc)) orelse try alloc.alloc(u64, 0);
-                defer alloc.free(column);
+                errdefer alloc.free(column);
                 const index = try alloc.create(SegmentVersions);
-                index.* = .{};
+                index.* = .{ .seg_id = segment.id, .column = column };
                 errdefer index.destroy(alloc);
-                try index.by_version.ensureTotalCapacity(alloc, @intCast(column.len));
-                for (column, 0..) |version, local| {
-                    if (version != 0) index.by_version.putAssumeCapacity(version, @intCast(local));
+                if (indexed) {
+                    try index.by_version.ensureTotalCapacity(alloc, @intCast(column.len));
+                    for (column, 0..) |version, local| {
+                        if (version != 0) index.by_version.putAssumeCapacity(version, @intCast(local));
+                    }
                 }
                 return index;
             }
 
             fn destroy(self: *SegmentVersions, alloc: Allocator) void {
                 self.by_version.deinit(alloc);
+                alloc.free(self.column);
                 alloc.destroy(self);
             }
         };
 
-        /// Where `version` sits among `snap`'s segments. A merge carries
-        /// versions into its output, so a retired input may still list it.
-        fn findServed(self: *const VersionLocations, snap: *const index_mod.IndexSnapshot, version: u64) !?Location {
-            var it = self.segments.iterator();
-            while (it.next()) |entry| {
-                const local = entry.value_ptr.*.by_version.get(version) orelse continue;
-                if ((try snap.segmentIndex(entry.key_ptr.*)) != null) return .{ .seg_id = entry.key_ptr.*, .local_id = local };
+        /// Where `version` sits among `snap`'s segments other than
+        /// `excluded`. A merge carries versions into its output, so a route
+        /// may name a retired input; the output is then pending or routed.
+        fn lookupLocked(self: *const VersionLocations, snap: *const index_mod.IndexSnapshot, version: u64, excluded: []const u64) !?Location {
+            if (self.route.get(version)) |location| {
+                if ((try snap.segmentIndex(location.seg_id)) != null and std.mem.indexOfScalar(u64, excluded, location.seg_id) == null) return location;
+            }
+            for (self.pending.items) |seg_id| {
+                const index = self.segments.get(seg_id) orelse continue;
+                const local = index.by_version.get(version) orelse continue;
+                if ((try snap.segmentIndex(seg_id)) != null and std.mem.indexOfScalar(u64, excluded, seg_id) == null) return .{ .seg_id = seg_id, .local_id = local };
             }
             return null;
+        }
+
+        /// O(1): routing follows in `advanceLocked`. On error the caller
+        /// still owns `index`.
+        fn attachLocked(self: *VersionLocations, alloc: Allocator, index: *SegmentVersions) !void {
+            try self.pending.ensureUnusedCapacity(alloc, 1);
+            const slot = try self.segments.getOrPut(alloc, index.seg_id);
+            if (slot.found_existing) return error.InvalidSegment;
+            slot.value_ptr.* = index;
+            self.pending.appendAssumeCapacity(index.seg_id);
+        }
+
+        /// Attaches and routes now: for a caller already decoding the
+        /// segment under this lock. On error the caller still owns `index`.
+        fn attachRoutedLocked(self: *VersionLocations, alloc: Allocator, index: *SegmentVersions) !void {
+            try self.route.ensureUnusedCapacity(alloc, @intCast(index.column.len));
+            try self.segments.put(alloc, index.seg_id, index);
+            for (index.column, 0..) |version, local| {
+                if (version != 0) self.route.putAssumeCapacity(version, .{ .seg_id = index.seg_id, .local_id = @intCast(local) });
+            }
+        }
+
+        /// O(pending): unrouting follows in `advanceLocked`.
+        fn detachLocked(self: *VersionLocations, alloc: Allocator, seg_id: u64) !void {
+            try self.retiring.ensureUnusedCapacity(alloc, 1);
+            const index = (self.segments.fetchRemove(seg_id) orelse return).value;
+            if (std.mem.indexOfScalar(u64, self.pending.items, seg_id)) |at| {
+                _ = self.pending.orderedRemove(at);
+                if (at == 0) self.pending_cursor = 0;
+            }
+            self.retiring.appendAssumeCapacity(index);
+        }
+
+        /// At most `step_budget` versions of routing and unrouting.
+        fn advanceLocked(self: *VersionLocations, alloc: Allocator) void {
+            var budget: usize = step_budget;
+            while (budget != 0 and self.pending.items.len != 0) {
+                const index = self.segments.get(self.pending.items[0]) orelse {
+                    _ = self.pending.orderedRemove(0);
+                    self.pending_cursor = 0;
+                    continue;
+                };
+                const start = self.pending_cursor;
+                const end = @min(index.column.len, start + budget);
+                self.route.ensureUnusedCapacity(alloc, @intCast(end - start)) catch return;
+                while (self.pending_cursor < end) : (self.pending_cursor += 1) {
+                    const version = index.column[self.pending_cursor];
+                    if (version != 0) self.route.putAssumeCapacity(version, .{ .seg_id = index.seg_id, .local_id = @intCast(self.pending_cursor) });
+                }
+                budget -= end - start;
+                if (self.pending_cursor == index.column.len) {
+                    index.by_version.clearAndFree(alloc);
+                    _ = self.pending.orderedRemove(0);
+                    self.pending_cursor = 0;
+                }
+            }
+            while (budget != 0 and self.retiring.items.len != 0) {
+                const index = self.retiring.items[0];
+                const start = self.retiring_cursor;
+                const end = @min(index.column.len, start + budget);
+                while (self.retiring_cursor < end) : (self.retiring_cursor += 1) {
+                    const version = index.column[self.retiring_cursor];
+                    if (self.route.get(version)) |location| if (location.seg_id == index.seg_id) {
+                        _ = self.route.remove(version);
+                    };
+                }
+                budget -= end - start;
+                if (self.retiring_cursor == index.column.len) {
+                    index.destroy(alloc);
+                    _ = self.retiring.orderedRemove(0);
+                    self.retiring_cursor = 0;
+                }
+            }
         }
 
         fn clear(self: *VersionLocations, alloc: Allocator) void {
             @import("antfly_platform").sync.lockYielding(&self.mutex);
             defer self.mutex.unlock();
-            self.destroySegments(alloc);
+            self.destroyAll(alloc);
+            self.route.clearAndFree(alloc);
             self.segments.clearAndFree(alloc);
+            self.pending.clearAndFree(alloc);
+            self.retiring.clearAndFree(alloc);
+            self.pending_cursor = 0;
+            self.retiring_cursor = 0;
             self.parked.clearAndFree(alloc);
         }
 
         fn deinit(self: *VersionLocations, alloc: Allocator) void {
-            self.destroySegments(alloc);
+            self.destroyAll(alloc);
+            self.route.deinit(alloc);
             self.segments.deinit(alloc);
+            self.pending.deinit(alloc);
+            self.retiring.deinit(alloc);
             self.parked.deinit(alloc);
         }
 
-        fn destroySegments(self: *VersionLocations, alloc: Allocator) void {
+        fn destroyAll(self: *VersionLocations, alloc: Allocator) void {
             var it = self.segments.valueIterator();
             while (it.next()) |index| index.*.destroy(alloc);
+            for (self.retiring.items) |index| index.destroy(alloc);
         }
     };
 
@@ -5516,6 +5612,7 @@ pub const PersistentIndex = struct {
         const locations = &self.version_locations;
         @import("antfly_platform").sync.lockYielding(&locations.mutex);
         defer locations.mutex.unlock();
+        locations.advanceLocked(self.alloc);
         const snap = self.writer.acquireSnapshot();
         defer snap.release();
         // Parked deaths outlive only the publications they wait for.
@@ -5523,34 +5620,37 @@ pub const PersistentIndex = struct {
         if (!pending and locations.parked.count() != 0) locations.parked.clearRetainingCapacity();
         var refreshed = false;
         for (versions) |version| {
-            var location = try locations.findServed(snap, version);
+            var location = try locations.lookupLocked(snap, version, &.{});
             if (location == null and !refreshed) {
                 try self.indexVersionLocationsLocked(snap);
                 refreshed = true;
-                location = try locations.findServed(snap, version);
+                location = try locations.lookupLocked(snap, version, &.{});
             }
             const found = location orelse {
                 if (pending) try locations.parked.put(self.alloc, version, {});
                 continue;
             };
-            // A dead version stays in its segment's index: marking it again
-            // changes nothing.
+            // A dead version keeps its route: marking it again changes
+            // nothing.
             try self.writer.applyCommittedDeletes(found.seg_id, &.{found.local_id});
         }
     }
 
+    /// Indexes every served segment not yet indexed, routing it at once:
+    /// this caller decodes the segment under the lock regardless. Segments
+    /// no longer served leave in bounded steps.
     fn indexVersionLocationsLocked(self: *PersistentIndex, snap: *const index_mod.IndexSnapshot) !void {
         const locations = &self.version_locations;
         var retired = std.ArrayListUnmanaged(u64).empty;
         defer retired.deinit(self.alloc);
         var indexed_it = locations.segments.keyIterator();
         while (indexed_it.next()) |seg_id| if ((try snap.segmentIndex(seg_id.*)) == null) try retired.append(self.alloc, seg_id.*);
-        for (retired.items) |seg_id| locations.segments.fetchRemove(seg_id).?.value.destroy(self.alloc);
+        for (retired.items) |seg_id| try locations.detachLocked(self.alloc, seg_id);
         for (snap.segments) |*segment| {
             if (locations.segments.contains(segment.id)) continue;
-            const index = try VersionLocations.SegmentVersions.build(self.alloc, segment);
+            const index = try VersionLocations.SegmentVersions.build(self.alloc, segment, false);
             errdefer index.destroy(self.alloc);
-            try locations.segments.put(self.alloc, segment.id, index);
+            try locations.attachRoutedLocked(self.alloc, index);
         }
     }
 
@@ -10527,6 +10627,43 @@ fn refreshFromChangesForTest(index: *PersistentIndex) !PersistentIndex.ChangeRef
 // waiting to install when the refresh would publish: the refresh neither
 // publishes nor clears the decision stamps that write depends on, and its
 // cut stays uncovered until the write lands.
+// The version lookup keeps one route per version, so a death costs one probe
+// whatever the number of segments. A segment attached by a refresh is routed
+// in bounded steps, answering through its own index until then, and a
+// detached one leaves the routes the same way: no lock holder does more than
+// one step.
+test "persistent index version routes move in bounded steps" {
+    const alloc = std.testing.allocator;
+    var locations: PersistentIndex.VersionLocations = .{};
+    defer locations.deinit(alloc);
+    const count = 10_000;
+    const index = try alloc.create(PersistentIndex.VersionLocations.SegmentVersions);
+    index.* = .{ .seg_id = 7, .column = try alloc.alloc(u64, count) };
+    for (index.column, 0..) |*version, i| version.* = 1000 + i;
+    try index.by_version.ensureTotalCapacity(alloc, count);
+    for (index.column, 0..) |version, i| index.by_version.putAssumeCapacity(version, @intCast(i));
+
+    try locations.attachLocked(alloc, index);
+    try std.testing.expectEqual(@as(usize, 0), locations.route.count());
+    locations.advanceLocked(alloc);
+    try std.testing.expectEqual(@as(usize, PersistentIndex.VersionLocations.step_budget), locations.route.count());
+    try std.testing.expectEqual(@as(u32, 0), locations.route.get(1000).?.local_id);
+    // Not routed yet: still found through the pending segment's index.
+    try std.testing.expect(locations.route.get(1000 + count - 1) == null);
+    try std.testing.expectEqual(@as(usize, 1), locations.pending.items.len);
+    try std.testing.expectEqual(@as(u32, count - 1), locations.segments.get(7).?.by_version.get(1000 + count - 1).?);
+    while (locations.pending.items.len != 0) locations.advanceLocked(alloc);
+    try std.testing.expectEqual(@as(usize, count), locations.route.count());
+    try std.testing.expectEqual(@as(usize, 0), locations.segments.get(7).?.by_version.count());
+
+    try locations.detachLocked(alloc, 7);
+    try std.testing.expect(!locations.segments.contains(7));
+    locations.advanceLocked(alloc);
+    try std.testing.expectEqual(@as(usize, count - PersistentIndex.VersionLocations.step_budget), locations.route.count());
+    while (locations.retiring.items.len != 0) locations.advanceLocked(alloc);
+    try std.testing.expectEqual(@as(usize, 0), locations.route.count());
+}
+
 test "persistent index change refresh yields to an inline write staged after preparation" {
     const alloc = std.testing.allocator;
     var sink = InlinePublicationTestSink{ .allocator = alloc };

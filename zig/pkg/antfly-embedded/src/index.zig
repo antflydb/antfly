@@ -230,7 +230,14 @@ pub const SegmentShared = struct {
     const deletion_writer_bit: u32 = 1 << 31;
 
     /// Private visibility state may borrow an immutable physical reader.
+    /// On a fork's cell (private tombstones over a shared physical
+    /// segment): the physical segment's owner entry, through which this cell
+    /// holds one reference. Always the owner, never another fork, so
+    /// repeated forks do not chain.
     physical_parent: ?*SegmentEntry = null,
+    /// On a physical cell: the one owner entry its forks reference, made by
+    /// the first fork and freed with this cell.
+    owner: std.atomic.Value(?*SegmentEntry) = .init(null),
 
     ref_count: u32,
     /// Visibility cells and physical readers may have independent owners.
@@ -748,16 +755,46 @@ pub const SegmentEntry = struct {
         const seg_id = self.id;
         const cleanup = self.shared.retired_cleanup;
         if (self.shared.physical_parent) |parent| {
+            // A fork's own cell goes; its reference on the physical segment
+            // is released through the owner, whose final release frees the
+            // segment, the owner and runs any retirement cleanup.
             destroyShared(alloc, self.shared);
             parent.releaseRef();
-            alloc.destroy(parent);
             return;
         }
+        const owner = self.shared.owner.load(.acquire);
         self.data.madviseDiscardCleanPages();
         self.reader.deinit();
         self.data.deinit(alloc);
         destroyShared(alloc, self.shared);
+        // `self` may be the owner: nothing below reads it.
+        if (owner) |entry| alloc.destroy(entry);
         if (cleanup) |c| c.run(seg_id);
+    }
+
+    /// The cell holding this segment's physical data: its own, or its
+    /// owner's when this entry is a fork.
+    pub fn physicalShared(self: *const SegmentEntry) *SegmentShared {
+        return if (self.shared.physical_parent) |owner| owner.shared else self.shared;
+    }
+
+    /// The owner entry forks of this segment reference, made once per
+    /// physical segment from the physical cell's allocator, which frees it.
+    /// It takes no reference itself: each fork's cell holds one on the
+    /// physical cell through it.
+    fn physicalOwner(self: *const SegmentEntry) !*SegmentEntry {
+        const cell = self.physicalShared();
+        if (cell.owner.load(.acquire)) |owner| return owner;
+        const alloc = cell.allocator;
+        const owner = try alloc.create(SegmentEntry);
+        // Query-bound reader state belongs to the entry that bound it.
+        owner.* = self.physical();
+        owner.shared = cell;
+        if (cell.owner.cmpxchgStrong(null, owner, .acq_rel, .acquire)) |winner| {
+            alloc.destroy(owner);
+            return winner.?;
+        }
+        return owner;
     }
 
     /// Number of live (non-deleted) documents.
@@ -968,11 +1005,9 @@ pub const KeptDeletion = struct {
 
 /// Undoes an unpublished fork (`buildSegmentReplacement`): its private cell
 /// and the parent entry, which took no reference yet.
-fn destroyFork(alloc: Allocator, seg: *SegmentEntry) void {
-    const parent = seg.shared.physical_parent.?;
+fn destroyFork(alloc: Allocator, seg: *SegmentEntry, previous: *SegmentShared) void {
     SegmentEntry.destroyShared(alloc, seg.shared);
-    seg.* = parent.*;
-    alloc.destroy(parent);
+    seg.shared = previous;
 }
 
 pub const RetiredSegmentCleanup = struct {
@@ -4110,8 +4145,8 @@ pub const IndexWriter = struct {
         /// replacement replaces: each holds a private shared cell over the
         /// same physical segment (`KeptDeletion`), so the snapshot publishes
         /// membership and liveness together while older snapshots keep
-        /// theirs.
-        forks: []const u32 = &.{},
+        /// theirs. Sorted by position.
+        forks: []const Fork = &.{},
         next_segment_id: u64,
         active: bool = true,
         /// Prepared under the writer lock, which it still holds. A
@@ -4120,6 +4155,10 @@ pub const IndexWriter = struct {
         locked: bool = true,
         /// The snapshot an unlocked preparation was built from.
         base: ?*const IndexSnapshot = null,
+
+        /// A kept segment given a private cell, at its position among the
+        /// carried segments, with the cell it replaced (restored on abort).
+        pub const Fork = struct { position: u32, previous: *SegmentShared };
 
         /// Publishes an unlocked preparation if the writer still serves the
         /// snapshot it was built from; otherwise discards it. The lock is
@@ -4143,16 +4182,23 @@ pub const IndexWriter = struct {
             const writer = self.writer;
             const old = @atomicLoad(*IndexSnapshot, &writer.current, .acquire);
 
+            // `forks` is sorted: one pass. A fork's cell is the snapshot's;
+            // the reference a carried segment would take goes to the
+            // physical segment, through its owner.
+            var next_fork: usize = 0;
             for (self.snapshot.segments[0..self.carried_count], 0..) |*seg, i| {
-                // A fork's physical parent takes the reference a carried
-                // segment would; the fork's own cell is the snapshot's.
-                if (std.mem.indexOfScalar(u32, self.forks, @intCast(i)) != null) seg.shared.physical_parent.?.retain() else seg.retain();
+                if (next_fork < self.forks.len and self.forks[next_fork].position == i) {
+                    seg.shared.physical_parent.?.retain();
+                    next_fork += 1;
+                } else seg.retain();
             }
             if (self.forks.len > 0) self.staging_alloc.free(self.forks);
             for (self.retired) |*seg| {
                 seg.data.madviseDiscardCleanPages();
-                std.debug.assert(seg.shared.retired_cleanup == null);
-                seg.shared.retired_cleanup = if (writer.retired_segment_cleanup) |cleanup| cleanup.retained() else null;
+                // On the physical cell: a fork's release frees only its own.
+                const physical_cell = seg.physicalShared();
+                std.debug.assert(physical_cell.retired_cleanup == null);
+                physical_cell.retired_cleanup = if (writer.retired_segment_cleanup) |cleanup| cleanup.retained() else null;
             }
             if (self.retired.len > 0) self.staging_alloc.free(self.retired);
 
@@ -4167,7 +4213,7 @@ pub const IndexWriter = struct {
         pub fn abort(self: *PreparedSegmentReplacement) void {
             if (!self.active) return;
             const writer = self.writer;
-            for (self.forks) |i| destroyFork(writer.alloc, &self.snapshot.segments[i]);
+            for (self.forks) |fork| destroyFork(writer.alloc, &self.snapshot.segments[fork.position], fork.previous);
             if (self.forks.len > 0) self.staging_alloc.free(self.forks);
             for (self.snapshot.segments[self.carried_count..]) |*seg| {
                 SegmentEntry.destroyShared(writer.alloc, seg.shared);
@@ -4350,9 +4396,7 @@ pub const IndexWriter = struct {
         for (snapshot_ref.segments, excluded) |*segment, mask| {
             if (mask.cardinality() == 0) continue;
             if (segment.reader.doc_count == 0 or mask.rank(segment.reader.doc_count) != mask.cardinality()) return error.InvalidSegment;
-            const parent = try self.alloc.create(SegmentEntry);
-            errdefer self.alloc.destroy(parent);
-            parent.* = segment.*;
+            const parent = try segment.physicalOwner();
             const shared = try SegmentEntry.createShared(self.alloc, segment.data, segment.reader.encoded());
             errdefer SegmentEntry.destroyShared(self.alloc, shared);
             shared.deleted = try mask.clone(self.alloc);
@@ -4726,8 +4770,9 @@ pub const IndexWriter = struct {
         // concurrently for segments old references.
         for (new_segments[0..carried_count]) |*seg| seg.retain();
         for (retired) |*seg| {
-            std.debug.assert(seg.shared.retired_cleanup == null);
-            seg.shared.retired_cleanup = if (self.retired_segment_cleanup) |cleanup| cleanup.retained() else null;
+            const physical_cell = seg.physicalShared();
+            std.debug.assert(physical_cell.retired_cleanup == null);
+            physical_cell.retired_cleanup = if (self.retired_segment_cleanup) |cleanup| cleanup.retained() else null;
         }
         if (retired.len > 0) self.alloc.free(retired);
 
@@ -5028,32 +5073,41 @@ pub const IndexWriter = struct {
         // Kept segments whose tombstones change get a private cell over the
         // same physical segment (as `shareMaskedImmutableSegments` does), so
         // the new tombstones are visible exactly in this snapshot.
-        const forks = try scratch_alloc.alloc(u32, kept.len);
+        const Fork = PreparedSegmentReplacement.Fork;
+        const forks = try scratch_alloc.alloc(Fork, kept.len);
         var forks_created: usize = 0;
         errdefer {
-            for (forks[0..forks_created]) |i| destroyFork(self.alloc, &new_segments[i]);
+            for (forks[0..forks_created]) |fork| destroyFork(self.alloc, &new_segments[fork.position], fork.previous);
             scratch_alloc.free(forks);
         }
-        for (kept) |*deletion| {
-            const position = for (new_segments[0..keep_count], 0..) |seg, i| {
-                if (seg.id == deletion.id) break i;
-            } else return error.InvalidSegment;
-            const seg = &new_segments[position];
-            const parent = try self.alloc.create(SegmentEntry);
-            errdefer self.alloc.destroy(parent);
-            parent.* = seg.*;
-            const shared = try SegmentEntry.createShared(self.alloc, seg.data, seg.reader.encoded());
-            if (deletion.bitmap) |bitmap| {
-                if (bitmap.isEmpty()) deletion.deinit() else {
-                    shared.deleted = bitmap;
-                    shared.deleted_count.store(@intCast(bitmap.cardinality()), .release);
-                    deletion.bitmap = null;
+        if (kept.len != 0) {
+            // Positions resolved once, not searched per changed segment.
+            var positions = std.AutoHashMapUnmanaged(u64, u32).empty;
+            defer positions.deinit(scratch_alloc);
+            try positions.ensureTotalCapacity(scratch_alloc, @intCast(keep_count));
+            for (new_segments[0..keep_count], 0..) |seg, i| positions.putAssumeCapacity(seg.id, @intCast(i));
+            for (kept) |*deletion| {
+                const position = positions.get(deletion.id) orelse return error.InvalidSegment;
+                const seg = &new_segments[position];
+                const owner = try seg.physicalOwner();
+                const shared = try SegmentEntry.createShared(self.alloc, seg.data, seg.reader.encoded());
+                if (deletion.bitmap) |bitmap| {
+                    if (bitmap.isEmpty()) deletion.deinit() else {
+                        shared.deleted = bitmap;
+                        shared.deleted_count.store(@intCast(bitmap.cardinality()), .release);
+                        deletion.bitmap = null;
+                    }
                 }
+                shared.physical_parent = owner;
+                forks[forks_created] = .{ .position = position, .previous = seg.shared };
+                seg.shared = shared;
+                forks_created += 1;
             }
-            shared.physical_parent = parent;
-            seg.shared = shared;
-            forks[forks_created] = @intCast(position);
-            forks_created += 1;
+            std.mem.sort(Fork, forks[0..forks_created], {}, struct {
+                fn less(_: void, a: Fork, b: Fork) bool {
+                    return a.position < b.position;
+                }
+            }.less);
         }
 
         var cells_created: usize = 0;
@@ -5953,6 +6007,53 @@ test "replacement publishes kept tombstones with its segments" {
     const old_alpha = try before.search(alloc, "body", &.{"alpha"}, 10);
     defer alloc.free(old_alpha.hits);
     try std.testing.expectEqual(@as(usize, 2), old_alpha.hits.len);
+}
+
+// Each refresh forks a segment's tombstones over its one physical owner, never
+// over the previous fork, so released generations go; and retiring a forked
+// segment runs its cleanup once, when its physical data is last released.
+test "forked segment tombstones share one physical owner and retire once" {
+    const alloc = std.testing.allocator;
+    const Deleted = struct {
+        var count: usize = 0;
+        fn delete(_: *anyopaque, _: u64) void {
+            count += 1;
+        }
+    };
+    Deleted.count = 0;
+    const seg1 = try buildTestSegmentWithIds(alloc, &.{
+        .{ .id = "a", .terms = &.{.{ .term = "alpha", .freq = 1, .norm = 10 }} },
+        .{ .id = "b", .terms = &.{.{ .term = "alpha", .freq = 1, .norm = 10 }} },
+        .{ .id = "c", .terms = &.{.{ .term = "alpha", .freq = 1, .norm = 10 }} },
+    });
+    defer alloc.free(seg1);
+    var writer = try IndexWriter.init(alloc);
+    defer writer.deinit();
+    var token: u8 = 0;
+    writer.setRetiredSegmentCleanup(.{ .ptr = &token, .delete = Deleted.delete });
+    try writer.addSegment(seg1);
+    const physical = writer.snapshot().segments[0].shared;
+    const id = writer.snapshot().segments[0].id;
+
+    for (0..3) |round| {
+        const base = writer.acquireSnapshot();
+        defer base.release();
+        var dead = roaring.RoaringBitmap.init(alloc);
+        try dead.add(@intCast(round));
+        var kept = [_]KeptDeletion{.{ .id = id, .bitmap = dead }};
+        defer for (&kept) |*item| item.deinit();
+        var prepared = try writer.prepareSegmentsAgainst(base, alloc, &.{}, &.{}, &kept);
+        defer prepared.abort();
+        try std.testing.expect(prepared.publishIfCurrent());
+        const forked = &writer.snapshot().segments[0];
+        try std.testing.expect(forked.shared != physical);
+        try std.testing.expectEqual(physical, forked.physicalShared());
+        try std.testing.expectEqual(physical, forked.shared.physical_parent.?.shared);
+        try std.testing.expectEqual(@as(u32, 2), writer.snapshot().liveDocCount());
+    }
+    // Retire the forked segment; its file goes once, with its data.
+    try writer.removeSegments(&.{id});
+    try std.testing.expectEqual(@as(usize, 1), Deleted.count);
 }
 
 test "empty index search" {
