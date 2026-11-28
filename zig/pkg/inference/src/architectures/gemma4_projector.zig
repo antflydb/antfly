@@ -1465,6 +1465,14 @@ test "audio cache recipe shares exact execution key and original HF packed names
     const rows = try batch.rowsAndSegments(&measured);
     try std.testing.expectEqualSlices(usize, &segments, &measured);
     try std.testing.expectEqual(@as(usize, 33), rows);
+    const full_key = batch.key(&segments, 0, batch.blocks);
+    try std.testing.expect(!try batch.matchesGroupedWorkspace(full_key, &segments, rows, 0, batch.blocks));
+    var declared = batch;
+    declared.workspace = audio_schedule.WorkspaceDeclaration.init(&.{.{ .allocate = rows * batch.hidden * @sizeOf(f32) }}, 0);
+    try std.testing.expect(try declared.matchesGroupedWorkspace(full_key, &segments, rows, 0, batch.blocks));
+    try std.testing.expect(!try declared.matchesGroupedWorkspace(batch.key(&segments, 1, batch.blocks), &segments, rows, 1, batch.blocks));
+    try std.testing.expect(!try declared.matchesGroupedWorkspace(full_key, &segments, rows + 1, 0, batch.blocks));
+    try std.testing.expect(!try declared.matchesGroupedWorkspace(full_key, &.{ 17, 11, 5 }, rows, 0, batch.blocks));
     const grouping = try audio_schedule.GroupedRows.resolve(batch.frames[0..batch.count]);
     try std.testing.expectEqual(rows, grouping.total);
     try std.testing.expectEqualSlices(usize, &.{ 0, 11, 28 }, grouping.offsets[0..batch.count]);
@@ -4959,12 +4967,7 @@ fn tryAudioExecutionRange(cb: *const ComputeBackend, a: std.mem.Allocator, store
     const local_recipe = audioCacheConfig(cfg);
     const key = local_recipe.key(inputs.segments, start, end);
     const recipe = if (admitted_recipe) |candidate| recipe: {
-        if (candidate.workspace == null or candidate.key(inputs.segments, start, end) != key) break :recipe &local_recipe;
-        var admitted_segments: [audio_schedule.GroupedRows.max_clips]usize = undefined;
-        if (candidate.count > admitted_segments.len) break :recipe &local_recipe;
-        const spans = admitted_segments[0..candidate.count];
-        const rows = try candidate.rowsAndSegments(spans);
-        if (rows != inputs.valid_mask.len or !std.mem.eql(usize, spans, inputs.segments)) break :recipe &local_recipe;
+        if (!(try candidate.matchesGroupedWorkspace(key, inputs.segments, inputs.valid_mask.len, start, end))) break :recipe &local_recipe;
         break :recipe candidate;
     } else &local_recipe;
     var relative_keys: [audio_schedule.ExecutionInputs.scale_count]CT = undefined;

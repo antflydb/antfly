@@ -303,6 +303,16 @@ pub const AudioRecipe = struct {
         }
         return hash.final();
     }
+    /// Cache funding binds declarations for the full grouped encoder.
+    pub fn matchesGroupedWorkspace(self: AudioRecipe, dispatch_key: u64, segments: []const usize, row_count: usize, start: usize, end: usize) !bool {
+        if (self.workspace == null or start != 0 or end != self.blocks or self.count != segments.len or
+            !supportsCudaGroupedGraph(segments.len, self.context_right)) return false;
+        var admitted: [GroupedRows.max_clips]usize = undefined;
+        const spans = admitted[0..self.count];
+        return (try self.rowsAndSegments(spans)) == row_count and
+            std.mem.eql(usize, spans, segments) and self.key(spans, start, end) == dispatch_key;
+    }
+
     pub fn frontendKey(buffer: []u8, kind: []const u8, fft: usize, frame: usize, mel: usize) ![]const u8 {
         return std.fmt.bufPrint(buffer, "audio_tower.prepared.frontend.f32.v1.{s}.{d}.{d}.{d}", .{ kind, fft, frame, mel });
     }
