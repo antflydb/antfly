@@ -72,16 +72,16 @@ pub const ExecutionInputs = struct {
     pub const hidden = 0;
     pub const valid = 1;
     pub const segment_start = 2;
-    pub const scales = 3;
+    pub const segment_valid = 3;
+    pub const scales = segment_valid + 1;
     pub const scale_count = 12;
-    pub const segment_valid = scales + scale_count;
-    pub const relative = segment_valid + 1;
+    pub const relative = scales + scale_count;
     pub const count = relative + 1;
 
-    /// Both CUDA paths borrow prepared relative keys. Source BF16 uses
+    /// CUDA borrows immutable scales and relative keys. Source BF16 uses
     /// explicit clip spans, while packed F32 attention needs segment_valid.
     pub const source_bf16_count = segment_valid;
-    pub const full_f32_count = relative;
+    pub const full_f32_count = scales;
 
     pub const Metadata = struct {
         shape: []const i64,
@@ -109,13 +109,11 @@ pub const ExecutionInputs = struct {
         var inputs: [count]Metadata = undefined;
         inputs[hidden] = .{ .shape = &shapes[hidden], .elements = try std.math.mul(usize, rows, width) };
         inputs[relative] = .{ .shape = &shapes[relative], .elements = try std.math.mul(usize, context_left, width) };
-        for (valid..segment_valid) |slot| {
+        for (valid..relative) |slot| {
             const elements = if (slot < scales) rows else head_dim;
             shapes[slot][0] = @intCast(elements);
             inputs[slot] = .{ .shape = shapes[slot][0..1], .elements = elements };
         }
-        shapes[segment_valid][0] = row_dim;
-        inputs[segment_valid] = .{ .shape = shapes[segment_valid][0..1], .elements = rows };
         return inputs;
     }
 };

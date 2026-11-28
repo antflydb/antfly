@@ -1488,13 +1488,13 @@ test "audio cache recipe shares exact execution key and original HF packed names
         try std.testing.expectEqualSlices(i64, &.{33}, mask.shape);
         try std.testing.expectEqual(rows, mask.elements);
     }
-    for (metadata[Inputs.scales..Inputs.segment_valid]) |scale| {
+    for (metadata[Inputs.scales..Inputs.relative]) |scale| {
         try std.testing.expectEqualSlices(i64, &.{@intCast(batch.hidden / batch.heads)}, scale.shape);
         try std.testing.expectEqual(batch.hidden / batch.heads, scale.elements);
     }
     try std.testing.expectEqualSlices(i64, &.{33}, metadata[Inputs.segment_valid].shape);
     try std.testing.expectEqual(rows, metadata[Inputs.segment_valid].elements);
-    try std.testing.expectEqual(Inputs.scales + Inputs.scale_count, Inputs.source_bf16_count);
+    try std.testing.expectEqual(Inputs.segment_start + 1, Inputs.source_bf16_count);
     try std.testing.expectEqual(Inputs.segment_valid + 1, Inputs.full_f32_count);
     try std.testing.expectEqual(Inputs.full_f32_count, batch.cudaExecutionInputCount());
     for (0..12) |layer| for ([_][]const u8{ "q", "k", "v" }, 0..) |component, index| {
@@ -4625,6 +4625,7 @@ const AudioLayerInputs = struct {
     /// copies for the reference path and device tensors for the kernel.
     scales_host: [][]f32,
     scales: []CT,
+    scales_cached: bool = false,
 
     fn init(cb: *const ComputeBackend, allocator: std.mem.Allocator, cfg: AudioConfig, valid_mask: []const bool, per_dim_scales: []const []const f32) !AudioLayerInputs {
         return initInternal(cb, allocator, null, cfg, valid_mask, &.{}, per_dim_scales);
@@ -4667,6 +4668,7 @@ const AudioLayerInputs = struct {
             for (scales.items) |item| cb.free(item);
             scales.deinit(allocator);
         }
+        var scales_cached = cached;
         for (0..cfg.block_count) |layer| {
             const key = try audioCacheConfig(cfg).towerKey(&key_buf, .query_scale, layer);
             var hit = if (cached) try cb.modelConstant(key, null) else null;
@@ -4697,7 +4699,13 @@ const AudioLayerInputs = struct {
                     defer cb.free(raw);
                     break :source (try cb.tryBf16SourceOperation(&.{ .softplus = .{ .input = raw } })) orelse return error.SourceArithmeticUnavailable;
                 } else raw;
-                break :blk try publishAudioConstant(cb, key, source, cached);
+                errdefer cb.free(source);
+                if (cached) if (try cb.modelConstant(key, source)) |snapshot| {
+                    cb.free(source);
+                    break :blk snapshot;
+                };
+                scales_cached = false;
+                break :blk source;
             };
             hit = null;
             {
@@ -4729,6 +4737,7 @@ const AudioLayerInputs = struct {
             .ones = ones,
             .scales_host = scales_host_slice,
             .scales = scales_slice,
+            .scales_cached = scales_cached,
         };
     }
 
@@ -5258,8 +5267,10 @@ fn tryAudioExecutionRange(cb: *const ComputeBackend, a: std.mem.Allocator, store
             layer_inputs.valid_ct = values[audio_schedule.ExecutionInputs.valid];
             layer_inputs.segment_starts = if (self.inputs.segment_starts != null) values[audio_schedule.ExecutionInputs.segment_start] else null;
             var scales: [audio_schedule.ExecutionInputs.scale_count]CT = undefined;
-            @memcpy(&scales, values[Input.scales..Input.segment_valid]);
-            layer_inputs.scales = &scales;
+            if (self.relative_keys.len == 0) {
+                @memcpy(&scales, values[Input.scales..Input.relative]);
+                layer_inputs.scales = &scales;
+            }
             return runAudioLayers(self.cb, self.a, self.store, self.cfg, values[audio_schedule.ExecutionInputs.hidden], &layer_inputs, self.start, self.end);
         }
     };
@@ -5272,7 +5283,7 @@ fn tryAudioExecutionRange(cb: *const ComputeBackend, a: std.mem.Allocator, store
 fn audioExecutionEligible(cb: *const ComputeBackend, store: *const ProjectorWeights, cfg: AudioConfig, inputs: *const AudioLayerInputs) bool {
     switch (cb.kind()) {
         .cuda => if (!audio_schedule.supportsCudaGroupedGraph(inputs.segments.len, cfg.attention_context_right) or
-            inputs.segment_starts == null or (cfg.source_scalar_storage != .bf16 and inputs.segment_valid == null)) return false,
+            !inputs.scales_cached or inputs.segment_starts == null or (cfg.source_scalar_storage != .bf16 and inputs.segment_valid == null)) return false,
         .metal => {},
         else => return false,
     }
@@ -5287,7 +5298,7 @@ fn audioExecutionInputs(hidden: CT, inputs: *const AudioLayerInputs) [audio_sche
     values[audio_schedule.ExecutionInputs.valid] = inputs.valid_ct;
     values[audio_schedule.ExecutionInputs.segment_start] = inputs.segment_starts orelse inputs.valid_ct;
     values[audio_schedule.ExecutionInputs.segment_valid] = inputs.segment_valid orelse inputs.valid_ct;
-    @memcpy(values[audio_schedule.ExecutionInputs.scales..audio_schedule.ExecutionInputs.segment_valid], inputs.scales);
+    @memcpy(values[audio_schedule.ExecutionInputs.scales..audio_schedule.ExecutionInputs.relative], inputs.scales);
     return values;
 }
 fn audioLayer(

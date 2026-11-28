@@ -3128,6 +3128,14 @@ checks passed without skips, including Metal segmented execution and
 cancellation. This qualification measured workspace size and exact
 outputs. The HTTP latency tables above cover the earlier revisions.
 
+Both CUDA precisions now borrow the twelve immutable query scales from
+the model cache. Replay stages three inputs for BF16 and four for F32.
+A missing cached scale selects eager execution. The same released-model
+Spark matrix passed all twelve cases with exact eager parity after
+changing samples, and both precisions used 6,144 fewer arena bytes at
+each width. The recipe, allocation cleanup and Metal segmented execution
+checks passed locally.
+
 ### Isolated Metal E4B HTTP comparison at `58b3917a89`
 
 The local M4 Max used the same pinned binaries as the mixed serving
