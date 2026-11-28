@@ -83,6 +83,13 @@ def graph_first_replays(text):
     return [int(rows) for rows, *_ in replays], banks
 
 
+def retirement_capacity_retries(text):
+    return [
+        int(count)
+        for count in re.findall(r"LIGHTONOCR3 retirement_capacity_retries=(\d+)", text)
+    ]
+
+
 def graph_retirements(text):
     return [
         dict(
@@ -656,6 +663,8 @@ def run(args, model, label, mode, concurrency, output):
         "exit_code": process.returncode,
         "status": "timeout" if timed_out else "failed",
     }
+    if retries := retirement_capacity_retries(text):
+        result["retirement_capacity_retries"] = retries
     if (
         process.returncode == 0
         and match

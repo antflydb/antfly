@@ -23,6 +23,7 @@ from benchmark_concurrency import (
     graph_funding_denials,
     graph_retirements,
     recurrent_placement_observation,
+    retirement_capacity_retries,
 )
 
 
@@ -80,6 +81,16 @@ class GraphReplayTests(unittest.TestCase):
 
 
 class GraphRetirementTests(unittest.TestCase):
+    def test_capacity_reports_preserve_zero_and_distinguish_missing_data(self):
+        self.assertEqual(retirement_capacity_retries("legacy benchmark"), [])
+        self.assertEqual(
+            retirement_capacity_retries(
+                "LIGHTONOCR3 retirement_capacity_retries=0\n"
+                "LIGHTONOCR3 retirement_capacity_retries=23\n"
+            ),
+            [0, 23],
+        )
+
     def test_records_progress_and_ignores_reset_messages(self):
         text = (
             "LIGHTONOCR3 cuda_model_graph_reset phase=disabled rows=64\n"
