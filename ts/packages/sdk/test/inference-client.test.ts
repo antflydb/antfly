@@ -10,6 +10,36 @@ import {
 } from "../src/index.js";
 
 describe("InferenceClient", () => {
+  it("serializes a text-only Memorilla hybrid request", async () => {
+    const fetch = vi.spyOn(globalThis, "fetch").mockImplementation(async (request) => {
+      expect(await (request as Request).json()).toEqual({
+        model: "hybrid",
+        question: "Who holds the key?",
+        encoder_execution_identity: "a".repeat(64),
+        document_texts: ["The key holder is Jo."],
+        read_mode: "auto",
+        include_diagnostics: true,
+      });
+      return new Response("{}", { headers: { "Content-Type": "application/json" } });
+    });
+    try {
+      const client = new InferenceClient({ baseUrl: "http://localhost:8080" });
+      await client.getRawClient().POST("/ai/v1/memorilla/generate", {
+        body: {
+          model: "hybrid",
+          question: "Who holds the key?",
+          encoder_execution_identity: "a".repeat(64),
+          document_texts: ["The key holder is Jo."],
+          read_mode: "auto",
+          include_diagnostics: true,
+        },
+      });
+      expect(fetch).toHaveBeenCalledOnce();
+    } finally {
+      fetch.mockRestore();
+    }
+  });
+
   it("should create a client with base config", () => {
     const client = new InferenceClient({
       baseUrl: "http://localhost:8080",

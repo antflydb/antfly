@@ -48,7 +48,7 @@ import re
 import sys
 import threading
 import time
-from collections import Counter
+from collections import Counter, OrderedDict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.error import HTTPError, URLError
@@ -61,6 +61,7 @@ ASCII_WHITESPACE = " \t\n\r\x0b\x0c"
 MAX_DOCUMENTS = 64
 MAX_TEXT_BYTES = 8192
 MAX_TOTAL_BYTES = 32768
+VECTOR_CACHE_BYTES = 32 * 1024 * 1024
 # memorilla_span.default_read_documents (the narrow read).
 NARROW_DOCUMENTS = 2
 READ_MODES = ("auto", "narrow", "wide", "none", "default")
@@ -135,7 +136,13 @@ def _split_unit(
         else:
             piece = i
             while piece < j:
-                stop = min(j, piece + max_tokens - 1)
+                stop = min(j, piece + max_tokens)
+                while count(text[piece:stop]) > max_tokens:
+                    if stop - piece == 1:
+                        raise ValueError(
+                            "a single character exceeds the passage token budget"
+                        )
+                    stop = piece + (stop - piece) // 2
                 words.append((piece, stop))
                 piece = stop
         i = j
@@ -313,7 +320,10 @@ class Playground:
         self.args = args
         self.zig = Zig(args.zig_url, args.timeout_ms)
         self.count = TokenCounter(args.tokenizer)
-        self.vectors: dict[tuple[str, str], list[float]] = {}
+        self.vectors: OrderedDict[tuple[str, str], tuple[list[float], int]] = (
+            OrderedDict()
+        )
+        self.vector_cache_bytes = 0
         self.identity: str | None = args.encoder_identity
         self.lock = threading.Lock()
         self.samples = json.loads((HERE / "samples.json").read_text())
@@ -321,7 +331,15 @@ class Playground:
 
     # Embeddings: the stock encoder through the server's embedding route.
     def embed(self, texts: list[str], task: str) -> list[list[float]]:
-        missing = [t for t in dict.fromkeys(texts) if (task, t) not in self.vectors]
+        resolved: dict[str, list[float]] = {}
+        missing = []
+        for text in dict.fromkeys(texts):
+            key = (task, text)
+            if key in self.vectors:
+                resolved[text] = self.vectors[key][0]
+                self.vectors.move_to_end(key)
+            else:
+                missing.append(text)
         for start in range(0, len(missing), 32):
             batch = missing[start : start + 32]
             payload, _ = self.zig.post(
@@ -334,11 +352,32 @@ class Playground:
             if len(rows) != len(batch):
                 raise RuntimeError("embedding route returned the wrong number of rows")
             identity = payload.get("model_identity")
-            if identity:
+            if identity and identity != self.identity:
+                self.vectors.clear()
+                self.vector_cache_bytes = 0
                 self.identity = identity
+                if resolved:
+                    raise RuntimeError(
+                        "embedding model changed while ranking; retry the request"
+                    )
             for text, row in zip(batch, rows):
-                self.vectors[(task, text)] = row
-        return [self.vectors[(task, t)] for t in texts]
+                resolved[text] = row
+                key = (task, text)
+                # Include owned Python objects and an allowance for the LRU node.
+                size = (
+                    sys.getsizeof(key)
+                    + sys.getsizeof(text)
+                    + sys.getsizeof(row)
+                    + sum(map(sys.getsizeof, row))
+                    + 128
+                )
+                if size <= VECTOR_CACHE_BYTES:
+                    self.vectors[key] = (row, size)
+                    self.vector_cache_bytes += size
+                    while self.vector_cache_bytes > VECTOR_CACHE_BYTES:
+                        _, (_, evicted_size) = self.vectors.popitem(last=False)
+                        self.vector_cache_bytes -= evicted_size
+        return [resolved[text] for text in texts]
 
     def encoder_identity(self) -> str:
         if not self.identity:

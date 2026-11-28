@@ -450,6 +450,21 @@ pub fn recordText(a: A, tokenizer: tok.Tokenizer, ids: []const i32) ![]u8 {
 
 const Range = struct { start: usize, end: usize };
 
+fn appendPooledTexts(a: A, tokenizer: tok.Tokenizer, texts: *std.ArrayListUnmanaged([]const u8), document: []const u8, limits: platform.resource_policy.InferenceRequestLimits) !void {
+    const count = try tokenCount(a, tokenizer, document);
+    if (count <= qualified.max_text_tokens) {
+        try common.validateInputTokenLimit(limits, count);
+        return texts.append(a, document);
+    }
+    const chunks = try chunkDocument(a, tokenizer, document, chunk_max_tokens);
+    defer a.free(chunks);
+    for (chunks) |chunk| {
+        const text = document[chunk.start..chunk.end];
+        try common.validateInputTokenLimit(limits, try tokenCount(a, tokenizer, text));
+        try texts.append(a, text);
+    }
+}
+
 fn tokenCount(a: A, tokenizer: tok.Tokenizer, text: []const u8) !usize {
     const ids = try tokenizer.encode(a, text);
     defer a.free(ids);
@@ -595,7 +610,7 @@ const Preflight = struct {
     }
 };
 
-fn preflightEncoder(a: A, io: std.Io, manager: *manager_mod.ModelManager, selected: selection.ResolvedModel, canonical: []const u8, documents: []const []const u8, control: Control) !Preflight {
+fn preflightEncoder(a: A, io: std.Io, manager: *manager_mod.ModelManager, selected: selection.ResolvedModel, canonical: []const u8, documents: []const []const u8, request_limits: platform.resource_policy.InferenceRequestLimits, control: Control) !Preflight {
     try control.check();
     var assets = try common.acquireGenerationAssets(a, io, manager, selected, encoder_profile, control);
     defer assets.deinit();
@@ -622,13 +637,7 @@ fn preflightEncoder(a: A, io: std.Io, manager: *manager_mod.ModelManager, select
     errdefer soft.deinit(a);
     for (documents) |document| {
         try control.check();
-        if (try tokenCount(a, tokenizer, document) <= qualified.max_text_tokens) {
-            try soft.append(a, document);
-            continue;
-        }
-        const chunks = try chunkDocument(a, tokenizer, document, chunk_max_tokens);
-        defer a.free(chunks);
-        for (chunks) |chunk| try soft.append(a, document[chunk.start..chunk.end]);
+        try appendPooledTexts(a, tokenizer, &soft, document, request_limits);
     }
     if (soft.items.len == 0) return error.EmptyMemorillaCollection;
     if (soft.items.len > qualified.max_documents) return error.MemorillaCollectionBudgetExceeded;
@@ -694,7 +703,7 @@ fn generateImpl(a: A, io: std.Io, manager: *manager_mod.ModelManager, profile: P
     const merged_prompt = try mergedSystemPrompt(backing, exact_prompt);
     defer backing.free(merged_prompt);
 
-    var preflight = try preflightEncoder(backing, io, manager, paths.encoder, canonical, documents, encoder_control);
+    var preflight = try preflightEncoder(backing, io, manager, paths.encoder, canonical, documents, options.request_limits, encoder_control);
     defer preflight.deinit();
     try common.validateInputTokenLimit(options.request_limits, preflight.question_tokens);
 
@@ -1127,7 +1136,7 @@ fn prepareRead(a: A, tokenizer: tok.Tokenizer, documents: []const []const u8, ca
 /// the larger. `pool_documents`: the soft half pools `documents` (no stored
 /// chunk vectors). `reads`: false prepares no span read at all (the
 /// soft-only request), only the question and the pooled texts.
-fn preflightSpan(a: A, io: std.Io, manager: *manager_mod.ModelManager, selected: selection.ResolvedModel, canonical: []const u8, documents: []const []const u8, protocol: *const span_window.Protocol, mode: ?span_window.ReadMode, pool_documents: bool, reads: bool, control: Control) !SpanPreflight {
+fn preflightSpan(a: A, io: std.Io, manager: *manager_mod.ModelManager, selected: selection.ResolvedModel, canonical: []const u8, documents: []const []const u8, protocol: *const span_window.Protocol, mode: ?span_window.ReadMode, pool_documents: bool, reads: bool, request_limits: platform.resource_policy.InferenceRequestLimits, control: Control) !SpanPreflight {
     try control.check();
     var assets = try common.acquireGenerationAssets(a, io, manager, selected, encoder_profile, control);
     defer assets.deinit();
@@ -1154,13 +1163,7 @@ fn preflightSpan(a: A, io: std.Io, manager: *manager_mod.ModelManager, selected:
     if (pool_documents) {
         for (documents) |document| {
             try control.check();
-            if (try tokenCount(a, tokenizer, document) <= qualified.max_text_tokens) {
-                try soft.append(a, document);
-                continue;
-            }
-            const chunks = try chunkDocument(a, tokenizer, document, chunk_max_tokens);
-            defer a.free(chunks);
-            for (chunks) |chunk| try soft.append(a, document[chunk.start..chunk.end]);
+            try appendPooledTexts(a, tokenizer, &soft, document, request_limits);
         }
         if (soft.items.len == 0) return error.EmptyMemorillaCollection;
         if (soft.items.len > qualified.max_documents) return error.MemorillaCollectionBudgetExceeded;
@@ -1331,7 +1334,7 @@ fn generateSpanImpl(a: A, io: std.Io, manager: *manager_mod.ModelManager, profil
     defer if (bench_user) |text| backing.free(text);
     const user_text: []const u8 = if (bench_user) |text| pythonStrip(text) else canonical;
 
-    var preflight = try preflightSpan(backing, io, manager, paths.encoder, canonical, documents, &protocol, mode, !(cascade and options.stored_documents != null), true, encoder_control);
+    var preflight = try preflightSpan(backing, io, manager, paths.encoder, canonical, documents, &protocol, mode, !(cascade and options.stored_documents != null), true, options.request_limits, encoder_control);
     defer preflight.deinit();
     try common.validateInputTokenLimit(options.request_limits, preflight.question_tokens);
     // Admitted for the widest read the request can take (worst case wide);
@@ -1796,7 +1799,7 @@ fn generateSoftOnlyImpl(a: A, io: std.Io, manager: *manager_mod.ModelManager, pr
     defer if (bench_user) |text| backing.free(text);
     const user_text: []const u8 = if (bench_user) |text| pythonStrip(text) else canonical;
 
-    var preflight = try preflightSpan(backing, io, manager, paths.encoder, canonical, documents, &protocol, null, true, false, encoder_control);
+    var preflight = try preflightSpan(backing, io, manager, paths.encoder, canonical, documents, &protocol, null, true, false, options.request_limits, encoder_control);
     defer preflight.deinit();
     try common.validateInputTokenLimit(options.request_limits, preflight.question_tokens);
 
@@ -2301,6 +2304,24 @@ const WordCountTokenizer = struct {
     }
     fn deinit(_: *anyopaque) void {}
 };
+
+test "Memorilla hybrid pooled passages respect the operator input token limit" {
+    const a = std.testing.allocator;
+    const tokenizer = WordCountTokenizer.handle();
+    const limits: platform.resource_policy.InferenceRequestLimits = .{ .max_input_tokens_per_item = 3 };
+    try common.validateInputTokenLimit(limits, try tokenCount(a, tokenizer, "Question?"));
+    var texts: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer texts.deinit(a);
+    try appendPooledTexts(a, tokenizer, &texts, "Two words", limits);
+    try std.testing.expectError(error.InferenceInputTokensExceeded, appendPooledTexts(a, tokenizer, &texts, "Three distinct words", limits));
+    try std.testing.expectEqual(@as(usize, 1), texts.items.len);
+
+    const word = "word ";
+    var oversized: [word.len * qualified.max_text_tokens]u8 = undefined;
+    for (0..qualified.max_text_tokens) |i| @memcpy(oversized[i * word.len ..][0..word.len], word);
+    try std.testing.expectError(error.InferenceInputTokensExceeded, appendPooledTexts(a, tokenizer, &texts, &oversized, limits));
+    try std.testing.expectEqual(@as(usize, 1), texts.items.len);
+}
 
 test "Memorilla hybrid chunker packs sentences greedily within the token bound" {
     const a = std.testing.allocator;

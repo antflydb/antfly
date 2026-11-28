@@ -773,8 +773,7 @@ fn run(a: A, decoder: Decoder, cb: *const CB, prompt: Prompt, request: Request, 
                     break;
                 }
                 try state.truncateTokens(fed_count - 1 - accepted);
-                a.free(logits);
-                logits = try a.dupe(f32, rows[accepted * vocab ..][0..vocab]);
+                try replaceSpeculativeLogits(a, &logits, rows[accepted * vocab ..][0..vocab]);
                 continue;
             }
         }
@@ -795,6 +794,21 @@ fn run(a: A, decoder: Decoder, cb: *const CB, prompt: Prompt, request: Request, 
     errdefer a.free(ids);
     try control.check();
     return .{ .text = output, .token_ids = ids, .prompt_tokens = input_ids.len, .tokens_used = ids.len, .finish_reason = reason, .allocator = a };
+}
+
+fn replaceSpeculativeLogits(a: A, logits: *[]f32, row: []const f32) !void {
+    const replacement = try a.dupe(f32, row);
+    a.free(logits.*);
+    logits.* = replacement;
+}
+
+test "memorilla speculative logits retain the old allocation on replacement failure" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
+    const a = failing.allocator();
+    var logits = try a.dupe(f32, &.{ 1, 2 });
+    defer a.free(logits);
+    try std.testing.expectError(error.OutOfMemory, replaceSpeculativeLogits(a, &logits, &.{ 3, 4 }));
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2 }, logits);
 }
 
 test "memorilla generation resource reservations reject overflow and unwind" {

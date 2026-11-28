@@ -16,6 +16,7 @@
 """CPU tests of the playground's passage splitter, read plan and highlights."""
 
 import sys
+from collections import OrderedDict
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -54,6 +55,41 @@ def test_split_passages_keeps_decimal_points_and_codes_inside_sentences():
         "The ramp has a 7.5 tonne limit.",
         "Code Hq4-007315 opens it.",
     ]
+
+
+def test_split_passages_bounds_multitoken_unicode_without_losing_text():
+    text = "𐍈" * 70
+
+    def count(fragment):
+        return len(fragment) * 2
+
+    parts = [text[a:b] for a, b in server.split_passages(text, count, 64)]
+    assert "".join(parts) == text
+    assert all(count(part) <= 64 for part in parts)
+
+
+def test_embedding_cache_evicts_by_bytes_and_preserves_inflight_results(monkeypatch):
+    requests = []
+
+    def post(_route, body):
+        batch = body["input"]
+        requests.append(batch)
+        return {
+            "embeddings": [[float(len(text))] for text in batch],
+            "model_identity": "v1",
+        }, 0
+
+    playground = server.Playground.__new__(server.Playground)
+    playground.args = SimpleNamespace(embed_model="encoder")
+    playground.zig = SimpleNamespace(post=post)
+    playground.vectors = OrderedDict()
+    playground.vector_cache_bytes = 0
+    playground.identity = None
+    monkeypatch.setattr(server, "VECTOR_CACHE_BYTES", 400)
+    assert playground.embed(["a", "bb", "a"], "test") == [[1.0], [2.0], [1.0]]
+    assert playground.embed(["bb", "a"], "test") == [[2.0], [1.0]]
+    assert requests == [["a", "bb"], ["a"]]
+    assert playground.vector_cache_bytes <= 400
 
 
 def test_wide_read_takes_leading_documents_within_the_budget():

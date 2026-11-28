@@ -3341,6 +3341,8 @@ pub const LoadedModel = struct {
     embedding_prototype_cache: ?*@import("../extractors/embedding_prototypes.zig").Cache = null,
     embedding_prototype_cache_lease: ?runtime.tier.memory.AdmissionLease = null,
     embedding_prototype_cache_mutex: std.atomic.Mutex = .unlocked,
+    memorilla_pooled_cache: ?*@import("../pipelines/memorilla_encoder.zig").PooledCache = null,
+    memorilla_pooled_cache_lease: ?runtime.tier.memory.AdmissionLease = null,
     memorilla_reader_cache: @import("memorilla_reader_cache.zig").Cache = .{},
     /// Research (encoder-LoRA) reader for the same decoder; the two caches
     /// are independent so a research profile never evicts the released reader.
@@ -3544,6 +3546,33 @@ pub const LoadedModel = struct {
         }
         self.embedding_prototype_cache = cache;
         self.embedding_prototype_cache_lease = lease;
+        return cache;
+    }
+
+    pub fn getMemorillaPooledCache(self: *LoadedModel, limits: runtime.tier.memory.Limits, control: InferenceExecutionControl) !*@import("../pipelines/memorilla_encoder.zig").PooledCache {
+        const Cache = @import("../pipelines/memorilla_encoder.zig").PooledCache;
+        try control.lock(&self.embedding_prototype_cache_mutex);
+        const existing = self.memorilla_pooled_cache;
+        self.embedding_prototype_cache_mutex.unlock();
+        if (existing) |cache| return cache;
+        // This optional cache should never evict another model to get space.
+        const model_manager = self.model_manager;
+        var lease = try model_manager.admissionController().tryAcquire(.cpu, model_manager.physicalRunLimits(.cpu, limits), .{ .host_weight_bytes = @sizeOf(Cache) }, true);
+        errdefer lease.release();
+        const cache = try self.allocator.create(Cache);
+        errdefer self.allocator.destroy(cache);
+        cache.key = null;
+        cache.question_tokens = 0;
+        try control.lock(&self.embedding_prototype_cache_mutex);
+        if (self.memorilla_pooled_cache) |published| {
+            self.embedding_prototype_cache_mutex.unlock();
+            self.allocator.destroy(cache);
+            lease.release();
+            return published;
+        }
+        self.memorilla_pooled_cache = cache;
+        self.memorilla_pooled_cache_lease = lease;
+        self.embedding_prototype_cache_mutex.unlock();
         return cache;
     }
 
@@ -4217,6 +4246,8 @@ pub const LoadedModel = struct {
         std.debug.assert(self.native_reader_stream.context == null and self.native_reader_stream.users == 0);
         if (self.embedding_prototype_cache) |cache| self.allocator.destroy(cache);
         if (self.embedding_prototype_cache_lease) |*lease| lease.release();
+        if (self.memorilla_pooled_cache) |cache| self.allocator.destroy(cache);
+        if (self.memorilla_pooled_cache_lease) |*lease| lease.release();
         if (self.projector_store) |store| {
             store.close();
             self.projector_store = null;

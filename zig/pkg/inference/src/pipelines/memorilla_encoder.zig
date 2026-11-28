@@ -198,6 +198,37 @@ const TokenBudget = struct {
     }
 };
 
+/// Retains raw, unprefixed pooled vectors for the most recent encoder batch.
+/// The model's embedding execution lane protects the entry. Including the
+/// ordered inputs preserves the padded GEMM geometry of the qualified recipe.
+pub const PooledCache = struct {
+    key: ?[32]u8 = null,
+    question_tokens: usize = 0,
+    rows: [qualified.max_documents + 1][width]f32 = undefined,
+
+    fn batchKey(identity: [64]u8, documents: []const []const u8, question: []const u8, trim_padding: bool) [32]u8 {
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update(&identity);
+        hash.update(&.{@intFromBool(trim_padding)});
+        for (documents) |text| {
+            hash.update(std.mem.asBytes(&text.len));
+            hash.update(text);
+        }
+        hash.update(std.mem.asBytes(&question.len));
+        hash.update(question);
+        return hash.finalResult();
+    }
+};
+
+test "memorilla pooled cache keys raw text order encoder identity and geometry" {
+    const identity: [64]u8 = @splat('a');
+    const key = PooledCache.batchKey(identity, &.{ "first", "second" }, "q", false);
+    try std.testing.expectEqual(key, PooledCache.batchKey(identity, &.{ "first", "second" }, "q", false));
+    try std.testing.expect(!std.mem.eql(u8, &key, &PooledCache.batchKey(identity, &.{ "second", "first" }, "q", false)));
+    try std.testing.expect(!std.mem.eql(u8, &key, &PooledCache.batchKey(@splat('b'), &.{ "first", "second" }, "q", false)));
+    try std.testing.expect(!std.mem.eql(u8, &key, &PooledCache.batchKey(identity, &.{ "first", "second" }, "q", true)));
+}
+
 /// The caller retains its handle and authorization closure. This call adds an
 /// independent lifetime pin and keeps the complete output admitted until deinit.
 pub fn encode(a: A, handle: *const manager.ModelHandle, documents: []const []const u8, question: []const u8, limits: memory.Limits, control: Control) !Features {
@@ -243,6 +274,10 @@ fn encodeImpl(a: A, handle: *const manager.ModelHandle, documents: []const []con
     };
     try model.verifyEmbeddingIdentityWithControl(control);
     const identity = model.embedding_identity orelse return error.InvalidEmbeddingIdentity;
+    const cache = if (question_only) null else model.getMemorillaPooledCache(limits, control) catch |err| switch (err) {
+        error.OutOfMemory, error.ResourceLimitExceeded, error.ResourceTemporarilyUnavailable => null,
+        else => return err,
+    };
     pipeline.execution_control = control;
     pipeline.execution_lane = &model.embedding_execution_lane;
     const lane = try model.embedding_execution_lane.acquire(control);
@@ -258,21 +293,27 @@ fn encodeImpl(a: A, handle: *const manager.ModelHandle, documents: []const []con
     // text instead of the 256-token limit. Causal attention and last-token
     // pooling leave active rows unaffected; GEMM row counts change.
     if (qualified.researchFastPrefill()) pipeline.config.trim_padding_to_batch_max = true;
+    const cache_key = if (cache != null) PooledCache.batchKey(identity, documents, canonical, pipeline.config.trim_padding_to_batch_max) else null;
+    const hit = if (cache) |entry| if (entry.key) |key| std.mem.eql(u8, &key, &cache_key.?) else false else false;
     var budget = TokenBudget{ .question_text = canonical };
-    pipeline.tokenization_observer = .{ .ptr = &budget, .observe = TokenBudget.observe };
-    const texts = try backing.alloc([]const u8, documents.len + 1);
-    defer backing.free(texts);
-    @memcpy(texts[0..documents.len], documents);
-    texts[documents.len] = canonical;
-    const vectors = try pipeline.embed(texts);
-    defer {
+    const computed = if (hit) vectors: {
+        budget.question_tokens = cache.?.question_tokens;
+        break :vectors null;
+    } else vectors: {
+        pipeline.tokenization_observer = .{ .ptr = &budget, .observe = TokenBudget.observe };
+        var texts: [qualified.max_documents + 1][]const u8 = undefined;
+        @memcpy(texts[0..documents.len], documents);
+        texts[documents.len] = canonical;
+        break :vectors try pipeline.embed(texts[0 .. documents.len + 1]);
+    };
+    defer if (computed) |vectors| {
         for (vectors) |vector| backing.free(vector);
         backing.free(vectors);
-    }
+    };
     try control.check();
     try model.verifyEmbeddingIdentityWithControl(control);
     try factory.requireMemorillaProfile(model.session, v1_profile);
-    if (vectors.len != texts.len) return error.InvalidMemorillaFeatureWidth;
+    if (computed) |vectors| if (vectors.len != documents.len + 1) return error.InvalidMemorillaFeatureWidth;
     if (budget.question_tokens == 0) return error.InvalidMemorillaTokens;
     const documents_fp16 = try backing.alloc(f16, documents.len * width);
     errdefer backing.free(documents_fp16);
@@ -286,14 +327,20 @@ fn encodeImpl(a: A, handle: *const manager.ModelHandle, documents: []const []con
     errdefer backing.free(question_text);
     const document_sha256 = try backing.alloc([32]u8, documents.len);
     errdefer backing.free(document_sha256);
-    for (documents, vectors[0..documents.len], 0..) |text, vector, i| {
+    for (documents, 0..) |text, i| {
         try control.check();
+        const vector = if (computed) |rows| rows[i] else &cache.?.rows[i];
         try copyFeature(vector, documents_fp16[i * width ..][0..width], document_features[i * width ..][0..width]);
         std.crypto.hash.sha2.Sha256.hash(text, &document_sha256[i], .{});
     }
-    try copyFeature(vectors[documents.len], question_fp16, question_features);
+    try copyFeature(if (computed) |rows| rows[documents.len] else &cache.?.rows[documents.len], question_fp16, question_features);
     const recipe_hash = try recipeSha256(v1_profile);
     try control.check();
+    if (cache) |entry| if (computed) |vectors| {
+        for (vectors, entry.rows[0..vectors.len]) |row, *cached| @memcpy(cached, row);
+        entry.question_tokens = budget.question_tokens;
+        entry.key = cache_key.?;
+    };
     owns_lease = false;
     return .{ .allocator = backing, .document_count = documents.len, .question_tokens = budget.question_tokens, .documents_fp16 = documents_fp16, .question_fp16 = question_fp16, .documents = document_features, .question = question_features, .question_text = question_text, .document_sha256 = document_sha256, .producer = .{ .profile = v1_profile, .publication = publication, .identity = identity, .source_lock_sha256 = v1SourceLockSha256(), .recipe_sha256 = recipe_hash }, .lease = lease };
 }

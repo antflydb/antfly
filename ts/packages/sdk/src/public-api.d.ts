@@ -5287,6 +5287,27 @@ export interface paths {
          *     Responses identify the final answer path and account
          *     for all internal generation and verification calls. A model support
          *     judgment is not a formal proof, and text/vector pairing is caller-supplied.
+         *
+         *     Profiles configured with reader_kind=encoder_lora_research serve the
+         *     experimental encoder-LoRA copy candidate. They take document_texts in
+         *     latent mode, encode them server-side with the merged research encoder,
+         *     reject document_embeddings (400) and source_verified (409), require the
+         *     fixed research encoder identity, and report context_source
+         *     supplied_documents with candidate_sha256. An answer-format guard
+         *     replaces decoder text that is not a short fact (a few words of
+         *     letters, digits, hyphen, period and apostrophe, or the literal
+         *     UNKNOWN) with UNKNOWN and finish_reason abstained, reported in
+         *     answer_guard. Every span copied into the memory record is returned in
+         *     citations with its document_index and UTF-8 byte range [start, end)
+         *     in that document_texts entry. This path is not qualified.
+         *
+         *     Profiles configured with reader_kind=hybrid_research also take
+         *     read_mode (auto, narrow or wide on a bundle with a span read cascade;
+         *     none on any span bundle answers from the soft rows alone, i.e. stock
+         *     Memorilla over the same pooled vectors) and include_diagnostics, which
+         *     adds a diagnostics object (cascade margins and decision, gate, span and
+         *     window as document byte ranges, the raw answer and stage timings).
+         *     Other profile kinds reject both fields with 400.
          */
         post: operations["generateMemorilla"];
         delete?: never;
@@ -31279,14 +31300,20 @@ export interface components {
          *     supported answer; otherwise the source answer or abstention is returned.
          *     This explicit mode does not establish
          *     source truth, authorization, or text/vector association cryptographically.
+         *     Profiles configured with reader_kind=encoder_lora_research or
+         *     hybrid_research instead take document_texts in latent mode and encode
+         *     them server-side (the hybrid computes the pooled document and question
+         *     vectors itself as well); they reject document_embeddings and
+         *     source_verified.
          */
         MemorillaGenerateRequest: {
             /** @description Name from inference.memorilla.profiles. Requests cannot override the bound model assets or memory module. */
             model: string;
             /** @description A nonempty question admitted to the configured encoder's 256-token limit after canonical whitespace normalization. */
             question: string;
-            document_embeddings: number[][];
-            /** @description Exact model_identity returned by the qualified encoder. Ordinary mixed-precision encoder identities are incompatible. */
+            /** @description Required for released profiles (reader_kind=released), which read stored features; omitted and rejected for encoder_lora_research profiles, which encode document_texts themselves. Values must be numeric tokens. */
+            document_embeddings?: number[][];
+            /** @description Exact model_identity returned by the configured encoder. For released profiles this is the qualified encoder identity; for encoder_lora_research profiles it is the fixed research encoder identity; for hybrid_research profiles it is the qualified (stock) encoder identity, because both passes run on the stock encoder. Ordinary mixed-precision encoder identities are incompatible. */
             encoder_execution_identity: string;
             /**
              * @description Maximum tokens for each answer candidate, including an optional source repair. Source-verified mode generates a memory candidate and an independent source answer, with at most one source repair and two verifier calls of eight tokens each; usage reports all phases. Every phase also respects profile and operator ceilings.
@@ -31299,8 +31326,66 @@ export interface components {
              * @enum {string}
              */
             context_mode?: "latent" | "source_verified";
-            /** @description Required only for source_verified and rejected in latent mode. One nonblank UTF-8 source text per embedding row, in the same order; at most 8192 bytes each and 32768 source bytes total. The complete rendered prompt must fit the 1024-token internal bound and operator limits, without truncation. Pairing is asserted by the caller, not recomputed or authenticated. */
+            /**
+             * @description Released profiles: required only for source_verified and rejected in
+             *     latent mode. One nonblank UTF-8 source text per embedding row, in the
+             *     same order; at most 8192 bytes each and 32768 source bytes total. The
+             *     complete rendered prompt must fit the 1024-token internal bound and
+             *     operator limits, without truncation. Pairing is asserted by the
+             *     caller, not recomputed or authenticated.
+             *     encoder_lora_research profiles: required in latent mode (1 to 64
+             *     texts, same per-text and total byte limits); the server encodes
+             *     each text with the merged research encoder.
+             *     hybrid_research profiles: the same rules; the server pools each
+             *     text with the stock encoder (texts over its 256-token pooled limit
+             *     are split into sentence-greedy chunks of at most 128 tokens, one
+             *     soft-memory vector each, at most 64 vectors) and encodes the
+             *     per-token record batch with the run-time encoder LoRA (padded
+             *     batch rows of at most 1024 tokens). With a span read cascade the
+             *     texts are the ranked candidate list, best first: the soft half
+             *     pools every text and the span reads take leading texts.
+             */
             document_texts?: string[];
+            /**
+             * @description hybrid_research profiles only (400 for other kinds). Absent keeps
+             *     the bundle's default read (auto on a bundle with a span read
+             *     cascade; every text on a span bundle without one). auto, narrow
+             *     and wide need a bundle with a span read cascade (400 otherwise):
+             *     narrow reads the top two texts with a 32-token window; wide reads
+             *     texts in order while their encoder tokens stay within the
+             *     cascade's budget, with its wider window; auto reads narrow and
+             *     reads wide when the narrow margin is below the cascade threshold,
+             *     reusing the narrow pass's work. none needs a span bundle and skips
+             *     the span pass: the decoder reads the 16 soft rows alone under the
+             *     released helpful prompt, the closed-gate path, i.e. stock
+             *     Memorilla over the same pooled vectors (record_gate closed,
+             *     memory_tokens 16, no citations).
+             * @enum {string}
+             */
+            read_mode?: "auto" | "narrow" | "wide" | "none";
+            /**
+             * @description hybrid_research profiles only (true is 400 for other kinds). Adds the diagnostics object to the response; the answer and every other field are unchanged.
+             * @default false
+             */
+            include_diagnostics?: boolean;
+        };
+        /** @description A region of one caller document that the copy head copied into the memory record (encoder_lora_research profiles). */
+        MemorillaCitation: {
+            /** @description Index into the request's document_texts. */
+            document_index: number;
+            /** @description Inclusive UTF-8 byte offset into document_texts[document_index]. Offsets count bytes of the UTF-8 encoding, not characters or UTF-16 code units, and always fall on character boundaries. */
+            start: number;
+            /** @description Exclusive UTF-8 byte offset into document_texts[document_index]; end > start. */
+            end: number;
+            /** @description Exactly the bytes document_texts[document_index][start:end]. The region covers the copied tokens widened to whole characters, with surrounding whitespace trimmed. */
+            text: string;
+            /** @description True when the published answer occurs in text (match is exact or case_insensitive). Always false when the published answer is UNKNOWN, including a guard abstention. */
+            supports_answer: boolean;
+            /**
+             * @description How the published answer occurs in text; case_insensitive ignores ASCII case only.
+             * @enum {string}
+             */
+            match: "exact" | "case_insensitive" | "none";
         };
         MemorillaGenerateUsage: {
             encoder_query_tokens: number;
@@ -31315,23 +31400,148 @@ export interface components {
             /** @description Source-verified mode only. True when the final selection uses the source-answer or abstention path, false for memory_verified. Independent source-answer work occurs even for memory_verified and is included in total token usage. */
             source_fallback_used?: boolean;
         };
+        /** @description A region of one caller document, mapped from encoder copy positions the way citations are. */
+        MemorillaDiagnosticRegion: {
+            /** @description Index into the request's document_texts. */
+            document_index: number;
+            /** @description Inclusive UTF-8 byte offset into document_texts[document_index], on a character boundary. */
+            start: number;
+            /** @description Exclusive UTF-8 byte offset; end > start. */
+            end: number;
+            /** @description Exactly the bytes document_texts[document_index][start:end], surrounding whitespace trimmed. */
+            text: string;
+        };
+        MemorillaDiagnosticWindow: {
+            /** @description The evidence window as the decoder reads it when the gate opens (its tokens padded with spaces to window_rows), decoded. */
+            text: string;
+            /** @description Where the window sits in document_texts, one region per document it touches (a window never crosses documents today). Empty when citations_unavailable. */
+            regions: components["schemas"]["MemorillaDiagnosticRegion"][];
+        };
+        /**
+         * @description Server-side stage times in milliseconds. Each stage is measured from
+         *     the end of the previous one, so it also carries the model-handle and
+         *     integrity checks done since. total spans the whole service call
+         *     (preflight, admission and every stage); queueing before it is not
+         *     included.
+         */
+        MemorillaDiagnosticTimings: {
+            /** @description Stock-encoder pooled vectors of the texts and the question. */
+            pooled: number;
+            /** @description The first span pass's per-token encoder features (encoder LoRA at run time). Absent for read_mode none. */
+            span_features?: number;
+            /** @description The first pass's span head, including the decoder handle acquisition before it. Absent for read_mode none. */
+            span_head?: number;
+            /** @description The cascade's wide pass features (reusing the narrow pass's leading rows). Present only when a wide pass ran after the first pass. */
+            wide_features?: number;
+            /** @description The wide pass's span head. Present only with wide_features. */
+            wide_head?: number;
+            /** @description Read plan, evidence window, path checks and the window's embedding rows. Absent for read_mode none. */
+            window?: number;
+            /** @description The released reader's 16 soft rows. */
+            soft_rows: number;
+            /** @description Decoder prefill and greedy decoding. */
+            generate: number;
+            total: number;
+        };
+        /**
+         * @description hybrid_research profiles with include_diagnostics only: how the span
+         *     hybrid read the request. Fields that do not apply are absent (never
+         *     null). Margins are score - null_score - the bundle's span gate
+         *     threshold; the cascade widens when the narrow margin is below
+         *     cascade_threshold, and the gate opens when margin >= gate_offset.
+         *     Research diagnostics, not a stable contract.
+         */
+        MemorillaDiagnostics: {
+            /**
+             * @description The read the request ran. all is a span bundle without a cascade (every text is read). Absent for a copy-head (non-span) bundle.
+             * @enum {string}
+             */
+            read_mode?: "auto" | "narrow" | "wide" | "none" | "all";
+            /**
+             * @description Cascade only. The pass whose record the request used.
+             * @enum {string}
+             */
+            read_pass?: "narrow" | "wide";
+            /** @description Cascade only. True when auto used the wide pass. */
+            widened?: boolean;
+            /** @description Cascade only. The narrow margin below which auto reads wide. */
+            cascade_threshold?: number;
+            /** @description Cascade only. Margin of the narrow pass; absent when it did not run. */
+            narrow_margin?: number;
+            /** @description Cascade only. Margin of the wide pass; absent when it did not run. */
+            wide_margin?: number;
+            /** @description Cascade only. Why the narrow read set was skipped at preflight (an error name); absent when usable. */
+            narrow_unavailable?: string;
+            /** @description Cascade only. Why the wide read set was skipped at preflight; absent when usable. */
+            wide_unavailable?: string;
+            /** @description Leading texts the used pass read. */
+            read_documents?: number;
+            /** @description Copy tokens of the used pass's read set. */
+            read_tokens?: number;
+            /** @description Encoder tokens the wide read budget summed; absent when no budget applied. */
+            read_budget_tokens?: number;
+            /** @description Evidence window rows of the used pass (32 narrow, the cascade's width wide). */
+            window_rows?: number;
+            /** @description Best span score (start plus end logit). */
+            score?: number;
+            /** @description No-answer score. */
+            null_score?: number;
+            /** @description Margin of the record used; the gate compares it with gate_offset. */
+            margin?: number;
+            /** @enum {string} */
+            gate_policy?: "always" | "learned" | "routed";
+            /** @description The offset the margin was compared with; absent for the always policy (the gate is always open). */
+            gate_offset?: number;
+            /** @description Routed or declared gate profile name, when one applied. */
+            gate_profile?: string;
+            /** @description Equals record_gate open. When true the decoder read the soft rows then the window rows. */
+            gate_open: boolean;
+            span?: components["schemas"]["MemorillaDiagnosticRegion"];
+            window?: components["schemas"]["MemorillaDiagnosticWindow"];
+            /** @description The stripped decoder answer before canonicalization and the answer guard. */
+            raw_answer: string;
+            timings_ms?: components["schemas"]["MemorillaDiagnosticTimings"];
+        };
         MemorillaGenerateResponse: {
             model: string;
             text: string;
             token_ids: number[];
             /**
-             * @description Abstained is a policy-produced UNKNOWN answer with empty token_ids and zero final completion tokens. Source-verified mode never publishes a truncated factual answer.
+             * @description Abstained is a policy-produced UNKNOWN answer. In source-verified mode it has empty token_ids and zero final completion tokens, and that mode never publishes a truncated factual answer. On encoder_lora_research and hybrid_research profiles it is produced by the answer guard (see answer_guard) and token_ids keep the decoder's output.
              * @enum {string}
              */
             finish_reason: "eos" | "length" | "abstained";
             input_documents: number;
             /**
-             * @description Memory slots used by the published answer. Sixteen for latent or approved memory answers; zero for a source-text fallback or policy abstention. Source-verified mode still evaluates an initial memory candidate.
+             * @description Memory slots used by the published answer. Sixteen for latent or approved memory answers; zero for a source-text fallback or policy abstention. Source-verified mode still evaluates an initial memory candidate. hybrid_research reports 32 when the record gate opened (16 soft rows then 16 record rows) and 16 when it closed (soft rows only); span-window bundles report 16 plus the evidence window rows when it opened (48 for a 32-row window, 80 for the cascade's 64-row wide window) and 16 when it closed or read_mode is none.
              * @enum {integer}
              */
-            memory_tokens: 0 | 16;
-            /** @enum {string} */
-            context_source: "supplied_embeddings" | "supplied_embeddings_and_documents";
+            memory_tokens: 0 | 16 | 32 | 48 | 80;
+            /**
+             * @description supplied_documents is reported by encoder_lora_research and hybrid_research profiles, which encoded caller-supplied texts server-side.
+             * @enum {string}
+             */
+            context_source: "supplied_embeddings" | "supplied_embeddings_and_documents" | "supplied_documents";
+            /** @description encoder_lora_research and hybrid_research profiles only. SHA256 of the research candidate.json pinned by the reader bundle and, for encoder_lora_research, by the merged encoder lock (hybrid_research instead checks that the candidate names the bundle's encoder-lora.safetensors digest); it identifies the experimental candidate, not a qualification status. */
+            candidate_sha256?: string;
+            /**
+             * @description encoder_lora_research and hybrid_research profiles only. Outcome of the answer guard applied to the decoder text. The research task answers are short exact facts (a name of a few words, a short code, or the literal UNKNOWN); text that is empty, longer than 64 bytes, more than six words, contains control characters, the memory frame literal Memory as a standalone word or the <|memory|> marker, or bytes outside letters, digits, space, hyphen, period and apostrophe is rejected. hybrid_research answers general questions in sentences, so it applies only the frame-echo rules (empty text, control characters including newlines, the standalone word Memory, the <|memory|> marker). A rejected answer is published as text UNKNOWN with finish_reason abstained; token_ids keep what the decoder produced.
+             * @enum {string}
+             */
+            answer_guard?: "accepted" | "rejected";
+            /** @description encoder_lora_research and hybrid_research profiles only. Where every span the copy head copied into the 16-slot memory record came from, one entry per contiguous cited region of a document, sorted by document_index then start. A copied run that crosses from one document into the next is split per document, and regions of one document that touch or overlap are merged. Empty when nothing was copied or when citations_unavailable is true, and on hybrid_research when record_gate is closed (the decoder then read only soft rows, which are not traceable to source bytes). A citation shows what the memory record copied, not proof that the answer is correct; supports_answer only reports whether the published answer text (on hybrid_research, after canonicalization) occurs in the cited region. */
+            citations?: components["schemas"]["MemorillaCitation"][];
+            /** @description encoder_lora_research and hybrid_research profiles only. True when the encoder tokenizer's pieces did not reproduce the supplied texts byte for byte (for example Unicode normalization changed them), so copied tokens could not be mapped back to byte ranges; citations is then empty and the answer is unaffected. */
+            citations_unavailable?: boolean;
+            /**
+             * @description hybrid_research profiles only. Open when at least one span the copy head copied into the record snapped every slot at cosine 0.85 or more; the decoder then read 32 rows under the merged prompt. Closed (no copied span, or every span carries a low-cosine slot) means the decoder read the 16 soft rows alone under the released helpful prompt.
+             * @enum {string}
+             */
+            record_gate?: "open" | "closed";
+            /** @description hybrid_research profiles only. True when the published text was re-spelled from the record (record casing for a word-aligned case-insensitive match, or the full record word sequence for a dropped-prefix tail of at least three characters). Never true when the gate is closed or the answer is UNKNOWN. */
+            canonicalized?: boolean;
+            /** @description hybrid_research profiles only. SHA256 of the released reader weights that produced the soft rows (memory_module_sha256 is the research reader's). */
+            soft_module_sha256?: string;
             /**
              * @description Present in source-verified mode and identifies the actual published answer path.
              * @enum {string}
@@ -31353,6 +31563,7 @@ export interface components {
             decoder_execution_identity: string;
             memory_module_sha256: string;
             usage: components["schemas"]["MemorillaGenerateUsage"];
+            diagnostics?: components["schemas"]["MemorillaDiagnostics"];
         };
         /** @description Content part supported by chunking requests. */
         InferenceChunkContentPart: components["schemas"]["TextContentPart"] | components["schemas"]["MediaContentPart"] | components["schemas"]["ChunkSourceReference"];
@@ -31803,15 +32014,66 @@ export interface components {
                 request_limits?: components["schemas"]["InferenceRequestLimitsConfig"];
             };
         };
-        /** @description An administrator-configured, immutable Memorilla model composition. Only the qualified Qwen3 F32 CUDA profiles are supported. */
+        /**
+         * @description An administrator-configured, immutable Memorilla model composition. Only
+         *     the qualified Qwen3 F32 CUDA profiles are supported for the released
+         *     reader kind. The encoder_lora_research kind serves the experimental
+         *     encoder-LoRA copy candidate from its own locked artifacts; it is not
+         *     qualified and must not be promoted or presented as such. The
+         *     hybrid_research kind composes the released reader's soft memory with
+         *     the research candidate's exact record (also unqualified research).
+         */
         MemorillaProfileConfig: {
             name: string;
-            /** @description Managed encoder reference using the qwen3_encoder_f32_v1 execution profile. */
+            /**
+             * @description Managed encoder reference. For reader_kind=released this uses the
+             *     qwen3_encoder_f32_v1 execution profile. For
+             *     reader_kind=encoder_lora_research it is the merged research encoder
+             *     directory exported by encoder_lora_export.py (manifest profile
+             *     qwen3_encoder_lora_research_f32_v1 with its memorilla_lock.json).
+             *     For reader_kind=hybrid_research it is the stock managed
+             *     qwen3_encoder_f32_v1 encoder, used for both passes: pooled document
+             *     and question vectors without adapters, and per-token record
+             *     features with the hybrid bundle's encoder LoRA applied at run time.
+             */
             encoder: string;
             /** @description Managed decoder reference using the qwen3_decoder_f32_kv_f32_v1 execution profile. */
             decoder: string;
-            /** @description Local exported released-checkpoint bundle directory. This path is configured by the administrator and cannot be supplied by an inference request. */
+            /**
+             * @description Local reader bundle directory. For reader_kind=released this is an
+             *     exported released-checkpoint bundle; for
+             *     reader_kind=encoder_lora_research it is the research reader bundle
+             *     (reader, copy head, candidate.json and protocol.json); for
+             *     reader_kind=hybrid_research it is the hybrid research bundle, the
+             *     research bundle plus a pinned encoder-lora.safetensors whose digest
+             *     equals candidate.json encoder_lora_sha256. This path is
+             *     configured by the administrator and cannot be supplied by an
+             *     inference request.
+             */
             memory_module_path: string;
+            /**
+             * @description Which reader the composition serves. released consumes
+             *     caller-supplied document embeddings and supports source_verified
+             *     mode. encoder_lora_research encodes caller-supplied document_texts
+             *     with the merged research encoder, rejects document_embeddings, does
+             *     not support source_verified, and reports candidate_sha256.
+             *     hybrid_research takes the same document_texts requests and answers
+             *     general questions: 16 soft rows from the released reader
+             *     (released_memory_module_path) over pooled vectors, plus, when the
+             *     record gate opens, the research candidate's 16 exact record rows,
+             *     with the answer re-spelled from the record and its copied spans
+             *     cited.
+             * @default released
+             * @enum {string}
+             */
+            reader_kind?: "released" | "encoder_lora_research" | "hybrid_research";
+            /**
+             * @description Required for reader_kind=hybrid_research and rejected for every
+             *     other kind. Local released reader bundle directory (for example
+             *     the stage3 export) whose 16 soft rows open the hybrid memory.
+             *     Configured by the administrator only.
+             */
+            released_memory_module_path?: string;
             /** @default 64 */
             max_documents?: number;
             /** @default 128 */

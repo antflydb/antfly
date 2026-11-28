@@ -36,6 +36,26 @@ import (
 
 type inferenceRoundTripFunc func(*http.Request) (*http.Response, error)
 
+func TestMemorillaHybridRequestOmitsEmbeddings(t *testing.T) {
+	body := oapi.GenerateMemorillaJSONRequestBody{
+		Model:                    "hybrid",
+		Question:                 "Who holds the key?",
+		EncoderExecutionIdentity: strings.Repeat("a", 64),
+		DocumentTexts:            []string{"The key holder is Jo."},
+		ReadMode:                 oapi.MemorillaGenerateRequestReadModeAuto,
+		IncludeDiagnostics:       true,
+	}
+	request, err := oapi.NewGenerateMemorillaRequest("https://example.invalid", body)
+	require.NoError(t, err)
+	defer request.Body.Close()
+	var wire map[string]any
+	require.NoError(t, json.NewDecoder(request.Body).Decode(&wire))
+	assert.NotContains(t, wire, "document_embeddings")
+	assert.Equal(t, []any{"The key holder is Jo."}, wire["document_texts"])
+	assert.Equal(t, "auto", wire["read_mode"])
+	assert.Equal(t, true, wire["include_diagnostics"])
+}
+
 func (f inferenceRoundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return f(req)
 }
