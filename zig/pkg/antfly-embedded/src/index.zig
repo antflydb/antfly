@@ -283,6 +283,11 @@ pub const SegmentShared = struct {
     /// Set when the segment is replaced/removed from the live index. Runs
     /// once the last reference dies, after resources are deinited.
     retired_cleanup: ?RetiredSegmentCleanup = null,
+    /// The segment id `retired_cleanup` runs with: the retiring writer's.
+    /// Entries sharing this cell carry their own writers' ids (a
+    /// composition renames them), so whichever releases last cannot name
+    /// the file.
+    retired_cleanup_id: u64 = 0,
 
     fn observeResidency(self: *SegmentShared, manager: ?*resource_manager_mod.ResourceManager) void {
         while (!self.residency_mutex.tryLock()) spinOrYield();
@@ -752,7 +757,7 @@ pub const SegmentEntry = struct {
         }
         if (@atomicRmw(u32, &self.shared.ref_count, .Sub, 1, .acq_rel) != 1) return;
         const alloc = self.shared.allocator;
-        const seg_id = self.id;
+        const seg_id = self.shared.retired_cleanup_id;
         const cleanup = self.shared.retired_cleanup;
         if (self.shared.physical_parent) |parent| {
             // A fork's own cell goes; its reference on the physical segment
@@ -4199,6 +4204,7 @@ pub const IndexWriter = struct {
                 const physical_cell = seg.physicalShared();
                 std.debug.assert(physical_cell.retired_cleanup == null);
                 physical_cell.retired_cleanup = if (writer.retired_segment_cleanup) |cleanup| cleanup.retained() else null;
+                physical_cell.retired_cleanup_id = seg.id;
             }
             if (self.retired.len > 0) self.staging_alloc.free(self.retired);
 
@@ -4402,9 +4408,14 @@ pub const IndexWriter = struct {
             shared.deleted = try mask.clone(self.alloc);
             shared.deleted_count.store(@intCast(mask.cardinality()), .release);
             shared.physical_parent = parent;
-            // Transfer this snapshot's physical pin to parent; its new shared
-            // cell owns only visibility and metadata, never the encoded source.
+            // The new cell owns only visibility and metadata, and pins the
+            // physical segment itself. The reference this snapshot held is
+            // on the cell it replaces, which may be a fork (one with no
+            // tombstones qualifies), so it is released, not transferred.
+            var replaced = segment.*;
+            parent.retain();
             segment.shared = shared;
+            replaced.releaseRef();
         }
         // The temporary writer is the sole owner until all masks are admitted.
         // Transfer the sealed snapshot into the destination atomically.
@@ -4773,6 +4784,7 @@ pub const IndexWriter = struct {
             const physical_cell = seg.physicalShared();
             std.debug.assert(physical_cell.retired_cleanup == null);
             physical_cell.retired_cleanup = if (self.retired_segment_cleanup) |cleanup| cleanup.retained() else null;
+            physical_cell.retired_cleanup_id = seg.id;
         }
         if (retired.len > 0) self.alloc.free(retired);
 
@@ -6014,13 +6026,7 @@ test "replacement publishes kept tombstones with its segments" {
 // segment runs its cleanup once, when its physical data is last released.
 test "forked segment tombstones share one physical owner and retire once" {
     const alloc = std.testing.allocator;
-    const Deleted = struct {
-        var count: usize = 0;
-        fn delete(_: *anyopaque, _: u64) void {
-            count += 1;
-        }
-    };
-    Deleted.count = 0;
+    RetiredIds.count = 0;
     const seg1 = try buildTestSegmentWithIds(alloc, &.{
         .{ .id = "a", .terms = &.{.{ .term = "alpha", .freq = 1, .norm = 10 }} },
         .{ .id = "b", .terms = &.{.{ .term = "alpha", .freq = 1, .norm = 10 }} },
@@ -6030,7 +6036,7 @@ test "forked segment tombstones share one physical owner and retire once" {
     var writer = try IndexWriter.init(alloc);
     defer writer.deinit();
     var token: u8 = 0;
-    writer.setRetiredSegmentCleanup(.{ .ptr = &token, .delete = Deleted.delete });
+    writer.setRetiredSegmentCleanup(.{ .ptr = &token, .delete = RetiredIds.delete });
     try writer.addSegment(seg1);
     const physical = writer.snapshot().segments[0].shared;
     const id = writer.snapshot().segments[0].id;
@@ -6053,7 +6059,147 @@ test "forked segment tombstones share one physical owner and retire once" {
     }
     // Retire the forked segment; its file goes once, with its data.
     try writer.removeSegments(&.{id});
-    try std.testing.expectEqual(@as(usize, 1), Deleted.count);
+    try std.testing.expectEqual(@as(usize, 1), RetiredIds.count);
+    try std.testing.expectEqual(id, RetiredIds.ids[0]);
+}
+
+const RetiredIds = struct {
+    var ids: [8]u64 = undefined;
+    var count: usize = 0;
+
+    fn delete(_: *anyopaque, id: u64) void {
+        ids[count] = id;
+        count += 1;
+    }
+};
+
+fn expectAlphaHits(snap: *const IndexSnapshot, expected: usize) !void {
+    const results = try snap.search(std.testing.allocator, "body", &.{"alpha"}, 10);
+    defer std.testing.allocator.free(results.hits);
+    try std.testing.expectEqual(expected, results.hits.len);
+}
+
+// A composition renames the segments it shares, and the physical cell's last
+// release may come from any of them: cleanup names the file by the id the
+// retiring writer gave it.
+test "retired cleanup names the retiring writer's segment after a renamed composition" {
+    const alloc = std.testing.allocator;
+    RetiredIds.count = 0;
+    const seg1 = try buildTestSegmentWithIds(alloc, &.{
+        .{ .id = "a", .terms = &.{.{ .term = "alpha", .freq = 1, .norm = 10 }} },
+        .{ .id = "b", .terms = &.{.{ .term = "alpha", .freq = 1, .norm = 10 }} },
+    });
+    defer alloc.free(seg1);
+    var source = try IndexWriter.init(alloc);
+    var source_open = true;
+    defer if (source_open) source.deinit();
+    var token: u8 = 0;
+    source.setRetiredSegmentCleanup(.{ .ptr = &token, .delete = RetiredIds.delete });
+    try source.addSegment(seg1);
+    const id = source.snapshot().segments[0].id;
+
+    var composed = try IndexWriter.init(alloc);
+    var composed_open = true;
+    defer if (composed_open) composed.deinit();
+    {
+        const snap = source.acquireSnapshot();
+        defer snap.release();
+        try composed.shareImmutableSegments(&.{.{ .snapshot = snap, .ordinal = 0, .target_id = id + 100 }});
+    }
+    // Forking the renamed copy makes its entry the physical owner.
+    {
+        const base = composed.acquireSnapshot();
+        defer base.release();
+        var kept = [_]KeptDeletion{.{ .id = id + 100, .bitmap = roaring.RoaringBitmap.init(alloc) }};
+        defer for (&kept) |*item| item.deinit();
+        var prepared = try composed.prepareSegmentsAgainst(base, alloc, &.{}, &.{}, &kept);
+        defer prepared.abort();
+        try std.testing.expect(prepared.publishIfCurrent());
+    }
+    try std.testing.expectEqual(id + 100, composed.snapshot().segments[0].shared.physical_parent.?.id);
+
+    try source.removeSegments(&.{id});
+    source.deinit();
+    source_open = false;
+    try std.testing.expectEqual(@as(usize, 0), RetiredIds.count);
+    try expectAlphaHits(composed.snapshot(), 2);
+    composed.deinit();
+    composed_open = false;
+    try std.testing.expectEqual(@as(usize, 1), RetiredIds.count);
+    try std.testing.expectEqual(id, RetiredIds.ids[0]);
+}
+
+// A source segment forked with no tombstones qualifies for a masked
+// composition. The composition's fork pins the physical segment itself and
+// releases the cell it replaced, whichever side is released first.
+test "masked composition over an empty-tombstone fork pins the physical segment in either release order" {
+    try maskedCompositionOverForkScenario(true);
+    try maskedCompositionOverForkScenario(false);
+}
+
+fn maskedCompositionOverForkScenario(composition_first: bool) !void {
+    const alloc = std.testing.allocator;
+    RetiredIds.count = 0;
+    const seg1 = try buildTestSegmentWithIds(alloc, &.{
+        .{ .id = "a", .terms = &.{.{ .term = "alpha", .freq = 1, .norm = 10 }} },
+        .{ .id = "b", .terms = &.{.{ .term = "alpha", .freq = 1, .norm = 10 }} },
+        .{ .id = "c", .terms = &.{.{ .term = "alpha", .freq = 1, .norm = 10 }} },
+    });
+    defer alloc.free(seg1);
+    var source = try IndexWriter.init(alloc);
+    var source_open = true;
+    defer if (source_open) source.deinit();
+    var token: u8 = 0;
+    source.setRetiredSegmentCleanup(.{ .ptr = &token, .delete = RetiredIds.delete });
+    try source.addSegment(seg1);
+    const id = source.snapshot().segments[0].id;
+    {
+        const base = source.acquireSnapshot();
+        defer base.release();
+        var kept = [_]KeptDeletion{.{ .id = id, .bitmap = roaring.RoaringBitmap.init(alloc) }};
+        defer for (&kept) |*item| item.deinit();
+        var prepared = try source.prepareSegmentsAgainst(base, alloc, &.{}, &.{}, &kept);
+        defer prepared.abort();
+        try std.testing.expect(prepared.publishIfCurrent());
+    }
+    const fork = &source.snapshot().segments[0];
+    try std.testing.expect(fork.shared.physical_parent != null);
+    try std.testing.expectEqual(@as(u32, 0), fork.shared.deleted_count.load(.acquire));
+
+    var composed = try IndexWriter.init(alloc);
+    var composed_open = true;
+    defer if (composed_open) composed.deinit();
+    {
+        const snap = source.acquireSnapshot();
+        defer snap.release();
+        var mask = roaring.RoaringBitmap.init(alloc);
+        defer mask.deinit();
+        try mask.add(1);
+        try composed.shareMaskedImmutableSegments(&.{.{ .snapshot = snap, .ordinal = 0, .target_id = id + 100 }}, &.{mask});
+    }
+    const masked = &composed.snapshot().segments[0];
+    try std.testing.expectEqual(fork.physicalShared(), masked.physicalShared());
+    try std.testing.expect(masked.shared != fork.shared);
+    try expectAlphaHits(composed.snapshot(), 2);
+    try expectAlphaHits(source.snapshot(), 3);
+
+    if (composition_first) {
+        composed.deinit();
+        composed_open = false;
+        try expectAlphaHits(source.snapshot(), 3);
+        try std.testing.expectEqual(@as(usize, 0), RetiredIds.count);
+        try source.removeSegments(&.{id});
+    } else {
+        try source.removeSegments(&.{id});
+        source.deinit();
+        source_open = false;
+        try std.testing.expectEqual(@as(usize, 0), RetiredIds.count);
+        try expectAlphaHits(composed.snapshot(), 2);
+        composed.deinit();
+        composed_open = false;
+    }
+    try std.testing.expectEqual(@as(usize, 1), RetiredIds.count);
+    try std.testing.expectEqual(id, RetiredIds.ids[0]);
 }
 
 test "empty index search" {

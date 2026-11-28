@@ -1522,11 +1522,10 @@ pub const WriterLane = struct {
                 self.parked_store = null;
                 self.foreign_release_due = false;
                 self.mutex.unlock(io);
-                if (overdue_store) |held_store| {
-                    held_store.ensureDurableForReuse();
-                    held_store.sync() catch {};
-                }
+                if (overdue_store) |held_store| held_store.prepareLeaseHandoff();
                 overdue.close();
+                // The seal needs no lease: never hold it across one.
+                if (overdue_store) |held_store| held_store.sealAfterHandoff();
                 self.mutex.lockUncancelable(io);
                 continue;
             }
@@ -2157,9 +2156,9 @@ pub const WriterLane = struct {
         self.noteReleased();
         self.mutex.unlock(io);
         self.signalReleased(io);
-        store.ensureDurableForReuse();
-        store.sync() catch {};
+        store.prepareLeaseHandoff();
         lease.close();
+        store.sealAfterHandoff();
     }
 
     /// `WriterLane` is embedded by value in `Owner` (`owner.writer_lane`),
@@ -2241,15 +2240,13 @@ pub const WriterLane = struct {
     /// can act while only the pin keeps the peer alive.
     var test_peer_release_pause: if (h.builtin.is_test) ?struct { reached: *std.Io.Event, @"resume": *std.Io.Event } else void = if (h.builtin.is_test) null else {};
 
-    /// Drains and syncs the store, which can enter maintenance writer
+    /// Drains the store (and syncs it, unless its seals pipeline), which can enter maintenance writer
     /// admission and take the path gate: the caller must not hold it.
     fn finishLocalPeerRelease(release: *PeerRelease) void {
         const self = release.lane;
-        if (release.store) |held_store| {
-            held_store.ensureDurableForReuse();
-            held_store.sync() catch {};
-        }
+        if (release.store) |held_store| held_store.prepareLeaseHandoff();
         release.lease.close();
+        if (release.store) |held_store| held_store.sealAfterHandoff();
         const io = h.handleLockIo();
         self.mutex.lockUncancelable(io);
         self.checked_out = false;
@@ -2320,11 +2317,15 @@ pub const WriterLane = struct {
         // store's own idle turn never writes (lite-writer-authority.md
         // §4.3); a foreign handoff skips the fold to keep its turn short.
         if (store) |held_store| {
-            held_store.ensureDurableForReuse();
-            if (!foreign_overdue) held_store.foldIdleRedoLog();
-            held_store.sync() catch {};
+            if (!foreign_overdue) {
+                // An idle release folds, which seals first.
+                held_store.ensureDurableForReuse();
+                held_store.foldIdleRedoLog();
+            }
+            held_store.prepareLeaseHandoff();
         }
         lease.close();
+        if (store) |held_store| held_store.sealAfterHandoff();
         self.mutex.lockUncancelable(io);
         self.checked_out = false;
         self.noteReleased();
@@ -5995,6 +5996,9 @@ pub fn open(path: []const u8, options: api.LiteResolvedOpenOptions, create: bool
     }
     errdefer if (existing == null) @import("io_lifetime.zig").release();
     errdefer if (existing == null) owner.path_lock_io.deinit();
+    // A failed first open may already have started the owner's open worker;
+    // its thread waits on the owner's memory, so it goes before the owner.
+    errdefer if (existing == null) owner.open_worker.stop();
     if (existing == null) {
         owner.reader_coordinator = try native.ReaderCoordinator.create(alloc, io);
         owner.options.reader_coordinator = owner.reader_coordinator;

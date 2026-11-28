@@ -1140,7 +1140,12 @@ fn ensurePendingVisibilityChunkAlloc(
 ) !*VisibilityChunk {
     const gop = try chunks.getOrPut(alloc, chunk_id);
     if (!gop.found_existing) {
-        gop.value_ptr.* = (try readVisibilityChunkTxn(alloc, txn, chunk_id)) orelse .{};
+        // A failed read must not leave the slot undefined: the map's
+        // cleanup deinits every value.
+        gop.value_ptr.* = (readVisibilityChunkTxn(alloc, txn, chunk_id) catch |err| {
+            chunks.removeByPtr(gop.key_ptr);
+            return err;
+        }) orelse .{};
     }
     return gop.value_ptr;
 }

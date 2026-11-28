@@ -1267,6 +1267,11 @@ pub const segmented_redo_format_version: u32 = 13;
 /// before reading its checkpoint or catalog. The lower bits encode the layout.
 const versioned_text_format_bit: u32 = 1 << 31;
 pub const sealed_redo_format_bit: u32 = 1 << 30;
+/// Writers may pipeline seals (lite-cross-process-commit-sealing.md): a
+/// lease holder's appended tail can await a seal from another process. An
+/// older binary's version check rejects the bit, so it can never open, or
+/// once open never resync, a file whose protocol it cannot honor.
+pub const sealed_tail_format_bit: u32 = 1 << 29;
 const redo_frontier_page_count = 2;
 pub const default_page_size: u32 = 4096;
 
@@ -5473,6 +5478,9 @@ pub const Header = struct {
     redo_log_capacity: u64 = 0,
     protected_redo: bool = false,
     sealed_redo_required: bool = false,
+    /// `sealed_tail_format_bit`: set on every protected file this binary
+    /// creates or publishes; pipelining requires it.
+    sealed_tail_required: bool = false,
 
     segmented_redo: bool = false,
     versioned_text_required: bool = false,
@@ -5492,7 +5500,8 @@ pub const Header = struct {
         const layout = if (self.segmented_redo) segmented_redo_format_version else if (self.protected_redo) protected_redo_format_version else format_version;
         return layout |
             (if (self.versioned_text_required) versioned_text_format_bit else 0) |
-            (if (self.sealed_redo_required) sealed_redo_format_bit else 0);
+            (if (self.sealed_redo_required) sealed_redo_format_bit else 0) |
+            (if (self.sealed_tail_required) sealed_tail_format_bit else 0);
     }
 };
 
@@ -7436,6 +7445,11 @@ pub const NativeFile = struct {
     // A failed redo frontier publication may already name durable WAL bytes.
     // Preserve them and require reopening before another mutation.
     redo_frontier_uncertain: bool = false,
+    /// Cross-process commit sealing
+    /// (lite-cross-process-commit-sealing.md): a non-durable commit
+    /// appends and publishes its tail in the region, and `sealThrough`
+    /// makes it durable from any process, without the writer lease.
+    pipelined_seal: bool = false,
     rotate_redo_on_checkpoint: bool = false,
     // A publication that fails after it may have started writing the slot
     // may leave disk ahead of header -- this means exactly that: a
@@ -7615,6 +7629,8 @@ pub const NativeFile = struct {
     /// the logical state every later commit computes its next sequence
     /// from. Disarms itself after firing once.
     test_fail_redo_sync: if (builtin.is_test) ?anyerror else void = if (builtin.is_test) null else {},
+    /// Fork tests: the process exits at this commit-sealing boundary.
+    test_seal_crash: if (builtin.is_test) ?SealCrashPoint else void = if (builtin.is_test) null else {},
     test_fail_redo_frontier_sync: if (builtin.is_test) ?anyerror else void = if (builtin.is_test) null else {},
     test_fail_redo_visibility: if (builtin.is_test) ?anyerror else void = if (builtin.is_test) null else {},
     /// Fails the very next `checkpointRedoLog` call outright (before it
@@ -8075,6 +8091,7 @@ pub const NativeFile = struct {
         self.header.redo_log_capacity = capacity;
         self.header.protected_redo = !self.no_sync;
         self.header.sealed_redo_required = self.header.protected_redo;
+        self.header.sealed_tail_required = self.header.protected_redo;
         self.header.segmented_redo = segmented;
 
         // Both checkpoint slots and the header are written here, but
@@ -8385,10 +8402,222 @@ pub const NativeFile = struct {
         });
     }
 
+    /// Turns on cross-process commit sealing. Only an externally locked
+    /// protected-redo file that syncs, with a shared region, pipelines.
+    pub fn enablePipelinedSeal(self: *NativeFile) !void {
+        if (self.redo == null or !self.header.protected_redo or !self.header.sealed_tail_required or self.no_sync or !self.externally_locked) return error.UnsupportedOperation;
+        _ = (try self.regionForInode()) orelse return error.UnsupportedOperation;
+        self.pipelined_seal = true;
+    }
+
+    pub const SealProgress = enum { sealed, busy };
+
+    pub const SealCrashPoint = enum { before_tail_publish, after_data_sync, after_frontier_write, after_frontier_sync };
+
+    fn sealCrashPoint(self: *const NativeFile, point: SealCrashPoint) void {
+        if (builtin.is_test) if (self.test_seal_crash) |crash| if (crash == point) std.c._exit(0);
+    }
+
+    /// One seal attempt: under the seal lock, syncs every record the
+    /// region's appended tail names, then a frontier covering them, and
+    /// announces it. Needs no writer lease and no store mutex: it reads
+    /// the log geometry from disk, which only a fold under the seal lock
+    /// changes. A failed barrier poisons the file for every process.
+    pub fn sealAppendedTail(self: *NativeFile) !SealProgress {
+        return self.sealAppendedTailWithHeader(self.header);
+    }
+
+    /// `header` is a copy taken under the store lock: a sealing group
+    /// holds no lock while another group commits on this handle.
+    fn sealAppendedTailWithHeader(self: *NativeFile, known: Header) !SealProgress {
+        const region = (try self.regionForInode()) orelse return error.UnsupportedOperation;
+        if (!region.tryLockFrontierBarrier()) return .busy;
+        defer region.unlockFrontierBarrier();
+        const state = region.sealState();
+        if (state.poisoned()) return error.OutcomeUnknown;
+        const tail = region.readAppendedTail() orelse return .sealed;
+        if (tail.sequence <= state.sealed_sequence) return .sealed;
+        const io = self.runtimeIo();
+        var header_bytes: [header_size]u8 = undefined;
+        try readHeaderExactAt(self.file, io, &header_bytes);
+        var header = try decodeHeader(&header_bytes);
+        header.checkpoints = known.checkpoints;
+        header.active_checkpoint = known.active_checkpoint;
+        const previous = (try readDurableFrontier(self.allocator, self.file, io, header)) orelse return error.NativeRedoLogCorrupt;
+        const own_claim = ownSidecarWriterClaim(io, if (self.sidecar_registration) |token| token.identity else if (self.redo) |*redo| redo.sidecar_identity else null);
+        // A takeover, a fold or a sealer that died sealed it first. A dead
+        // sealer may have left the slot written but not synced: complete the
+        // barrier unless a synced proof matches, and publish the watermark,
+        // before anyone is acknowledged.
+        if (previous.frontier.sequence >= tail.sequence) {
+            const frontier = previous.frontier;
+            if (!region.hasSyncedFrontier(frontier.sequence, frontier.generation, frontier.end_offset, self.durability_policy == .full_fsync)) {
+                errdefer region.poisonSeal(state.sealed_sequence);
+                try self.syncRedoData();
+                if (builtin.is_test) test_seal_barrier_completions += 1;
+                self.noteSyncedRedoFrontier(region, frontier);
+            }
+            publishSealedLogState(region, .{ .salt = frontier.generation, .reset_generation = tail.reset_generation, .segment = frontier.segment, .sequence = frontier.sequence, .end_offset = frontier.end_offset }, own_claim);
+            region.noteSealed(frontier.sequence);
+            return .sealed;
+        }
+        const prefix = @max(state.sealed_sequence, previous.frontier.sequence);
+        errdefer region.poisonSeal(prefix);
+        if (builtin.is_test) if (self.test_fail_redo_sync) |err| {
+            self.test_fail_redo_sync = null;
+            return err;
+        };
+        self.applyTestSyncDelay();
+        try self.syncRedoData();
+        self.sealCrashPoint(.after_data_sync);
+        const publication = try redoFrontierSlots(header).writeNext(self.file, io, previous, .{
+            .generation = tail.salt,
+            .sequence = tail.sequence,
+            .end_offset = tail.end_offset,
+            .segment = @intCast(tail.segment),
+        });
+        self.sealCrashPoint(.after_frontier_write);
+        if (builtin.is_test) if (self.test_fail_redo_frontier_sync) |err| {
+            self.test_fail_redo_frontier_sync = null;
+            return err;
+        };
+        try self.syncRedoData();
+        self.sealCrashPoint(.after_frontier_sync);
+        if (builtin.is_test) test_seal_count += 1;
+        self.noteSyncedRedoFrontier(region, publication.frontier);
+        publishSealedLogState(region, tail, own_claim);
+        region.noteSealed(tail.sequence);
+        return .sealed;
+    }
+
+    /// Returns once a synced frontier covers `sequence`, sealing it here
+    /// when no other process is: the idle path needs no later writer.
+    /// `OutcomeUnknown` when a barrier failed above the acknowledged
+    /// prefix, or a cut since `cut_generation` may have removed the
+    /// commit.
+    pub fn sealThrough(self: *NativeFile, sequence: u64, cut_generation: u32) !void {
+        return self.sealThroughWithHeader(sequence, cut_generation, self.header);
+    }
+
+    fn sealThroughWithHeader(self: *NativeFile, sequence: u64, cut_generation: u32, known: Header) !void {
+        const region = (try self.regionForInode()) orelse return error.UnsupportedOperation;
+        while (true) {
+            const state = region.sealState();
+            if (state.cut_generation != cut_generation) return error.OutcomeUnknown;
+            if (state.poisoned()) {
+                if (sequence < state.poison_sequence) return;
+                return error.OutcomeUnknown;
+            }
+            if (state.sealed_sequence >= sequence) return;
+            switch (try self.sealAppendedTailWithHeader(known)) {
+                .sealed => {
+                    const after = region.sealState();
+                    // The tail the seal covered stops short of this commit:
+                    // it was never published, so nothing can seal it.
+                    if (after.sealed_sequence < sequence and after.epoch == state.epoch) return error.OutcomeUnknown;
+                },
+                .busy => region.waitSealEpoch(state.epoch, std.Io.Clock.now(.awake, self.runtimeIo()).addDuration(.fromMilliseconds(50))),
+            }
+        }
+    }
+
+    /// Publishes this lease holder's appended records for any process to
+    /// seal. Their writes have returned: a sealer's data barrier covers
+    /// them.
+    fn publishAppendedTail(self: *NativeFile, redo: *RedoCommitState) !void {
+        const region = (try self.regionForInode()) orelse return error.UnsupportedOperation;
+        self.sealCrashPoint(.before_tail_publish);
+        region.publishAppendedTail(.{
+            .salt = redo.writer.salt orelse 0,
+            .reset_generation = redo.log_reset_generation,
+            .segment = self.activeRedoSegment(),
+            .sequence = redo.writer.last_sequence orelse return,
+            .end_offset = redo.writer.tail,
+        });
+    }
+
+    /// A published tail stopped verifying at `valid_end`: unacknowledged
+    /// by construction, so cut it there, under the seal lock so no sealer
+    /// covers the bytes, and tell waiters from before the cut.
+    fn cutAppendedTail(self: *NativeFile, region: *shared_lock_region.Region, io: std.Io, tail: shared_lock_region.AppendedTail, valid_end: u64, valid_sequence: u64) !void {
+        try region.lockFrontierBarrier();
+        defer region.unlockFrontierBarrier();
+        // A seal of the whole tail landed first: it verified for that
+        // sealer, so a racing reread here is wrong, not the tail.
+        if (region.sealState().sealed_sequence >= tail.sequence) return error.NativeRedoLogCorrupt;
+        const capacity = self.header.redo_log_capacity;
+        const len: usize = @intCast(@min(@as(u64, redo_log.header_len), capacity - valid_end));
+        const zeros: [redo_log.header_len]u8 = @splat(0);
+        try self.file.writePositionalAll(io, zeros[0..len], self.header.redoOffset() + valid_end);
+        var cut = tail;
+        cut.sequence = valid_sequence;
+        cut.end_offset = valid_end;
+        region.publishAppendedTail(cut);
+        region.noteCut();
+    }
+
+    pub const PendingSeal = struct { sequence: u64, cut_generation: u32 };
+
+    /// A group's seal, captured under the store lock and run without it.
+    pub const SealContext = struct {
+        file: *NativeFile,
+        header: Header,
+        pending: PendingSeal,
+
+        pub fn sealThrough(self: SealContext) !void {
+            return self.file.sealThroughWithHeader(self.pending.sequence, self.pending.cut_generation, self.header);
+        }
+    };
+
+    pub fn sealContext(self: *NativeFile) !?SealContext {
+        const pending = (try self.pendingSeal()) orelse return null;
+        return .{ .file = self, .header = self.header, .pending = pending };
+    }
+
+    /// What `sealThrough` must cover for this handle's appended commits,
+    /// or null when none awaits a seal. Taken by the lease holder that
+    /// appended them, before it releases the lease: only a later holder
+    /// can cut.
+    pub fn pendingSeal(self: *NativeFile) !?PendingSeal {
+        if (!self.pipelined_seal) return null;
+        const redo = if (self.redo) |*r| r else return null;
+        if (redo.unsynced_from == null) return null;
+        const region = (try self.regionForInode()) orelse return null;
+        return .{ .sequence = redo.writer.last_sequence orelse return null, .cut_generation = region.sealState().cut_generation };
+    }
+
+    /// After `sealThrough`: adopts a seal covering this handle's appended
+    /// records as their durability, as a barrier of its own would have,
+    /// and publishes them to this process's readers (and, while this
+    /// handle holds the lease, to other processes'). A seal short of
+    /// them settles nothing yet.
+    pub fn settleSealed(self: *NativeFile) void {
+        const redo = if (self.redo) |*r| r else return;
+        if (redo.unsynced_from == null or self.transaction_header != null) return;
+        const region = (self.regionForInode() catch null) orelse return;
+        const appended = redo.writer.last_sequence orelse return;
+        if (region.sealState().sealed_sequence < appended) return;
+        if (appended > redo.durable_sequence) redo.durable_sequence = appended;
+        redo.unsynced_from = null;
+        redo.shared.noteApplied(appended);
+        self.durable_header = null;
+        self.publishRedoLogState();
+        wal_trace.recordCommit();
+        self.last_synced_header = self.header;
+        if (self.ledger) |state| {
+            self.retirement_activity_bytes +|= state.released_data_pages *| self.header.page_size;
+            self.retirement_activity_bytes +|= state.retired_inline_bytes;
+            state.released_data_pages = 0;
+            state.retired_inline_bytes = 0;
+        }
+        self.publishCommittedSequenceToInode();
+    }
+
     fn persistRedoFrontier(self: *NativeFile, writer: *redo_log.Writer) !void {
         defer if (builtin.is_test) {
             self.test_fail_redo_frontier_sync = null;
         };
+        errdefer self.poisonSealedPeers();
         self.writeAndSyncRedoFrontier(writer, false) catch |err| switch (err) {
             // The data barrier completed. Repeating the frontier operation
             // is safe, including when its first write reached the kernel.
@@ -8397,10 +8626,29 @@ pub const NativeFile = struct {
         };
     }
 
+    /// A barrier failed on a file pipelined writers share: whatever they
+    /// appended may not have reached disk either. Stop every process above
+    /// the sealed prefix.
+    fn poisonSealedPeers(self: *NativeFile) void {
+        const region = (self.regionForInode() catch null) orelse return;
+        if (region.readAppendedTail() == null) return;
+        region.poisonSeal(region.sealState().sealed_sequence);
+    }
+
     fn writeAndSyncRedoFrontier(self: *NativeFile, writer: *redo_log.Writer, retry: bool) !void {
         const io = self.runtimeIo();
         const slots = redoFrontierSlots(self.header);
         const redo = &self.redo.?;
+        // Pipelined sealers write frontiers without the lease: serialize
+        // with them, and read the slot they may have advanced.
+        const sealing_region = if (self.regionForInode() catch null) |region|
+            (if (region.readAppendedTail() != null) region else null)
+        else
+            null;
+        if (sealing_region) |region| try region.lockFrontierBarrier();
+        defer if (sealing_region) |region| region.unlockFrontierBarrier();
+        if (sealing_region) |region| if (region.sealState().poisoned()) return error.OutcomeUnknown;
+        if (sealing_region != null) redo.frontier_cache = null;
         // Lifetime writer authority excludes another process. The inode
         // publication guards against reuse after another local handle commits.
         const cached = if (!retry and (self.writer_lock_file != null or
@@ -8434,6 +8682,7 @@ pub const NativeFile = struct {
         if (builtin.is_test) if (self.test_fail_redo_frontier_sync) |err| return err;
         try self.syncRedoData();
         redo.frontier_cache = publication;
+        if (sealing_region) |region| region.noteSealed(publication.frontier.sequence);
         if (self.regionForInode() catch null) |region| {
             self.noteSyncedRedoFrontier(region, publication.frontier);
         } else {
@@ -9442,6 +9691,17 @@ pub const NativeFile = struct {
         // Select a recyclable extent only after refreshing writer authority.
         try self.refreshIfWriterBaseStale(true);
         try self.resyncRedoTailUnderAuthority();
+        // A fold may erase or reset the log: seal every pipelined append
+        // first, so no sealer covers a run being replaced and no waiter's
+        // records leave the log unsealed. Only this lease holder appends,
+        // so nothing new needs sealing until the fold is done.
+        if (self.header.protected_redo and !self.no_sync) if (self.regionForInode() catch null) |region| if (region.readAppendedTail()) |tail| {
+            const state = region.sealState();
+            if (tail.sequence > state.sealed_sequence) {
+                try self.sealThrough(tail.sequence, state.cut_generation);
+                self.settleSealed();
+            }
+        };
         const redo: *RedoCommitState = &self.redo.?;
         const io = self.runtimeIo();
         const has_logical_work = for (0..3) |root_idx| {
@@ -10986,6 +11246,11 @@ pub const NativeFile = struct {
         self.releaseCrossProcessRedoReaderSlot();
         self.releaseRegionBinding();
         if (self.inode_lock_ref.load(.acquire)) |entry| {
+            // Nothing may ever release on this entry again, and the
+            // registry's fairness probe runs only on a later release: cede
+            // a parked kernel lock now, or it blocks an independent flock()
+            // from this process forever. A no-op while a grant remains.
+            inode_lock.cedeParked(entry, io);
             inode_lock.unref(entry, io);
             self.inode_lock_ref.store(null, .release);
         }
@@ -11486,7 +11751,20 @@ pub const NativeFile = struct {
                 }
             }
         }
-        const scan_end = if (persisted) |seal| end: {
+        // A pipelined holder's records past the frontier, published but not
+        // yet sealed: adopted when they verify, cut where they stop
+        // (lite-cross-process-commit-sealing.md §5.5). Either way they were
+        // never acknowledged.
+        const appended: ?shared_lock_region.AppendedTail = if (persisted) |seal| if (region) |r| tail: {
+            const tail = r.readAppendedTail() orelse break :tail null;
+            const sealed_through = @max(seal.frontier.sequence, covered);
+            if (tail.sequence <= sealed_through or tail.end_offset > capacity or tail.end_offset < start_offset) break :tail null;
+            if (seal.frontier.sequence > covered and tail.end_offset < seal.frontier.end_offset) break :tail null;
+            const promised_state = r.readLogStateChecked() orelse break :tail null;
+            if (tail.reset_generation != @max(redo.log_reset_generation, promised_state.reset_generation) or tail.segment != self.activeRedoSegment()) break :tail null;
+            break :tail tail;
+        } else null else null;
+        const scan_end = if (appended) |tail| tail.end_offset else if (persisted) |seal| end: {
             if (seal.frontier.sequence <= covered) break :end capacity;
             if (seal.frontier.end_offset < start_offset or seal.frontier.end_offset > capacity) return error.NativeRedoLogCorrupt;
             break :end seal.frontier.end_offset;
@@ -11527,11 +11805,29 @@ pub const NativeFile = struct {
             redo_log.replayBufferedPrefix
         else
             redo_log.replayBounded;
-        var scan = try replay_prefix(self.allocator, self.file, io, base + start_offset, scan_end - start_offset, floor, if (persisted) |seal| @max(seal.frontier.sequence, floor) else null, covered, Scan.onRecord, &scan_ctx);
+        const ceiling: ?u64 = if (appended) |tail| tail.sequence else if (persisted) |seal| @max(seal.frontier.sequence, floor) else null;
+        var scan = try replay_prefix(self.allocator, self.file, io, base + start_offset, scan_end - start_offset, floor, ceiling, covered, Scan.onRecord, &scan_ctx);
         scan.valid_bytes += start_offset;
         const published = if (region) |r| r.readLogStateChecked() else null;
+        // The sealed prefix verifies exactly; an adopted tail may stop short.
+        var adopted_unsealed = false;
         if (persisted) |seal| {
-            if (seal.frontier.sequence > redo.checkpoint_sequence and
+            const sealed_ok = if (appended != null and seal.frontier.sequence > redo.checkpoint_sequence)
+                @max(scan.last_sequence orelse 0, floor) >= seal.frontier.sequence and scan.valid_bytes >= seal.frontier.end_offset
+            else
+                true;
+            if (appended) |tail| {
+                if (!sealed_ok) return error.NativeRedoLogCorrupt;
+                if (scan.valid_count != 0 and seal.frontier.sequence > covered and scan.generation != seal.frontier.generation) return error.NativeRedoLogCorrupt;
+                if (scan.last_sequence != tail.sequence or scan.valid_bytes != tail.end_offset) {
+                    const kept = @max(scan.last_sequence orelse 0, floor, covered);
+                    try self.cutAppendedTail(region.?, io, tail, scan.valid_bytes, kept);
+                    // A handle in this process may have appended the cut
+                    // records: their sequences go to the next commits.
+                    redo.shared.discardUnsealedSuffix(io, kept + 1);
+                }
+                adopted_unsealed = @max(scan.last_sequence orelse 0, floor) > @max(seal.frontier.sequence, covered);
+            } else if (seal.frontier.sequence > redo.checkpoint_sequence and
                 (@max(scan.last_sequence orelse 0, floor) < seal.frontier.sequence or scan.valid_bytes != seal.frontier.end_offset or
                     (scan.valid_count != 0 and scan.generation != seal.frontier.generation)))
                 return error.NativeRedoLogCorrupt;
@@ -11555,8 +11851,10 @@ pub const NativeFile = struct {
         else
             false else false;
         const needs_publication = found or torn or slot_advanced or (persisted != null and region != null and !live_publication);
+        // Adopted unsealed records need no barrier here: their waiters seal.
+        const sealed_last = if (adopted_unsealed) @min(scan.last_sequence orelse 0, persisted.?.frontier.sequence) else (scan.last_sequence orelse 0);
         const sync_proven = if (persisted) |seal| if (region) |r|
-            @max(covered, scan.last_sequence orelse 0) == seal.frontier.sequence and
+            @max(covered, sealed_last) == seal.frontier.sequence and
                 r.hasSyncedFrontier(seal.frontier.sequence, seal.frontier.generation, seal.frontier.end_offset, self.durability_policy == .full_fsync)
         else
             false else false;
@@ -11618,10 +11916,17 @@ pub const NativeFile = struct {
         if (scan.valid_count != 0) redo.shared.noteApplied(last);
         // Rebuilding a cursor can rescan the already-visible prefix. Only
         // advancing the visible sequence invalidates logical runtime state.
-        if (last > redo.durable_sequence) {
-            redo.durable_sequence = last;
-            _ = self.adoption_epoch.fetchAdd(1, .acq_rel);
+        // Adopted unsealed records are this handle's to seal like its own
+        // appends: durable only through the frontier.
+        const durable_last = if (adopted_unsealed) @max(persisted.?.frontier.sequence, covered) else last;
+        if (adopted_unsealed) {
+            if (redo.unsynced_from == null) redo.unsynced_from = durable_last + 1;
+            if (self.durable_header == null) self.durable_header = self.header;
         }
+        if (durable_last > redo.durable_sequence) {
+            redo.durable_sequence = durable_last;
+            _ = self.adoption_epoch.fetchAdd(1, .acq_rel);
+        } else if (adopted_unsealed) _ = self.adoption_epoch.fetchAdd(1, .acq_rel);
         if (self.writer_lock_file != null or redo.sidecar_epoch != null) redo.frontier_cache = persisted;
         // Provisional bump, as `refreshCrossProcessRedoOverlay` does: an
         // adopted on-disk checkpoint names only its fold boundary.
@@ -12809,6 +13114,13 @@ pub const NativeFile = struct {
         if (self.reader_fence_lock) |handle| {
             handle.release(self.runtime());
             self.reader_fence_lock = null;
+            // A dedicated reader may cycle generations and then stay idle:
+            // cede its parked lock rather than leave it held with no later
+            // release to probe fairness. The writer-capable root keeps
+            // parking, since its next cycle reacquires for free.
+            if (self.read_only) {
+                if (self.inode_lock_ref.load(.acquire)) |entry| inode_lock.cedeParked(entry, self.runtime());
+            }
         }
     }
     /// Acquires this inode's shared epoch-reuse (exclusive) grant through
@@ -19269,6 +19581,7 @@ pub const NativeFile = struct {
         compact_header.protected_redo = reserve_redo_log and !self.no_sync;
         compact_header.segmented_redo = compact_header.protected_redo;
         compact_header.sealed_redo_required = compact_header.protected_redo;
+        compact_header.sealed_tail_required = compact_header.protected_redo;
         if (compact_header.segmented_redo) {
             for (&compact_header.checkpoints) |*slot| slot.redo_rotation = .{};
         }
@@ -22065,6 +22378,14 @@ pub const NativeFile = struct {
     /// continue reading immutable pages from their own checkpoint.
     pub fn beginTransaction(self: *NativeFile) !void {
         if (self.redo_frontier_uncertain) return error.OutcomeUnknown;
+        // Another process's seal barrier failed: nothing appends until a
+        // cold recovery (lite-cross-process-commit-sealing.md §5.8).
+        if (self.redo != null and self.header.protected_redo) if (self.regionForInode() catch null) |region| {
+            if (region.sealState().poisoned()) {
+                self.redo_frontier_uncertain = true;
+                return error.OutcomeUnknown;
+            }
+        };
         // lite-writer-authority.md W1: a maintenance snapshot's writes all
         // forward to the writer's store; this file never begins one.
         std.debug.assert(!self.forwarding_only);
@@ -22464,7 +22785,9 @@ pub const NativeFile = struct {
         // must not reserve a manifest page of its own: flushTransactionWrites
         // reserves one under allow_manifest_reservation, only for a commit
         // that might actually durably publish.
-        const deferred_publication = !durable and !self.no_sync and !self.externally_locked;
+        // A pipelined writer appends like a ride-along and publishes the
+        // tail for any process to seal (`sealThrough`).
+        const deferred_publication = !durable and !self.no_sync and (!self.externally_locked or self.pipelined_seal);
         self.allow_manifest_reservation = !deferred_publication and self.manifest_commits_enabled;
         defer self.allow_manifest_reservation = false;
         // `flushTransactionWrites` (and everything else below, before the
@@ -22775,6 +23098,7 @@ pub const NativeFile = struct {
                         redo.logical_pending.clearRetainingCapacity();
                         redo.pending.clearRetainingCapacity();
                         redo.dropOverlayUndo(self.allocator);
+                        if (self.pipelined_seal) try self.publishAppendedTail(redo);
                     }
                     self.header.checkpoints[self.header.active_checkpoint] = next;
                     recoveryDebugLog("ride-along commit (non-durable) commit_sequence={d} captured_durable_header={} durable_header_commit_sequence={d}", .{
@@ -23533,6 +23857,7 @@ pub const NativeFile = struct {
                 // computes its own next sequence from.
                 const append_mark = redo.writer.mark();
                 var frontier_failed = false;
+                var barrier_started = false;
                 (blk: {
                     if (comptime builtin.is_test) if (self.test_fail_checkpoint_publication) |err| {
                         self.test_fail_checkpoint_publication = null;
@@ -23570,6 +23895,7 @@ pub const NativeFile = struct {
                     {
                         const sync_span = write_stage_profile.begin(.redo_sync);
                         defer sync_span.end();
+                        barrier_started = true;
                         self.syncRedoData() catch |err| break :blk err;
                     }
                     const frontier_span = write_stage_profile.begin(.frontier_sync);
@@ -23581,6 +23907,7 @@ pub const NativeFile = struct {
                     break :blk {};
                 }) catch {
                     self.redo_frontier_uncertain = frontier_failed;
+                    if (barrier_started and !frontier_failed) self.poisonSealedPeers();
                     if (!frontier_failed) redo.writer.rollbackTo(append_mark);
                     // perf/lwa-maint-serialize: `rollbackTo` above only
                     // restores the log writer's own physical cursor.
@@ -23996,6 +24323,7 @@ pub const NativeFile = struct {
             try slots.noteSyncedWithoutRegion(self.file, io, frontier);
             self.header.sealed_redo_required = true;
         }
+        if (self.header.protected_redo) self.header.sealed_tail_required = true;
         try self.bindPrivateEpochNamespace(destination_path);
         try self.syncIfRequired(null);
     }
@@ -24638,7 +24966,69 @@ fn discardTornRedoAppend(file: std.Io.File, io: std.Io, log_offset: u64, capacit
     return true;
 }
 
+/// Readers in every process bound replay by the published watermark: a
+/// seal advances it before anyone is acknowledged, from whichever process
+/// sealed. Under the seal lock, so a fold (which seals first, then
+/// publishes its own boundary) is never overwritten with an older one; the
+/// region drops a tuple behind the current one anyway.
+fn publishSealedLogState(region: *shared_lock_region.Region, tail: shared_lock_region.AppendedTail, own_claim: ?u128) void {
+    const current = region.readLogStateChecked() orelse region.readLogStateRaw();
+    if (current.reset_generation != tail.reset_generation or current.segment != tail.segment or current.durable_sequence >= tail.sequence) return;
+    var state = current;
+    state.durable_sequence = tail.sequence;
+    state.durable_offset = tail.end_offset;
+    region.publishReadyLogStateForClaim(state, own_claim);
+}
+
+/// A dead lease holder may leave pipelined appends published but unsealed,
+/// its own or ones it adopted, with their writers still waiting. Seal what
+/// verifies past the frontier and cut the rest, under the seal lock.
+fn sealOrCutDeadWriterTail(allocator: Allocator, io: std.Io, file: std.Io.File, header: Header, checkpoint: CheckpointSlot, region: *shared_lock_region.Region, policy: ?antfly_platform.filesystem.DurabilityPolicy) !void {
+    if (!header.protected_redo) return;
+    if (region.readAppendedTail() == null) return;
+    try region.lockFrontierBarrier();
+    defer region.unlockFrontierBarrier();
+    const state = region.sealState();
+    if (state.poisoned()) return error.OutcomeUnknown;
+    const tail = region.readAppendedTail() orelse return;
+    const previous = (try NativeFile.readDurableFrontier(allocator, file, io, header)) orelse return error.NativeRedoLogCorrupt;
+    const sealed_through = @max(previous.frontier.sequence, checkpoint.redo_folded_through);
+    if (tail.sequence <= @max(sealed_through, state.sealed_sequence)) return;
+    const start = if (previous.frontier.sequence > checkpoint.redo_folded_through) previous.frontier.end_offset else 0;
+    if (tail.end_offset < start or tail.end_offset > header.redo_log_capacity) return error.NativeRedoLogCorrupt;
+    const outcome = try redo_log.replayBufferedPrefix(allocator, file, io, header.redoOffset() + start, tail.end_offset - start, sealed_through, tail.sequence, checkpoint.commit_sequence, null, null);
+    const valid_end = start + outcome.valid_bytes;
+    const valid_sequence = outcome.last_sequence orelse sealed_through;
+    if (valid_sequence != tail.sequence or valid_end != tail.end_offset) {
+        const len: usize = @intCast(@min(@as(u64, redo_log.header_len), header.redo_log_capacity - valid_end));
+        const zeros: [redo_log.header_len]u8 = @splat(0);
+        try file.writePositionalAll(io, zeros[0..len], header.redoOffset() + valid_end);
+        var cut = tail;
+        cut.sequence = valid_sequence;
+        cut.end_offset = valid_end;
+        region.publishAppendedTail(cut);
+        region.noteCut();
+        if (valid_sequence <= sealed_through) return;
+    }
+    errdefer region.poisonSeal(@max(sealed_through, state.sealed_sequence));
+    if (policy) |durability| try antfly_platform.filesystem.syncData(file.handle, durability) else try file.sync(io);
+    const publication = try NativeFile.redoFrontierSlots(header).writeNext(file, io, previous, .{
+        .generation = outcome.generation orelse tail.salt,
+        .sequence = valid_sequence,
+        .end_offset = valid_end,
+        .segment = @intCast(tail.segment),
+    });
+    if (policy) |durability| try antfly_platform.filesystem.syncData(file.handle, durability) else try file.sync(io);
+    region.noteSyncedFrontier(publication.frontier.sequence, publication.frontier.generation, publication.frontier.end_offset, policy == .full_fsync);
+    var sealed_tail = tail;
+    sealed_tail.sequence = valid_sequence;
+    sealed_tail.end_offset = valid_end;
+    publishSealedLogState(region, sealed_tail, null);
+    region.noteSealed(valid_sequence);
+}
+
 fn recoverCrashedWriterRedoState(allocator: Allocator, io: std.Io, file: std.Io.File, header: Header, checkpoint: CheckpointSlot, region: *shared_lock_region.Region, policy: ?antfly_platform.filesystem.DurabilityPolicy) !void {
+    try sealOrCutDeadWriterTail(allocator, io, file, header, checkpoint, region, policy);
     const folded_through = checkpoint.redo_folded_through;
     const persisted = if (header.protected_redo)
         (try NativeFile.readDurableFrontier(allocator, file, io, header)) orelse return error.NativeRedoLogCorrupt
@@ -25342,8 +25732,9 @@ pub fn decodeHeader(raw: []const u8) !Header {
     if (!std.mem.eql(u8, header_raw[magic_offset..][0..magic.len], magic)) return error.InvalidNativeMagic;
 
     const version_word = std.mem.readInt(u32, header_raw[version_offset..][0..4], .little);
-    const version = version_word & ~(versioned_text_format_bit | sealed_redo_format_bit);
+    const version = version_word & ~(versioned_text_format_bit | sealed_redo_format_bit | sealed_tail_format_bit);
     const sealed_redo = version_word & sealed_redo_format_bit != 0;
+    const sealed_tail = version_word & sealed_tail_format_bit != 0;
     if (version != format_version and version != protected_redo_format_version and version != segmented_redo_format_version) return error.UnsupportedNativeFormatVersion;
 
     const encoded_header_size = std.mem.readInt(u32, header_raw[header_size_offset..][0..4], .little);
@@ -25377,7 +25768,7 @@ pub fn decodeHeader(raw: []const u8) !Header {
     const redo_capacity = std.mem.readInt(u64, header_raw[redo_log_capacity_offset..][0..8], .little);
     const segmented_redo = version == segmented_redo_format_version;
     const protected_redo = version == protected_redo_format_version or segmented_redo;
-    if (sealed_redo and !protected_redo) return error.UnsupportedNativeFormatVersion;
+    if ((sealed_redo or sealed_tail) and !protected_redo) return error.UnsupportedNativeFormatVersion;
     if (segmented_redo and redo_capacity > (std.math.maxInt(u64) - redo_offset) / 2) return error.InvalidNativeHeaderSize;
     if (protected_redo and (redo_capacity == 0 or redo_offset % page_size != 0 or
         redo_offset / page_size < reserved_header_pages + redo_frontier_page_count))
@@ -25394,6 +25785,7 @@ pub fn decodeHeader(raw: []const u8) !Header {
         .redo_log_capacity = redo_capacity,
         .protected_redo = protected_redo,
         .sealed_redo_required = sealed_redo,
+        .sealed_tail_required = sealed_tail,
         .segmented_redo = segmented_redo,
         .versioned_text_required = fenced,
         .versioned_text_fence_pending = migrated and header_raw[text_fence_synced_offset] == 0,
@@ -38534,6 +38926,8 @@ test "lite redo log cold open tolerates a corrupt-looking record at or past the 
 
 /// Full-log rescans by a stale same-process writer's refresh.
 var test_stale_writer_full_scans: u32 = 0;
+var test_seal_count: u32 = 0;
+var test_seal_barrier_completions: u32 = 0;
 var test_redo_resync_start: u64 = 0;
 var test_redo_recovery_start: u64 = 0;
 
@@ -38593,6 +38987,7 @@ fn writeLegacyRedoHeaderForTest(writer: *NativeFile, io: std.Io) !void {
     var legacy = writer.header;
     legacy.protected_redo = false;
     legacy.sealed_redo_required = false;
+    legacy.sealed_tail_required = false;
     legacy.segmented_redo = false;
     const file_size = (try writer.file.stat(io)).size;
     for (loadCheckpointSlots(writer.file, io, legacy.page_size, file_size), 0..) |slot, i| {
@@ -42384,6 +42779,378 @@ test "lite redo handoff replaces an unsealed deferred record despite a retained 
 test "lite redo trusted handoff checks and applies a foreign suffix" {
     try exerciseForeignRedoSuffix(false);
     try exerciseForeignRedoSuffix(true);
+}
+
+/// Appends `key` under a lease as a pipelined commit and releases the lease
+/// without any barrier: the commit is published, unsealed and unacknowledged.
+fn appendPipelinedForTest(file: *NativeFile, path: []const u8, key: []const u8, value: []const u8) !NativeFile.PendingSeal {
+    const a = std.testing.allocator;
+    var lease = try lockWriterPathWithIo(a, file.runtimeIo(), path);
+    defer lease.close();
+    try file.beginTransaction();
+    errdefer file.abortTransaction();
+    try file.putDocument(key, value);
+    try file.commitTransactionWithDurability(false, null);
+    return (try file.pendingSeal()) orelse error.TestUnexpectedResult;
+}
+
+fn openPipelinedForTest(path: []const u8) !NativeFile {
+    var file = try NativeFile.openWithIo(std.testing.allocator, std.testing.io, path, .{});
+    errdefer file.close();
+    try file.releaseWriterOwnership();
+    try file.enablePipelinedSeal();
+    return file;
+}
+
+fn sealedFrontierForTest(file: *NativeFile) !redo_log.Frontier {
+    return (try NativeFile.redoFrontierSlots(file.header).readLatest(file.file, file.runtimeIo())).?.frontier;
+}
+
+// lite-cross-process-commit-sealing.md §5.3: with no later writer, the
+// committer seals its own append, after releasing the lease.
+test "lite commit sealing: an idle pipelined append is sealed by its own waiter" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "seal-idle.aflite");
+    defer a.free(path);
+    {
+        var setup = try NativeFile.createWithRedoLog(a, io, path, .{}, 64 * 1024);
+        defer setup.close();
+        try setup.putDocument("before", "zero");
+    }
+    var file = try openPipelinedForTest(path);
+    defer file.close();
+    const pending = try appendPipelinedForTest(&file, path, "idle", "one");
+    // Appended and published, not durable: the lease went without a barrier.
+    const region = (try file.regionForInode()).?;
+    try std.testing.expectEqual(pending.sequence, region.readAppendedTail().?.sequence);
+    try std.testing.expect(region.sealState().sealed_sequence < pending.sequence);
+    try std.testing.expect((try sealedFrontierForTest(&file)).sequence < pending.sequence);
+
+    const seals = test_seal_count;
+    try file.sealThrough(pending.sequence, pending.cut_generation);
+    try std.testing.expectEqual(seals + 1, test_seal_count);
+    try std.testing.expectEqual(pending.sequence, (try sealedFrontierForTest(&file)).sequence);
+    // Other processes' readers see it once acknowledged, though no lease
+    // holder published it.
+    try std.testing.expectEqual(pending.sequence, region.readLogStateChecked().?.durable_sequence);
+    // Covered already: no second barrier.
+    try file.sealThrough(pending.sequence, pending.cut_generation);
+    try std.testing.expectEqual(seals + 1, test_seal_count);
+    file.settleSealed();
+    try std.testing.expect(try file.pendingSeal() == null);
+    try expectRedoDocument(&file, "idle", "one");
+
+    var reopened = try NativeFile.openWithIo(a, io, path, .{ .read_only = true });
+    defer reopened.close();
+    try expectRedoDocument(&reopened, "idle", "one");
+    try expectRedoDocument(&reopened, "before", "zero");
+}
+
+// §5.5: the next holder adopts a peer's published, unsealed tail without a
+// barrier; one seal then covers both processes' commits. The peer died
+// after releasing its lease, before sealing.
+test "lite commit sealing: a later holder adopts a dead peer's unsealed tail and one seal covers both" {
+    if (builtin.os.tag == .windows or builtin.single_threaded) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "seal-adopt.aflite");
+    defer a.free(path);
+    {
+        var setup = try NativeFile.createWithRedoLog(a, io, path, .{}, 64 * 1024);
+        defer setup.close();
+        try setup.putDocument("before", "zero");
+    }
+    var file = try openPipelinedForTest(path);
+    defer file.close();
+
+    const child = std.c.fork();
+    if (child == 0) {
+        var peer = openPipelinedForTest(path) catch std.c._exit(1);
+        const region = (peer.regionForInode() catch std.c._exit(2)) orelse std.c._exit(2);
+        region.reclaimLivenessAfterFork() catch std.c._exit(3);
+        _ = appendPipelinedForTest(&peer, path, "foreign", "one") catch std.c._exit(4);
+        std.c._exit(0);
+    }
+    try std.testing.expect(child > 0);
+    try std.testing.expectEqual(@as(c_int, 0), try crossProcessReapBounded(child, cross_process_fork_reap_timeout_ms));
+    const region = (try file.regionForInode()).?;
+    const foreign = region.readAppendedTail().?;
+    try std.testing.expect(region.sealState().sealed_sequence < foreign.sequence);
+
+    const seals = test_seal_count;
+    const pending = try appendPipelinedForTest(&file, path, "own", "two");
+    try std.testing.expectEqual(foreign.sequence + 1, pending.sequence);
+    // Adopting cost no barrier.
+    try std.testing.expectEqual(seals, test_seal_count);
+    try file.sealThrough(pending.sequence, pending.cut_generation);
+    try std.testing.expectEqual(seals + 1, test_seal_count);
+    try std.testing.expectEqual(pending.sequence, (try sealedFrontierForTest(&file)).sequence);
+
+    var reopened = try NativeFile.openWithIo(a, io, path, .{ .read_only = true });
+    defer reopened.close();
+    try expectRedoDocument(&reopened, "foreign", "one");
+    try expectRedoDocument(&reopened, "own", "two");
+}
+
+// §5.5: a published tail that no longer verifies (a power loss took its
+// bytes) is cut at the last valid record; a waiter from before the cut
+// cannot know its outcome.
+test "lite commit sealing: a torn published tail is cut and its waiter gets an unknown outcome" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "seal-cut.aflite");
+    defer a.free(path);
+    {
+        var setup = try NativeFile.createWithRedoLog(a, io, path, .{}, 64 * 1024);
+        defer setup.close();
+        try setup.putDocument("before", "zero");
+    }
+    var writer = try openPipelinedForTest(path);
+    defer writer.close();
+    _ = try appendPipelinedForTest(&writer, path, "kept", "one");
+    const torn_at = writer.header.redoOffset() + writer.redo.?.writer.tail;
+    const lost = try appendPipelinedForTest(&writer, path, "lost", "two");
+    const zeros: [redo_log.header_len]u8 = @splat(0);
+    try writer.file.writePositionalAll(io, &zeros, torn_at);
+
+    var successor = try openPipelinedForTest(path);
+    defer successor.close();
+    const region = (try successor.regionForInode()).?;
+    const cuts = region.sealState().cut_generation;
+    {
+        var lease = try lockWriterPathWithIo(a, io, path);
+        defer lease.close();
+        try successor.beginTransaction();
+        successor.abortTransaction();
+    }
+    try std.testing.expectEqual(cuts + 1, region.sealState().cut_generation);
+    try std.testing.expectEqual(lost.sequence - 1, region.readAppendedTail().?.sequence);
+    try std.testing.expectError(error.OutcomeUnknown, writer.sealThrough(lost.sequence, lost.cut_generation));
+    // The adopted record stays unacknowledged, and unread, until a seal.
+    const pending = try appendPipelinedForTest(&successor, path, "after", "three");
+    try successor.sealThrough(pending.sequence, pending.cut_generation);
+    successor.settleSealed();
+    try expectRedoDocument(&successor, "kept", "one");
+    try expectRedoDocument(&successor, "lost", null);
+    try expectRedoDocument(&successor, "after", "three");
+
+    var reopened = try NativeFile.openWithIo(a, io, path, .{ .read_only = true });
+    defer reopened.close();
+    try expectRedoDocument(&reopened, "kept", "one");
+    try expectRedoDocument(&reopened, "lost", null);
+    try expectRedoDocument(&reopened, "after", "three");
+}
+
+// §5.8: a failed seal barrier poisons the file for every handle. The
+// acknowledged prefix survives; nothing above it is acknowledged, and
+// nothing appends until a cold reopen.
+test "lite commit sealing: a failed seal barrier poisons every handle and keeps the acknowledged prefix" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "seal-poison.aflite");
+    defer a.free(path);
+    {
+        var setup = try NativeFile.createWithRedoLog(a, io, path, .{}, 64 * 1024);
+        defer setup.close();
+        try setup.putDocument("before", "zero");
+    }
+    {
+        var file = try openPipelinedForTest(path);
+        defer file.close();
+        var other = try openPipelinedForTest(path);
+        defer other.close();
+        const acked = try appendPipelinedForTest(&file, path, "acked", "one");
+        try file.sealThrough(acked.sequence, acked.cut_generation);
+        file.settleSealed();
+        const failed = try appendPipelinedForTest(&file, path, "unknown", "two");
+        file.test_fail_redo_sync = error.InputOutput;
+        try std.testing.expectError(error.InputOutput, file.sealThrough(failed.sequence, failed.cut_generation));
+        try std.testing.expectError(error.OutcomeUnknown, file.sealThrough(failed.sequence, failed.cut_generation));
+        try std.testing.expectError(error.OutcomeUnknown, other.sealThrough(failed.sequence, failed.cut_generation));
+        // At or below the prefix stays acknowledged.
+        try other.sealThrough(acked.sequence, acked.cut_generation);
+        var lease = try lockWriterPathWithIo(a, io, path);
+        defer lease.close();
+        try std.testing.expectError(error.OutcomeUnknown, other.beginTransaction());
+    }
+    var reopened = try NativeFile.openWithIo(a, io, path, .{ .read_only = true });
+    defer reopened.close();
+    try expectRedoDocument(&reopened, "acked", "one");
+}
+
+// §5.7: a fold seals every pipelined append before it replaces the log.
+test "lite commit sealing: a fold seals an adopted tail before replacing the log" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "seal-fold.aflite");
+    defer a.free(path);
+    {
+        var setup = try NativeFile.createWithRedoLog(a, io, path, .{}, 64 * 1024);
+        defer setup.close();
+        try setup.putDocument("before", "zero");
+    }
+    var writer = try openPipelinedForTest(path);
+    defer writer.close();
+    const pending = try appendPipelinedForTest(&writer, path, "folded", "one");
+    var folder = try openPipelinedForTest(path);
+    defer folder.close();
+    {
+        var lease = try lockWriterPathWithIo(a, io, path);
+        defer lease.close();
+        try folder.checkpointRedoLog();
+    }
+    const region = (try folder.regionForInode()).?;
+    try std.testing.expect(region.sealState().sealed_sequence >= pending.sequence);
+    try writer.sealThrough(pending.sequence, pending.cut_generation);
+
+    var reopened = try NativeFile.openWithIo(a, io, path, .{ .read_only = true });
+    defer reopened.close();
+    try expectRedoDocument(&reopened, "folded", "one");
+}
+
+const SealBoundary = enum {
+    before_tail_publish,
+    after_publish_holding_lease,
+    after_lease_release,
+    during_tail_publish,
+    after_seal_data_sync,
+    after_seal_frontier_write,
+    after_seal_frontier_sync,
+    during_takeover_after_adopt,
+};
+
+/// The child process's part: it dies at `boundary`.
+fn crashAtSealBoundary(path: []const u8, boundary: SealBoundary) noreturn {
+    var peer = openPipelinedForTest(path) catch std.c._exit(1);
+    const region = (peer.regionForInode() catch std.c._exit(2)) orelse std.c._exit(2);
+    region.reclaimLivenessAfterFork() catch std.c._exit(3);
+    switch (boundary) {
+        .before_tail_publish, .after_publish_holding_lease => {
+            var lease = lockWriterPathWithIo(std.testing.allocator, peer.runtimeIo(), path) catch std.c._exit(4);
+            _ = &lease;
+            if (boundary == .before_tail_publish) peer.test_seal_crash = .before_tail_publish;
+            peer.beginTransaction() catch std.c._exit(5);
+            peer.putDocument("child", "unacknowledged") catch std.c._exit(6);
+            peer.commitTransactionWithDurability(false, null) catch std.c._exit(7);
+            // Dies holding the lease, its tail published.
+            std.c._exit(0);
+        },
+        .after_lease_release => {
+            _ = appendPipelinedForTest(&peer, path, "child", "unacknowledged") catch std.c._exit(4);
+            std.c._exit(0);
+        },
+        .during_tail_publish => {
+            // Dies between filling the next tail slot and publishing it.
+            shared_lock_region.Region.test_tail_publish_crash = true;
+            _ = appendPipelinedForTest(&peer, path, "child", "unacknowledged") catch std.c._exit(4);
+            std.c._exit(9);
+        },
+        .after_seal_data_sync, .after_seal_frontier_write, .after_seal_frontier_sync => {
+            const pending = appendPipelinedForTest(&peer, path, "child", "unacknowledged") catch std.c._exit(4);
+            peer.test_seal_crash = switch (boundary) {
+                .after_seal_data_sync => .after_data_sync,
+                .after_seal_frontier_write => .after_frontier_write,
+                else => .after_frontier_sync,
+            };
+            peer.sealThrough(pending.sequence, pending.cut_generation) catch std.c._exit(5);
+            std.c._exit(8);
+        },
+        .during_takeover_after_adopt => {
+            var lease = lockWriterPathWithIo(std.testing.allocator, peer.runtimeIo(), path) catch std.c._exit(4);
+            _ = &lease;
+            peer.beginTransaction() catch std.c._exit(5);
+            std.c._exit(0);
+        },
+    }
+}
+
+// lite-cross-process-commit-sealing.md §6: a writer process killed at each
+// boundary from append to acknowledgement. Every acknowledged commit
+// survives, the file stays writable, and a later writer's commit and any
+// waiter whose records survived resolve.
+test "lite commit sealing: a writer killed at each boundary keeps every acknowledged commit" {
+    if (builtin.os.tag == .windows or builtin.single_threaded) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    for (std.enums.values(SealBoundary)) |boundary| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try testPath(a, tmp, "seal-boundary.aflite");
+        defer a.free(path);
+        {
+            var setup = try NativeFile.createWithRedoLog(a, io, path, .{}, 64 * 1024);
+            defer setup.close();
+            try setup.putDocument("before", "zero");
+        }
+        var file = try openPipelinedForTest(path);
+        defer file.close();
+        const acked = try appendPipelinedForTest(&file, path, "acked", "one");
+        try file.sealThrough(acked.sequence, acked.cut_generation);
+        file.settleSealed();
+        // A waiter in this process whose records the child adopts and dies
+        // holding.
+        const waiting: ?NativeFile.PendingSeal = if (boundary == .during_takeover_after_adopt)
+            try appendPipelinedForTest(&file, path, "waiting", "two")
+        else
+            null;
+
+        const child = std.c.fork();
+        if (child == 0) crashAtSealBoundary(path, boundary);
+        try std.testing.expect(child > 0);
+        try std.testing.expectEqual(@as(c_int, 0), try crossProcessReapBounded(child, cross_process_fork_reap_timeout_ms));
+
+        if (waiting) |pending| try file.sealThrough(pending.sequence, pending.cut_generation);
+        const region = (try file.regionForInode()).?;
+        // Never wedged: the interrupted publication left the last one whole.
+        if (boundary == .during_tail_publish) try std.testing.expectEqual(acked.sequence, region.readAppendedTail().?.sequence);
+        // The dead sealer's frontier is on the slot; only a completed
+        // barrier, with a matching proof and the watermark, may acknowledge it.
+        if (boundary == .after_seal_frontier_write or boundary == .after_seal_frontier_sync) {
+            const tail = region.readAppendedTail().?;
+            const completions = test_seal_barrier_completions;
+            try std.testing.expectEqual(NativeFile.SealProgress.sealed, try file.sealAppendedTail());
+            try std.testing.expectEqual(completions + 1, test_seal_barrier_completions);
+            const frontier = try sealedFrontierForTest(&file);
+            try std.testing.expectEqual(tail.sequence, frontier.sequence);
+            try std.testing.expect(region.hasSyncedFrontier(frontier.sequence, frontier.generation, frontier.end_offset, file.durability_policy == .full_fsync));
+            try std.testing.expectEqual(tail.sequence, region.readLogStateChecked().?.durable_sequence);
+            try std.testing.expect(region.sealState().sealed_sequence >= tail.sequence);
+        }
+        var next = try openPipelinedForTest(path);
+        defer next.close();
+        const after = try appendPipelinedForTest(&next, path, "after", "three");
+        try next.sealThrough(after.sequence, after.cut_generation);
+        next.settleSealed();
+
+        var reopened = try NativeFile.openWithIo(a, io, path, .{ .read_only = true });
+        defer reopened.close();
+        expectRedoDocument(&reopened, "before", "zero") catch |err| {
+            std.debug.print("boundary {s}\n", .{@tagName(boundary)});
+            return err;
+        };
+        try expectRedoDocument(&reopened, "acked", "one");
+        try expectRedoDocument(&reopened, "after", "three");
+        if (waiting != null) try expectRedoDocument(&reopened, "waiting", "two");
+        // A seal that completed in the child covered its commit.
+        if (boundary == .after_seal_frontier_write or boundary == .after_seal_frontier_sync) try expectRedoDocument(&reopened, "child", "unacknowledged");
+        // Never published, so never sealed.
+        if (boundary == .before_tail_publish or boundary == .during_tail_publish) try expectRedoDocument(&reopened, "child", null);
+    }
 }
 
 fn exerciseForeignRedoSuffix(damage: bool) !void {

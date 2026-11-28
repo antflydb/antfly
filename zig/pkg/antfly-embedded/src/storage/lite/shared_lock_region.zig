@@ -120,7 +120,13 @@ const magic: [8]u8 = "AFLLOCK1".*;
 // version mismatch always was -- including this one.
 // v6 serializes each WAL watermark publication with a crash-recoverable
 // owner word. Older writers cannot participate in this protocol.
-const format_version: u32 = 6;
+// v8 adds the commit-sealing block (`SealBlock`): a lease holder publishes
+// the redo it appended without syncing, and any process seals it. An older
+// binary treats this region as corrupt and can fall back to regionless
+// access, so the region version is not the fence: a file whose writers
+// pipeline carries the data file's sealed-tail format bit, which an older
+// binary refuses to open (native.zig `sealed_tail_format_bit`).
+const format_version: u32 = 8;
 
 /// Fixed size of the header itself. The header's own `region_bytes` and
 /// `max_readers` fields (not this constant) are the source of truth for
@@ -287,6 +293,72 @@ const Header = extern struct {
 
 comptime {
     std.debug.assert(@sizeOf(Header) == header_bytes);
+}
+
+/// The redo a lease holder appended and published without syncing: its
+/// run (log salt, reset generation, active segment) and its end.
+pub const AppendedTail = struct {
+    salt: u64,
+    reset_generation: u32,
+    segment: u32,
+    sequence: u64,
+    end_offset: u64,
+};
+
+pub const SealState = struct {
+    /// Bumped, and its futex woken, by every seal, cut and poison.
+    epoch: u32,
+    /// The highest commit sequence a synced frontier covers. Sequences are
+    /// global across folds and resets, so this never decreases.
+    sealed_sequence: u64,
+    cut_generation: u32,
+    /// 0, or 1 + the last sealed sequence once a barrier failed.
+    poison_sequence: u64,
+
+    pub fn poisoned(self: SealState) bool {
+        return self.poison_sequence != 0;
+    }
+};
+
+/// One published appended tail. `check` covers the fields and `stamp`, the
+/// publication number that selected this slot.
+const TailSlot = extern struct {
+    salt: std.atomic.Value(u64),
+    sequence: std.atomic.Value(u64),
+    end_offset: std.atomic.Value(u64),
+    reset_generation: std.atomic.Value(u32),
+    segment: std.atomic.Value(u32),
+    stamp: std.atomic.Value(u64),
+    check: std.atomic.Value(u64),
+
+    fn checksum(salt: u64, sequence: u64, end_offset: u64, reset_generation: u32, segment: u32, stamp: u64) u64 {
+        var hasher = std.hash.Wyhash.init(0x5ea1_7a11);
+        inline for (.{ salt, sequence, end_offset, @as(u64, reset_generation), @as(u64, segment), stamp }) |word| {
+            hasher.update(std.mem.asBytes(&word));
+        }
+        return hasher.final();
+    }
+};
+
+/// The commit-sealing extension, after the publication owner word.
+///
+/// The appended tail is double-buffered so a writer that dies mid-publish
+/// never leaves readers without a complete tuple: publication `n` fills
+/// slot `n & 1`, which no reader is directed to, and only then advances
+/// `tail_published` to `n`. The slot it leaves is publication `n - 1`,
+/// still whole. No state needs repair, and a reset is one store of zero.
+const SealBlock = extern struct {
+    /// The current publication number; 0 when none.
+    tail_published: std.atomic.Value(u64),
+    seal_epoch: std.atomic.Value(u32),
+    cut_generation: std.atomic.Value(u32),
+    sealed_sequence: std.atomic.Value(u64),
+    poison_sequence: std.atomic.Value(u64),
+    slots: [2]TailSlot,
+};
+
+comptime {
+    std.debug.assert(@sizeOf(SealBlock) == 128);
 }
 
 /// §8.3's fixed reader-slot layout: one per concurrent reader the region
@@ -1249,6 +1321,122 @@ pub const Region = struct {
         return publicationOwnerOffset(max_readers) + @sizeOf(std.atomic.Value(u128));
     }
 
+    fn sealBlockOffset(max_readers: u32) u64 {
+        return std.mem.alignForward(u64, publicationRegionBytes(max_readers), 64);
+    }
+
+    fn sealRegionBytes(max_readers: u32) u64 {
+        return sealBlockOffset(max_readers) + @sizeOf(SealBlock);
+    }
+
+    fn sealBlock(self: *const Region) *SealBlock {
+        return @ptrCast(@alignCast(self.mapping.ptr + @as(usize, @intCast(sealBlockOffset(self.header().max_readers)))));
+    }
+
+    /// Publishes the redo this lease holder appended, after its writes
+    /// returned and before anything syncs it. Lease holder only (a cut runs
+    /// under the lease too). A writer that dies anywhere in here leaves the
+    /// previous publication current and whole.
+    pub fn publishAppendedTail(self: *Region, tail: AppendedTail) void {
+        const block = self.sealBlock();
+        const next = block.tail_published.load(.acquire) +% 1;
+        const slot = &block.slots[@intCast(next & 1)];
+        slot.salt.store(tail.salt, .monotonic);
+        slot.sequence.store(tail.sequence, .monotonic);
+        slot.end_offset.store(tail.end_offset, .monotonic);
+        slot.reset_generation.store(tail.reset_generation, .monotonic);
+        slot.segment.store(tail.segment, .monotonic);
+        slot.stamp.store(next, .monotonic);
+        slot.check.store(TailSlot.checksum(tail.salt, tail.sequence, tail.end_offset, tail.reset_generation, tail.segment, next), .release);
+        if (builtin.is_test) if (test_tail_publish_crash) std.c._exit(0);
+        block.tail_published.store(next, .release);
+    }
+
+    /// Fork tests: the process exits after filling the next tail slot and
+    /// before publishing it.
+    pub var test_tail_publish_crash: bool = false;
+
+    /// The last published appended tail, or null before any. Retries only
+    /// while a live writer refills the slot it is reading.
+    pub fn readAppendedTail(self: *const Region) ?AppendedTail {
+        const block = self.sealBlock();
+        while (true) {
+            const published = block.tail_published.load(.acquire);
+            if (published == 0) return null;
+            const slot = &block.slots[@intCast(published & 1)];
+            const check = slot.check.load(.acquire);
+            const tail: AppendedTail = .{
+                .salt = slot.salt.load(.monotonic),
+                .reset_generation = slot.reset_generation.load(.monotonic),
+                .segment = slot.segment.load(.monotonic),
+                .sequence = slot.sequence.load(.monotonic),
+                .end_offset = slot.end_offset.load(.monotonic),
+            };
+            const stamp = slot.stamp.load(.monotonic);
+            if (stamp == published and check == TailSlot.checksum(tail.salt, tail.sequence, tail.end_offset, tail.reset_generation, tail.segment, stamp) and
+                block.tail_published.load(.acquire) == published)
+                return if (tail.sequence == 0) null else tail;
+            std.atomic.spinLoopHint();
+        }
+    }
+
+    pub fn sealState(self: *const Region) SealState {
+        const block = self.sealBlock();
+        // The epoch first: a waiter that sees no progress parks on it, and a
+        // seal bumps it after the state it announces.
+        const epoch = block.seal_epoch.load(.acquire);
+        return .{
+            .epoch = epoch,
+            .sealed_sequence = block.sealed_sequence.load(.acquire),
+            .cut_generation = block.cut_generation.load(.acquire),
+            .poison_sequence = block.poison_sequence.load(.acquire),
+        };
+    }
+
+    fn announceSeal(block: *SealBlock) void {
+        _ = block.seal_epoch.fetchAdd(1, .release);
+        futexWakeShared(&block.seal_epoch.raw);
+    }
+
+    /// A sealed frontier now covers `sequence`. Seal lock holder only.
+    pub fn noteSealed(self: *Region, sequence: u64) void {
+        const block = self.sealBlock();
+        _ = block.sealed_sequence.fetchMax(sequence, .acq_rel);
+        announceSeal(block);
+    }
+
+    /// A tail that failed verification was cut: waiters from before it
+    /// cannot know whether their records survived.
+    pub fn noteCut(self: *Region) void {
+        const block = self.sealBlock();
+        _ = block.cut_generation.fetchAdd(1, .acq_rel);
+        announceSeal(block);
+    }
+
+    /// A barrier failed: nothing above `sealed_prefix` is acknowledged, and
+    /// nothing appends or seals until a cold recovery.
+    pub fn poisonSeal(self: *Region, sealed_prefix: u64) void {
+        const block = self.sealBlock();
+        _ = block.poison_sequence.cmpxchgStrong(0, sealed_prefix + 1, .acq_rel, .acquire);
+        announceSeal(block);
+    }
+
+    /// Parks until the seal epoch moves past `epoch`, or `deadline`.
+    pub fn waitSealEpoch(self: *const Region, epoch: u32, deadline: Io.Timestamp) void {
+        antfly_platform.sync.futexWaitSharedBounded(self.io, &self.sealBlock().seal_epoch.raw, epoch, deadline) catch {};
+    }
+
+    /// The seal lock without waiting: the frontier barrier's process mutex
+    /// and byte lock. The kernel drops the byte lock with its holder.
+    pub fn tryLockFrontierBarrier(self: *Region) bool {
+        if (!self.fd_entry.frontier_barrier_mutex.tryLock()) return false;
+        if (!fcntlTryLock(self.fd_entry.fd, frontier_barrier_lock_offset, std.c.F.WRLCK)) {
+            self.fd_entry.frontier_barrier_mutex.unlock(self.io);
+            return false;
+        }
+        return true;
+    }
+
     fn publicationOwner(self: *const Region) *std.atomic.Value(u128) {
         return @ptrCast(@alignCast(self.mapping.ptr + @as(usize, @intCast(publicationOwnerOffset(self.header().max_readers)))));
     }
@@ -1697,7 +1885,7 @@ pub const Region = struct {
             try ensureNoLivePeer(io, fd_entry, &existing_raw, size);
         }
         if (need_init) {
-            const region_bytes = publicationRegionBytes(max_readers);
+            const region_bytes = sealRegionBytes(max_readers);
             // Rebuild from a clean slate: a corrupt region's leftover
             // reader-slot/liveness bytes are never trusted either, only
             // the header's own validity was checked above. `setLength(0)`
@@ -1750,11 +1938,23 @@ pub const Region = struct {
             const existing: *const Header = @ptrCast(@alignCast(&existing_raw));
             break :blk existing.max_readers;
         };
-        const map_len: usize = @intCast(publicationRegionBytes(final_max_readers));
+        const map_len: usize = @intCast(sealRegionBytes(final_max_readers));
         if (!need_init and size < map_len) try setup_file.setLength(io, map_len);
 
         const mapping = std.posix.mmap(null, map_len, .{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED }, raw_fd, 0) catch return RegionError.RegionUnavailable;
         errdefer std.posix.munmap(mapping);
+        // A poisoned seal or an unsealed tail outlives only the processes
+        // that shared it: with none left alive, cold recovery reads the
+        // file to its last sealed frontier, and appends resume.
+        if (!need_init) {
+            const block: *SealBlock = @ptrCast(@alignCast(mapping.ptr + @as(usize, @intCast(sealBlockOffset(final_max_readers)))));
+            if (block.poison_sequence.load(.acquire) != 0 or block.tail_published.load(.acquire) != 0) {
+                if (ensureNoLivePeer(io, fd_entry, &existing_raw, map_len)) |_| {
+                    block.poison_sequence.store(0, .release);
+                    block.tail_published.store(0, .release);
+                } else |_| {}
+            }
+        }
         // The lock and mapping are process coordination primitives. Use
         // system entropy even when the data file uses an I/O adapter.
         var nonce: u64 = undefined;
@@ -5852,6 +6052,52 @@ test "shared lock region: Header stays exactly header_bytes with the §9.3b WAL-
     try std.testing.expectEqual(@as(usize, 128), @sizeOf(Header));
 }
 
+test "shared lock region seal block publishes tails, seals, cuts and poison to every handle" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(io, &buf);
+    const db_path = try std.fmt.allocPrint(a, "{s}/region-seal.aflite", .{buf[0..dir_len]});
+    defer a.free(db_path);
+    var appender = try Region.open(a, io, db_path);
+    defer appender.close();
+    var sealer = try Region.open(a, io, db_path);
+    defer sealer.close();
+
+    try std.testing.expect(sealer.readAppendedTail() == null);
+    const tail: AppendedTail = .{ .salt = 9, .reset_generation = 2, .segment = 1, .sequence = 40, .end_offset = 4096 };
+    appender.publishAppendedTail(tail);
+    try std.testing.expectEqual(tail, sealer.readAppendedTail().?);
+
+    const before = appender.sealState();
+    try std.testing.expectEqual(@as(u64, 0), before.sealed_sequence);
+    try std.testing.expect(sealer.tryLockFrontierBarrier());
+    // One sealer at a time, through any handle.
+    try std.testing.expect(!appender.tryLockFrontierBarrier());
+    sealer.noteSealed(40);
+    sealer.unlockFrontierBarrier();
+    const sealed = appender.sealState();
+    try std.testing.expectEqual(@as(u64, 40), sealed.sealed_sequence);
+    try std.testing.expect(sealed.epoch != before.epoch);
+    // A wait past an epoch that already moved returns at once.
+    appender.waitSealEpoch(before.epoch, Io.Clock.now(.awake, io).addDuration(.fromSeconds(5)));
+    // Sealed never goes back.
+    sealer.noteSealed(30);
+    try std.testing.expectEqual(@as(u64, 40), appender.sealState().sealed_sequence);
+
+    sealer.noteCut();
+    try std.testing.expectEqual(sealed.cut_generation + 1, appender.sealState().cut_generation);
+    try std.testing.expect(!appender.sealState().poisoned());
+    sealer.poisonSeal(40);
+    // The first failure names the prefix; later ones keep it.
+    appender.poisonSeal(50);
+    try std.testing.expectEqual(@as(u64, 41), appender.sealState().poison_sequence);
+    try std.testing.expect(appender.tryLockFrontierBarrier());
+    appender.unlockFrontierBarrier();
+}
+
 test "shared lock region extends the publisher proof without invalidating existing WAL state" {
     const a = std.testing.allocator;
     const io = std.testing.io;
@@ -5889,7 +6135,7 @@ test "shared lock region extends the publisher proof without invalidating existi
     observer.noteSyncedFrontier(5, 7, 512, false);
     try std.testing.expect(observer.hasSyncedFrontier(5, 7, 512, true));
     const file: Io.File = .{ .handle = observer.fd_entry.fd, .flags = .{ .nonblocking = false } };
-    try std.testing.expectEqual(Region.publicationRegionBytes(observer.header().max_readers), (try file.stat(io)).size);
+    try std.testing.expectEqual(Region.sealRegionBytes(observer.header().max_readers), (try file.stat(io)).size);
     try std.testing.expect(!observer.isLogStateLive(state));
     {
         var publisher = try Region.open(a, io, db_path);

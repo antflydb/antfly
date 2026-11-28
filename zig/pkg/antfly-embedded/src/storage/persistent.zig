@@ -2471,6 +2471,8 @@ pub const PersistentIndex = struct {
             .native_catalog => |backend| backend,
             else => return error.UnsupportedRefresh,
         };
+        // Runs once the storage lock is released.
+        defer self.version_locations.settle(self.alloc);
         self.lockStorage();
         defer self.unlockStorage();
         // An inline write staged since preparation may still be waiting to
@@ -2505,22 +2507,13 @@ pub const PersistentIndex = struct {
     /// After a delta published: the lookup detaches the segments the delta
     /// retired, by id from its own list, and attaches the indexes it built
     /// for segments still served. Each is O(1); their versions are routed
-    /// in and out in bounded steps (`VersionLocations.advanceLocked`).
+    /// in and out in bounded steps (`VersionLocations.advanceLocked`),
+    /// which `installPeerDelta` settles once it holds no lock.
     fn installVersionColumns(self: *PersistentIndex, prepared: *PreparedPeerDelta) void {
         const locations = &self.version_locations;
         @import("antfly_platform").sync.lockYielding(&locations.mutex);
         defer locations.mutex.unlock();
-        for (prepared.removed) |seg_id| locations.detachLocked(self.alloc, seg_id) catch {
-            // Cannot queue it: drop the lookup, which rebuilds on demand.
-            locations.destroyAll(self.alloc);
-            locations.route.clearRetainingCapacity();
-            locations.segments.clearRetainingCapacity();
-            locations.pending.clearRetainingCapacity();
-            locations.retiring.clearRetainingCapacity();
-            locations.pending_cursor = 0;
-            locations.retiring_cursor = 0;
-            return;
-        };
+        for (prepared.removed) |seg_id| locations.detachLocked(self.alloc, seg_id);
         const snap = @atomicLoad(*index_mod.IndexSnapshot, &self.writer.current, .acquire);
         for (prepared.columns.items) |*column| {
             const index = column.index orelse continue;
@@ -5430,17 +5423,22 @@ pub const PersistentIndex = struct {
     pub const VersionLocations = struct {
         mutex: std.atomic.Mutex = .unlocked,
         /// Where each routed version sits: one probe per death.
-        route: std.AutoHashMapUnmanaged(u64, Location) = .empty,
-        /// Indexed segments. One attached by a refresh joins `route` in
-        /// bounded steps (`pending`, looked up through its own index until
+        route: RouteMap = .{},
+        /// Attached segments, by id. One attached by a refresh joins `route`
+        /// in bounded steps (`pending`, looked up through its own index until
         /// then), and a detached one leaves it the same way (`retiring`), so
         /// attaching or detaching costs the same whatever the segment's
-        /// size, and no lock holder routes more than `step_budget` versions.
+        /// size, and no lock holder walks more than `step_budget` versions.
+        /// Each queue removes a segment in O(1), wherever it is.
         segments: std.AutoHashMapUnmanaged(u64, *SegmentVersions) = .empty,
-        pending: std.ArrayListUnmanaged(u64) = .empty,
-        pending_cursor: usize = 0,
-        retiring: std.ArrayListUnmanaged(*SegmentVersions) = .empty,
-        retiring_cursor: usize = 0,
+        pending: std.DoublyLinkedList = .{},
+        /// Column entries `pending` has yet to route.
+        pending_versions: usize = 0,
+        routed: std.DoublyLinkedList = .{},
+        /// Routed segments moving into a replacement table, while the
+        /// table it replaced still answers for them.
+        rerouting: std.DoublyLinkedList = .{},
+        retiring: std.DoublyLinkedList = .{},
         /// Versions a committed death named before their level-0 segment was
         /// installed (a later commit's install ran first). The segment's
         /// install takes them.
@@ -5449,19 +5447,72 @@ pub const PersistentIndex = struct {
         const Location = struct { seg_id: u64, local_id: u32 };
         const step_budget = 4096;
 
+        /// `version` → location, in tables no lock holder grows: one that
+        /// runs out of room, or fills with tombstones, is replaced by a
+        /// table allocated outside the lock (`grow`), and the routed
+        /// segments move over in bounded steps while the old one answers
+        /// for them.
+        pub const RouteMap = struct {
+            const Map = std.AutoHashMapUnmanaged(u64, Location);
+            live: Map = .empty,
+            /// Removals from `live`: tombstones, which lengthen its misses.
+            live_removed: usize = 0,
+            old: Map = .empty,
+            /// Capacity the next table needs; 0 while none is wanted.
+            wanted: usize = 0,
+            /// Bumped by every swap: see `SegmentVersions.table`.
+            generation: u32 = 0,
+
+            fn get(self: *const RouteMap, version: u64) ?Location {
+                return self.live.get(version) orelse self.old.get(version);
+            }
+
+            /// Removes `version`'s route if it names `seg_id`.
+            fn removeIf(self: *RouteMap, version: u64, seg_id: u64) void {
+                if (self.live.get(version)) |location| if (location.seg_id == seg_id) {
+                    _ = self.live.remove(version);
+                    self.live_removed += 1;
+                };
+                if (self.old.get(version)) |location| if (location.seg_id == seg_id) {
+                    _ = self.old.remove(version);
+                };
+            }
+
+            fn deinit(self: *RouteMap, alloc: Allocator) void {
+                self.live.deinit(alloc);
+                self.old.deinit(alloc);
+                self.* = .{};
+            }
+        };
+
         pub const SegmentVersions = struct {
             seg_id: u64,
             /// Local order: routes it in, and later out.
             column: []u64,
             /// Until routed: lookups for a pending segment.
             by_version: std.AutoHashMapUnmanaged(u64, u32) = .empty,
+            node: std.DoublyLinkedList.Node = .{},
+            queue: Queue = .pending,
+            /// The route table generation its entries belong to. A routed
+            /// segment from an older generation is rerouting, and a pending
+            /// one restarts, so a swap retags nothing.
+            table: u32 = 0,
+            /// Column entries its queue has walked: rerouting walks down
+            /// from a routed segment's end, so a whole table's segments
+            /// start rerouting in O(1).
+            cursor: usize = 0,
+
+            const Queue = enum { pending, routed, retiring };
 
             /// Decodes the column; `indexed` also builds the lookup a
             /// pending segment answers through. Needs no lock.
             fn build(alloc: Allocator, segment: *const index_mod.SegmentEntry, indexed: bool) !*SegmentVersions {
                 const column = (try segment.reader.docVersionsAlloc(alloc)) orelse try alloc.alloc(u64, 0);
-                errdefer alloc.free(column);
-                const index = try alloc.create(SegmentVersions);
+                const index = alloc.create(SegmentVersions) catch |err| {
+                    alloc.free(column);
+                    return err;
+                };
+                // The index owns the column from here.
                 index.* = .{ .seg_id = segment.id, .column = column };
                 errdefer index.destroy(alloc);
                 if (indexed) {
@@ -5471,6 +5522,10 @@ pub const PersistentIndex = struct {
                     }
                 }
                 return index;
+            }
+
+            fn of(node: *std.DoublyLinkedList.Node) *SegmentVersions {
+                return @fieldParentPtr("node", node);
             }
 
             fn destroy(self: *SegmentVersions, alloc: Allocator) void {
@@ -5483,117 +5538,224 @@ pub const PersistentIndex = struct {
         /// Where `version` sits among `snap`'s segments other than
         /// `excluded`. A merge carries versions into its output, so a route
         /// may name a retired input; the output is then pending or routed.
+        /// A miss probes each pending segment, which `settle` keeps few.
         fn lookupLocked(self: *const VersionLocations, snap: *const index_mod.IndexSnapshot, version: u64, excluded: []const u64) !?Location {
             if (self.route.get(version)) |location| {
                 if ((try snap.segmentIndex(location.seg_id)) != null and std.mem.indexOfScalar(u64, excluded, location.seg_id) == null) return location;
             }
-            for (self.pending.items) |seg_id| {
-                const index = self.segments.get(seg_id) orelse continue;
+            var node = self.pending.first;
+            while (node) |n| : (node = n.next) {
+                const index = SegmentVersions.of(n);
                 const local = index.by_version.get(version) orelse continue;
-                if ((try snap.segmentIndex(seg_id)) != null and std.mem.indexOfScalar(u64, excluded, seg_id) == null) return .{ .seg_id = seg_id, .local_id = local };
+                if ((try snap.segmentIndex(index.seg_id)) != null and std.mem.indexOfScalar(u64, excluded, index.seg_id) == null) return .{ .seg_id = index.seg_id, .local_id = local };
             }
             return null;
         }
 
-        /// O(1): routing follows in `advanceLocked`. On error the caller
+        /// O(1): routing follows in `advanceLocked`, and `index` must carry
+        /// its pending lookup (`build` with `indexed`). On error the caller
         /// still owns `index`.
         fn attachLocked(self: *VersionLocations, alloc: Allocator, index: *SegmentVersions) !void {
-            try self.pending.ensureUnusedCapacity(alloc, 1);
             const slot = try self.segments.getOrPut(alloc, index.seg_id);
             if (slot.found_existing) return error.InvalidSegment;
             slot.value_ptr.* = index;
-            self.pending.appendAssumeCapacity(index.seg_id);
+            index.queue = .pending;
+            index.table = self.route.generation;
+            index.cursor = 0;
+            self.pending.append(&index.node);
+            self.pending_versions += index.column.len;
         }
 
-        /// Attaches and routes now: for a caller already decoding the
-        /// segment under this lock. On error the caller still owns `index`.
-        fn attachRoutedLocked(self: *VersionLocations, alloc: Allocator, index: *SegmentVersions) !void {
-            try self.route.ensureUnusedCapacity(alloc, @intCast(index.column.len));
-            try self.segments.put(alloc, index.seg_id, index);
-            for (index.column, 0..) |version, local| {
-                if (version != 0) self.route.putAssumeCapacity(version, .{ .seg_id = index.seg_id, .local_id = @intCast(local) });
-            }
-        }
-
-        /// O(pending): unrouting follows in `advanceLocked`.
-        fn detachLocked(self: *VersionLocations, alloc: Allocator, seg_id: u64) !void {
-            try self.retiring.ensureUnusedCapacity(alloc, 1);
+        /// O(1): unrouting follows in `advanceLocked`.
+        fn detachLocked(self: *VersionLocations, alloc: Allocator, seg_id: u64) void {
             const index = (self.segments.fetchRemove(seg_id) orelse return).value;
-            if (std.mem.indexOfScalar(u64, self.pending.items, seg_id)) |at| {
-                _ = self.pending.orderedRemove(at);
-                if (at == 0) self.pending_cursor = 0;
+            switch (index.queue) {
+                .pending => {
+                    self.pending.remove(&index.node);
+                    self.pending_versions -= index.column.len - index.cursor;
+                },
+                .routed => if (index.table == self.route.generation) self.routed.remove(&index.node) else self.rerouting.remove(&index.node),
+                .retiring => unreachable,
             }
-            self.retiring.appendAssumeCapacity(index);
+            index.by_version.clearAndFree(alloc);
+            index.queue = .retiring;
+            index.cursor = 0;
+            self.retiring.append(&index.node);
         }
 
-        /// At most `step_budget` versions of routing and unrouting.
+        /// At most `step_budget` column entries of routing and unrouting.
+        /// Retirement gets half before routing starts and whatever routing
+        /// leaves; a segment finishing costs one entry, so empty columns
+        /// are bounded too. Never allocates a route table: routing that
+        /// needs one waits for `grow`.
         fn advanceLocked(self: *VersionLocations, alloc: Allocator) void {
             var budget: usize = step_budget;
-            while (budget != 0 and self.pending.items.len != 0) {
-                const index = self.segments.get(self.pending.items[0]) orelse {
-                    _ = self.pending.orderedRemove(0);
-                    self.pending_cursor = 0;
-                    continue;
+            budget -= self.retireLocked(alloc, step_budget / 2);
+            budget -= self.rerouteLocked(alloc, budget);
+            budget -= self.routeLocked(alloc, budget);
+            _ = self.retireLocked(alloc, budget);
+        }
+
+        fn retireLocked(self: *VersionLocations, alloc: Allocator, budget: usize) usize {
+            var left = budget;
+            while (left != 0) {
+                const index = SegmentVersions.of(self.retiring.first orelse break);
+                const end = @min(index.column.len, index.cursor + left);
+                left -= end - index.cursor;
+                while (index.cursor < end) : (index.cursor += 1) self.route.removeIf(index.column[index.cursor], index.seg_id);
+                if (index.cursor != index.column.len) break;
+                self.retiring.remove(&index.node);
+                index.destroy(alloc);
+                if (left != 0) left -= 1;
+            }
+            return budget - left;
+        }
+
+        /// Moves routed segments into the table that replaced theirs,
+        /// keeping each entry the old table holds for the segment. Room
+        /// was reserved for all of them when the table was swapped in.
+        fn rerouteLocked(self: *VersionLocations, alloc: Allocator, budget: usize) usize {
+            var left = budget;
+            while (left != 0) {
+                const index = SegmentVersions.of(self.rerouting.first orelse break);
+                const start = index.cursor - @min(index.cursor, left);
+                left -= index.cursor - start;
+                while (index.cursor > start) {
+                    index.cursor -= 1;
+                    const version = index.column[index.cursor];
+                    const location = self.route.old.get(version) orelse continue;
+                    if (location.seg_id != index.seg_id or self.route.live.available == 0) continue;
+                    self.route.live.putAssumeCapacity(version, location);
+                }
+                if (index.cursor != 0) break;
+                self.rerouting.remove(&index.node);
+                index.table = self.route.generation;
+                index.cursor = index.column.len;
+                self.routed.append(&index.node);
+                if (left != 0) left -= 1;
+            }
+            if (self.rerouting.first == null and self.route.old.capacity() != 0) {
+                self.route.old.deinit(alloc);
+                self.route.old = .empty;
+            }
+            return budget - left;
+        }
+
+        fn routeLocked(self: *VersionLocations, alloc: Allocator, budget: usize) usize {
+            // Waits for rerouting, so the old table frees first and the
+            // new one keeps the room reserved for it.
+            if (self.route.old.capacity() != 0) return 0;
+            var left = budget;
+            while (left != 0) {
+                const index = SegmentVersions.of(self.pending.first orelse break);
+                // Its routed part was in a replaced table: restart.
+                if (index.table != self.route.generation) {
+                    self.pending_versions += index.cursor;
+                    index.cursor = 0;
+                    index.table = self.route.generation;
+                }
+                const room: usize = self.route.live.available;
+                const end = @min(index.column.len, index.cursor + @min(left, room));
+                left -= end - index.cursor;
+                self.pending_versions -= end - index.cursor;
+                while (index.cursor < end) : (index.cursor += 1) {
+                    const version = index.column[index.cursor];
+                    if (version != 0) self.route.live.putAssumeCapacity(version, .{ .seg_id = index.seg_id, .local_id = @intCast(index.cursor) });
+                }
+                if (index.cursor != index.column.len) {
+                    if (self.route.live.available == 0) self.wantTableLocked();
+                    break;
+                }
+                index.by_version.clearAndFree(alloc);
+                self.pending.remove(&index.node);
+                index.queue = .routed;
+                self.routed.append(&index.node);
+                if (left != 0) left -= 1;
+            }
+            // Tombstones lengthen every miss: rebuild once they dominate.
+            if (self.route.live_removed > self.route.live.capacity() / 2) self.wantTableLocked();
+            return budget - left;
+        }
+
+        fn wantTableLocked(self: *VersionLocations) void {
+            self.route.wanted = 2 * (self.route.live.count() + self.pending_versions) + step_budget;
+        }
+
+        /// Swaps in `table`, allocated outside the lock, in O(1): routed
+        /// segments reroute into it in bounded steps, and pending ones
+        /// restart when next routed, since their routed part sits in the
+        /// table being replaced. The generation marks both.
+        fn swapTableLocked(self: *VersionLocations, table: *RouteMap.Map) void {
+            std.debug.assert(self.route.old.capacity() == 0 and self.rerouting.first == null);
+            self.route.old = self.route.live;
+            self.route.live = table.*;
+            table.* = .empty;
+            self.route.live_removed = 0;
+            self.route.wanted = 0;
+            self.rerouting = self.routed;
+            self.routed = .{};
+            self.route.generation +%= 1;
+        }
+
+        /// Routes and unroutes everything queued, one bounded step per lock
+        /// hold, allocating any table the route asks for between holds.
+        /// For a caller holding no lock, after attaching or detaching.
+        fn settle(self: *VersionLocations, alloc: Allocator) void {
+            while (true) {
+                const wanted = wanted: {
+                    @import("antfly_platform").sync.lockYielding(&self.mutex);
+                    defer self.mutex.unlock();
+                    self.advanceLocked(alloc);
+                    if (self.route.wanted == 0 and self.pending.first == null and self.rerouting.first == null and self.retiring.first == null) return;
+                    break :wanted self.route.wanted;
                 };
-                const start = self.pending_cursor;
-                const end = @min(index.column.len, start + budget);
-                self.route.ensureUnusedCapacity(alloc, @intCast(end - start)) catch return;
-                while (self.pending_cursor < end) : (self.pending_cursor += 1) {
-                    const version = index.column[self.pending_cursor];
-                    if (version != 0) self.route.putAssumeCapacity(version, .{ .seg_id = index.seg_id, .local_id = @intCast(self.pending_cursor) });
-                }
-                budget -= end - start;
-                if (self.pending_cursor == index.column.len) {
-                    index.by_version.clearAndFree(alloc);
-                    _ = self.pending.orderedRemove(0);
-                    self.pending_cursor = 0;
-                }
+                if (wanted != 0) self.grow(alloc, wanted) catch return;
             }
-            while (budget != 0 and self.retiring.items.len != 0) {
-                const index = self.retiring.items[0];
-                const start = self.retiring_cursor;
-                const end = @min(index.column.len, start + budget);
-                while (self.retiring_cursor < end) : (self.retiring_cursor += 1) {
-                    const version = index.column[self.retiring_cursor];
-                    if (self.route.get(version)) |location| if (location.seg_id == index.seg_id) {
-                        _ = self.route.remove(version);
-                    };
-                }
-                budget -= end - start;
-                if (self.retiring_cursor == index.column.len) {
-                    index.destroy(alloc);
-                    _ = self.retiring.orderedRemove(0);
-                    self.retiring_cursor = 0;
-                }
-            }
+        }
+
+        /// Allocates a route table of `capacity` outside the lock and swaps
+        /// it in if one is still wanted.
+        fn grow(self: *VersionLocations, alloc: Allocator, capacity: usize) !void {
+            var table: RouteMap.Map = .empty;
+            defer table.deinit(alloc);
+            try table.ensureTotalCapacity(alloc, std.math.cast(RouteMap.Map.Size, capacity) orelse return error.OutOfMemory);
+            @import("antfly_platform").sync.lockYielding(&self.mutex);
+            defer self.mutex.unlock();
+            if (self.route.wanted == 0 or self.route.old.capacity() != 0) return;
+            // Rerouting needs a slot for every route: grown since asking.
+            if (table.available < self.route.live.count()) return self.wantTableLocked();
+            self.swapTableLocked(&table);
+        }
+
+        /// Drops everything; lookups rebuild on demand.
+        fn resetLocked(self: *VersionLocations, alloc: Allocator) void {
+            self.destroyAll(alloc);
+            self.route.deinit(alloc);
+            self.segments.clearAndFree(alloc);
+            self.pending = .{};
+            self.pending_versions = 0;
+            self.routed = .{};
+            self.rerouting = .{};
+            self.retiring = .{};
         }
 
         fn clear(self: *VersionLocations, alloc: Allocator) void {
             @import("antfly_platform").sync.lockYielding(&self.mutex);
             defer self.mutex.unlock();
-            self.destroyAll(alloc);
-            self.route.clearAndFree(alloc);
-            self.segments.clearAndFree(alloc);
-            self.pending.clearAndFree(alloc);
-            self.retiring.clearAndFree(alloc);
-            self.pending_cursor = 0;
-            self.retiring_cursor = 0;
+            self.resetLocked(alloc);
             self.parked.clearAndFree(alloc);
         }
 
         fn deinit(self: *VersionLocations, alloc: Allocator) void {
-            self.destroyAll(alloc);
-            self.route.deinit(alloc);
+            self.resetLocked(alloc);
             self.segments.deinit(alloc);
-            self.pending.deinit(alloc);
-            self.retiring.deinit(alloc);
             self.parked.deinit(alloc);
         }
 
         fn destroyAll(self: *VersionLocations, alloc: Allocator) void {
             var it = self.segments.valueIterator();
             while (it.next()) |index| index.*.destroy(alloc);
-            for (self.retiring.items) |index| index.destroy(alloc);
+            while (self.retiring.popFirst()) |node| SegmentVersions.of(node).destroy(alloc);
         }
     };
 
@@ -5610,47 +5772,85 @@ pub const PersistentIndex = struct {
 
     fn installDeadVersionsOrError(self: *PersistentIndex, versions: []const u64) !void {
         const locations = &self.version_locations;
-        @import("antfly_platform").sync.lockYielding(&locations.mutex);
-        defer locations.mutex.unlock();
-        locations.advanceLocked(self.alloc);
         const snap = self.writer.acquireSnapshot();
         defer snap.release();
         // Parked deaths outlive only the publications they wait for.
         const pending = self.inline_segments_pending.load(.acquire) != 0;
-        if (!pending and locations.parked.count() != 0) locations.parked.clearRetainingCapacity();
-        var refreshed = false;
-        for (versions) |version| {
-            var location = try locations.lookupLocked(snap, version, &.{});
-            if (location == null and !refreshed) {
-                try self.indexVersionLocationsLocked(snap);
-                refreshed = true;
-                location = try locations.lookupLocked(snap, version, &.{});
+        var missed = std.ArrayListUnmanaged(u64).empty;
+        defer missed.deinit(self.alloc);
+        var unindexed = std.ArrayListUnmanaged(u64).empty;
+        defer unindexed.deinit(self.alloc);
+        {
+            @import("antfly_platform").sync.lockYielding(&locations.mutex);
+            defer locations.mutex.unlock();
+            locations.advanceLocked(self.alloc);
+            if (!pending and locations.parked.count() != 0) locations.parked.clearRetainingCapacity();
+            for (versions) |version| {
+                // A dead version keeps its route: marking it again changes
+                // nothing.
+                const found = (try locations.lookupLocked(snap, version, &.{})) orelse {
+                    try missed.append(self.alloc, version);
+                    continue;
+                };
+                try self.writer.applyCommittedDeletes(found.seg_id, &.{found.local_id});
             }
-            const found = location orelse {
+            if (missed.items.len == 0) return;
+            for (snap.segments) |*segment| {
+                if (!locations.segments.contains(segment.id)) try unindexed.append(self.alloc, segment.id);
+            }
+        }
+        // Runs once the lock below is released.
+        defer locations.settle(self.alloc);
+        var built = try self.buildVersionLocations(snap, unindexed.items);
+        defer {
+            for (built.items) |index| if (index) |owned| owned.destroy(self.alloc);
+            built.deinit(self.alloc);
+        }
+        @import("antfly_platform").sync.lockYielding(&locations.mutex);
+        defer locations.mutex.unlock();
+        try self.attachVersionLocationsLocked(built.items);
+        for (missed.items) |version| {
+            const found = (try locations.lookupLocked(snap, version, &.{})) orelse {
                 if (pending) try locations.parked.put(self.alloc, version, {});
                 continue;
             };
-            // A dead version keeps its route: marking it again changes
-            // nothing.
             try self.writer.applyCommittedDeletes(found.seg_id, &.{found.local_id});
         }
     }
 
-    /// Indexes every served segment not yet indexed, routing it at once:
-    /// this caller decodes the segment under the lock regardless. Segments
-    /// no longer served leave in bounded steps.
-    fn indexVersionLocationsLocked(self: *PersistentIndex, snap: *const index_mod.IndexSnapshot) !void {
+    /// Decodes each of `seg_ids` in `snap`, with the lookup a pending
+    /// segment answers through. Holds no lock: this is segment-sized work.
+    fn buildVersionLocations(self: *PersistentIndex, snap: *const index_mod.IndexSnapshot, seg_ids: []const u64) !std.ArrayListUnmanaged(?*VersionLocations.SegmentVersions) {
+        var built = std.ArrayListUnmanaged(?*VersionLocations.SegmentVersions).empty;
+        errdefer {
+            for (built.items) |index| if (index) |owned| owned.destroy(self.alloc);
+            built.deinit(self.alloc);
+        }
+        try built.ensureTotalCapacity(self.alloc, seg_ids.len);
+        for (seg_ids) |seg_id| {
+            const position = (try snap.segmentIndex(seg_id)) orelse continue;
+            built.appendAssumeCapacity(try VersionLocations.SegmentVersions.build(self.alloc, &snap.segments[position], true));
+        }
+        return built;
+    }
+
+    /// Detaches every segment the current snapshot no longer serves and
+    /// attaches each of `built` not attached since it was decoded, taking
+    /// it out of the list. O(segments): versions move in bounded steps.
+    fn attachVersionLocationsLocked(self: *PersistentIndex, built: []?*VersionLocations.SegmentVersions) !void {
         const locations = &self.version_locations;
+        const current = self.writer.acquireSnapshot();
+        defer current.release();
         var retired = std.ArrayListUnmanaged(u64).empty;
         defer retired.deinit(self.alloc);
         var indexed_it = locations.segments.keyIterator();
-        while (indexed_it.next()) |seg_id| if ((try snap.segmentIndex(seg_id.*)) == null) try retired.append(self.alloc, seg_id.*);
-        for (retired.items) |seg_id| try locations.detachLocked(self.alloc, seg_id);
-        for (snap.segments) |*segment| {
-            if (locations.segments.contains(segment.id)) continue;
-            const index = try VersionLocations.SegmentVersions.build(self.alloc, segment, false);
-            errdefer index.destroy(self.alloc);
-            try locations.attachRoutedLocked(self.alloc, index);
+        while (indexed_it.next()) |seg_id| if ((try current.segmentIndex(seg_id.*)) == null) try retired.append(self.alloc, seg_id.*);
+        for (retired.items) |seg_id| locations.detachLocked(self.alloc, seg_id);
+        for (built) |*slot| {
+            const index = slot.* orelse continue;
+            if (locations.segments.contains(index.seg_id) or (try current.segmentIndex(index.seg_id)) == null) continue;
+            try locations.attachLocked(self.alloc, index);
+            slot.* = null;
         }
     }
 
@@ -10632,36 +10832,166 @@ fn refreshFromChangesForTest(index: *PersistentIndex) !PersistentIndex.ChangeRef
 // in bounded steps, answering through its own index until then, and a
 // detached one leaves the routes the same way: no lock holder does more than
 // one step.
+fn versionLocationsTestSegment(alloc: Allocator, seg_id: u64, first: u64, count: usize) !*PersistentIndex.VersionLocations.SegmentVersions {
+    const column = try alloc.alloc(u64, count);
+    const index = alloc.create(PersistentIndex.VersionLocations.SegmentVersions) catch |err| {
+        alloc.free(column);
+        return err;
+    };
+    index.* = .{ .seg_id = seg_id, .column = column };
+    errdefer index.destroy(alloc);
+    for (index.column, 0..) |*version, i| version.* = first + i;
+    try index.by_version.ensureTotalCapacity(alloc, @intCast(count));
+    for (index.column, 0..) |version, i| index.by_version.putAssumeCapacity(version, @intCast(i));
+    return index;
+}
+
+fn attachVersionLocationsTestSegment(alloc: Allocator, locations: *PersistentIndex.VersionLocations, seg_id: u64, first: u64, count: usize) !void {
+    const index = try versionLocationsTestSegment(alloc, seg_id, first, count);
+    locations.attachLocked(alloc, index) catch |err| {
+        index.destroy(alloc);
+        return err;
+    };
+}
+
 test "persistent index version routes move in bounded steps" {
+    const alloc = std.testing.allocator;
+    const VersionLocations = PersistentIndex.VersionLocations;
+    const budget = VersionLocations.step_budget;
+    var locations: VersionLocations = .{};
+    defer locations.deinit(alloc);
+    const count = 10_000;
+    try attachVersionLocationsTestSegment(alloc, &locations, 7, 1000, count);
+
+    // No lock holder allocates a route table: routing waits for one, and
+    // the pending segment answers through its own index meanwhile.
+    locations.advanceLocked(alloc);
+    try std.testing.expectEqual(@as(u32, 0), locations.route.live.capacity());
+    try std.testing.expect(locations.route.wanted != 0);
+    try std.testing.expect(locations.route.get(1000) == null);
+    try std.testing.expectEqual(@as(u32, count - 1), locations.segments.get(7).?.by_version.get(1000 + count - 1).?);
+    try locations.grow(alloc, locations.route.wanted);
+    try std.testing.expectEqual(@as(usize, 0), locations.route.wanted);
+    const capacity = locations.route.live.capacity();
+    locations.advanceLocked(alloc);
+    try std.testing.expectEqual(@as(u32, budget), locations.route.live.count());
+    try std.testing.expectEqual(@as(u32, 0), locations.route.get(1000).?.local_id);
+    try std.testing.expect(locations.route.get(1000 + count - 1) == null);
+    while (locations.pending.first != null) locations.advanceLocked(alloc);
+    try std.testing.expectEqual(capacity, locations.route.live.capacity());
+    try std.testing.expectEqual(@as(u32, count), locations.route.live.count());
+    try std.testing.expectEqual(@as(usize, 0), locations.segments.get(7).?.by_version.count());
+
+    // A replacement table: routed segments move into it in bounded steps
+    // while the table it replaced answers for them.
+    var table: VersionLocations.RouteMap.Map = .empty;
+    defer table.deinit(alloc);
+    try table.ensureTotalCapacity(alloc, 4 * count);
+    locations.swapTableLocked(&table);
+    try std.testing.expectEqual(@as(u32, 0), locations.route.live.count());
+    try std.testing.expectEqual(@as(u32, count - 1), locations.route.get(1000 + count - 1).?.local_id);
+    locations.advanceLocked(alloc);
+    try std.testing.expectEqual(@as(u32, budget), locations.route.live.count());
+    while (locations.rerouting.first != null) locations.advanceLocked(alloc);
+    try std.testing.expectEqual(@as(u32, 0), locations.route.old.capacity());
+    try std.testing.expectEqual(@as(u32, count), locations.route.live.count());
+    try std.testing.expectEqual(@as(u32, 0), locations.route.get(1000).?.local_id);
+
+    // A swap retags no segment: a partly routed pending one restarts, and a
+    // rerouting one detached mid-way leaves the old generation's list.
+    {
+        try attachVersionLocationsTestSegment(alloc, &locations, 21, 600_000, 10);
+        try attachVersionLocationsTestSegment(alloc, &locations, 20, 500_000, count);
+        while (locations.segments.get(21).?.queue == .pending) locations.advanceLocked(alloc);
+        const partial = locations.segments.get(20).?;
+        try std.testing.expect(partial.queue == .pending and partial.cursor != 0);
+        var second: VersionLocations.RouteMap.Map = .empty;
+        defer second.deinit(alloc);
+        try second.ensureTotalCapacity(alloc, 8 * count);
+        const generation = locations.route.generation;
+        locations.swapTableLocked(&second);
+        try std.testing.expectEqual(generation +% 1, locations.route.generation);
+        try std.testing.expect(partial.cursor != 0 and partial.table == generation);
+        try std.testing.expectEqual(@as(u64, 21), VersionLocations.SegmentVersions.of(locations.rerouting.last.?).seg_id);
+        locations.detachLocked(alloc, 21);
+        try std.testing.expect(locations.rerouting.last == null or VersionLocations.SegmentVersions.of(locations.rerouting.last.?).seg_id != 21);
+        locations.settle(alloc);
+        try std.testing.expectEqual(locations.route.generation, partial.table);
+        try std.testing.expectEqual(@as(u32, count - 1), locations.route.get(500_000 + count - 1).?.local_id);
+        try std.testing.expect(locations.route.get(600_000) == null);
+        try std.testing.expectEqual(@as(u32, 0), locations.route.get(1000).?.local_id);
+        locations.detachLocked(alloc, 20);
+        locations.settle(alloc);
+    }
+
+    // Retirement keeps half of every step however much routing is queued.
+    try attachVersionLocationsTestSegment(alloc, &locations, 8, 100_000, count);
+    locations.detachLocked(alloc, 7);
+    try std.testing.expect(!locations.segments.contains(7));
+    locations.advanceLocked(alloc);
+    try std.testing.expectEqual(@as(usize, budget / 2), VersionLocations.SegmentVersions.of(locations.retiring.first.?).cursor);
+    try std.testing.expectEqual(@as(usize, budget / 2), VersionLocations.SegmentVersions.of(locations.pending.first.?).cursor);
+
+    // Detaching from the middle of a queue is O(1).
+    try attachVersionLocationsTestSegment(alloc, &locations, 9, 200_000, 10);
+    try attachVersionLocationsTestSegment(alloc, &locations, 10, 300_000, 10);
+    try attachVersionLocationsTestSegment(alloc, &locations, 11, 400_000, 10);
+    locations.detachLocked(alloc, 10);
+    try std.testing.expectEqual(@as(usize, 3), locations.pending.len());
+    try std.testing.expectEqual(@as(usize, 2), locations.retiring.len());
+    locations.settle(alloc);
+    try std.testing.expectEqual(@as(usize, 0), locations.pending.len());
+    try std.testing.expectEqual(@as(usize, 0), locations.retiring.len());
+    try std.testing.expectEqual(@as(u32, count + 20), locations.route.live.count());
+    try std.testing.expect(locations.route.get(1000) == null);
+    try std.testing.expect(locations.route.get(300_000) == null);
+    try std.testing.expectEqual(@as(u64, 11), locations.route.get(400_009).?.seg_id);
+}
+
+test "persistent index version routes rebuild a table full of tombstones" {
     const alloc = std.testing.allocator;
     var locations: PersistentIndex.VersionLocations = .{};
     defer locations.deinit(alloc);
-    const count = 10_000;
-    const index = try alloc.create(PersistentIndex.VersionLocations.SegmentVersions);
-    index.* = .{ .seg_id = 7, .column = try alloc.alloc(u64, count) };
-    for (index.column, 0..) |*version, i| version.* = 1000 + i;
-    try index.by_version.ensureTotalCapacity(alloc, count);
-    for (index.column, 0..) |version, i| index.by_version.putAssumeCapacity(version, @intCast(i));
+    const count = 5_000;
+    var rebuilt = false;
+    for (0..12) |round| {
+        const seg_id: u64 = 100 + round;
+        try attachVersionLocationsTestSegment(alloc, &locations, seg_id, (round + 1) * 1_000_000, count);
+        locations.settle(alloc);
+        try std.testing.expectEqual(@as(u32, count), locations.route.live.count());
+        const before = locations.route.live_removed;
+        locations.detachLocked(alloc, seg_id);
+        locations.settle(alloc);
+        if (locations.route.live_removed < before + count) rebuilt = true;
+        // Churn never grows the table: misses stay short.
+        try std.testing.expect(locations.route.live_removed <= locations.route.live.capacity() / 2);
+        try std.testing.expect(locations.route.live.capacity() <= 8 * count);
+    }
+    try std.testing.expect(rebuilt);
+}
 
-    try locations.attachLocked(alloc, index);
-    try std.testing.expectEqual(@as(usize, 0), locations.route.count());
-    locations.advanceLocked(alloc);
-    try std.testing.expectEqual(@as(usize, PersistentIndex.VersionLocations.step_budget), locations.route.count());
-    try std.testing.expectEqual(@as(u32, 0), locations.route.get(1000).?.local_id);
-    // Not routed yet: still found through the pending segment's index.
-    try std.testing.expect(locations.route.get(1000 + count - 1) == null);
-    try std.testing.expectEqual(@as(usize, 1), locations.pending.items.len);
-    try std.testing.expectEqual(@as(u32, count - 1), locations.segments.get(7).?.by_version.get(1000 + count - 1).?);
-    while (locations.pending.items.len != 0) locations.advanceLocked(alloc);
-    try std.testing.expectEqual(@as(usize, count), locations.route.count());
-    try std.testing.expectEqual(@as(usize, 0), locations.segments.get(7).?.by_version.count());
+fn buildVersionLocationsScenario(alloc: Allocator, segment: *const index_mod.SegmentEntry) !void {
+    const index = try PersistentIndex.VersionLocations.SegmentVersions.build(alloc, segment, true);
+    index.destroy(alloc);
+}
 
-    try locations.detachLocked(alloc, 7);
-    try std.testing.expect(!locations.segments.contains(7));
-    locations.advanceLocked(alloc);
-    try std.testing.expectEqual(@as(usize, count - PersistentIndex.VersionLocations.step_budget), locations.route.count());
-    while (locations.retiring.items.len != 0) locations.advanceLocked(alloc);
-    try std.testing.expectEqual(@as(usize, 0), locations.route.count());
+test "persistent index version column decode survives every allocation failure" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = persistTmpPath(&path_buf);
+    defer cleanupPersistDir(path);
+    var index = try PersistentIndex.open(alloc, .{ .path = path });
+    defer index.close();
+    const bytes = try buildSimpleSegment(alloc, "doc:a", "alpha");
+    defer alloc.free(bytes);
+    try index.indexSegment(bytes);
+    const snap = index.writer.acquireSnapshot();
+    defer snap.release();
+    // The segment carries a version column, so every allocation is reached.
+    const column = (try snap.segments[0].reader.docVersionsAlloc(alloc)).?;
+    defer alloc.free(column);
+    try std.testing.expectEqual(@as(usize, 1), column.len);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, buildVersionLocationsScenario, .{&snap.segments[0]});
 }
 
 test "persistent index change refresh yields to an inline write staged after preparation" {
