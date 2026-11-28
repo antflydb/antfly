@@ -532,6 +532,11 @@ pub const CudaVendorConvolution = struct {
 pub const CudaDecoderWorkspace = struct {
     completed_bursts: u64 = 1,
     eager_bursts: u64 = 0,
+    /// Host wall time through kernel submission or graph launch. Capture
+    /// instantiation is a subset, and readback includes device completion.
+    submit_host_ns: u64 = 0,
+    capture_instantiate_host_ns: u64 = 0,
+    readback_host_ns: u64 = 0,
     route: Route,
     plan_origin: ?@import("stream_workspace.zig").Origin,
     planned_events: usize,
@@ -581,6 +586,11 @@ pub inline fn cudaDecoderWorkspace(workspace: CudaDecoderWorkspace) void {
             .recorded_and_launched, .replayed => 0,
         };
         scope.cuda_decoder_workspace.?.eager_bursts = (if (prior) |previous| previous.eager_bursts else 0) +| eager;
+        if (prior) |previous| {
+            scope.cuda_decoder_workspace.?.submit_host_ns +|= previous.submit_host_ns;
+            scope.cuda_decoder_workspace.?.capture_instantiate_host_ns +|= previous.capture_instantiate_host_ns;
+            scope.cuda_decoder_workspace.?.readback_host_ns +|= previous.readback_host_ns;
+        }
     }
 }
 

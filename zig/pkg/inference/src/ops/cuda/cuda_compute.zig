@@ -3765,6 +3765,13 @@ pub const CudaCompute = struct {
         head_destination: ?buffer_mod.DeviceBuffer,
         capture_scope: ?@import("../../execution/stream_workspace.zig").Scope = null,
         launch_route: ?@import("../../execution/runtime_observation.zig").CudaDecoderWorkspace.Route = null,
+        profile: bool = false,
+        log_profile: bool = false,
+        submit_host_ns: u64 = 0,
+        capture_instantiate_host_ns: u64 = 0,
+
+        const observation = @import("../../execution/runtime_observation.zig");
+
         pub fn deinit(self: *@This()) void {
             self.compute.bounded_decode_graph.active = false;
             self.compute.execution_scope = null;
@@ -3877,6 +3884,12 @@ pub const CudaCompute = struct {
             try self.compute.lighton_attention.advanceGraph(&self.compute.ctx, owner.positions().ptr, owner.counter().ptr, @intCast(owner.rows * 3));
         }
         pub fn run(self: *@This(), context: *anyopaque, callback: *const fn (*anyopaque, *@This()) anyerror!void) !void {
+            self.log_profile = platform.env.getenvBool("ANTFLY_INFERENCE_READ_PROFILE");
+            self.profile = self.log_profile or observation.kernelObservationActive();
+            const start = if (self.profile) platform.time.monotonicNs() else 0;
+            defer if (self.profile) {
+                self.submit_host_ns = platform.time.monotonicNs() -| start;
+            };
             const compute = self.compute;
             const owner = &compute.bounded_decode_graph;
             if (owner.phase == .replay) {
@@ -3951,7 +3964,9 @@ pub const CudaCompute = struct {
                 capture_active = false;
                 owner.pending_graph = try graph_mod.endRecording(&compute.ctx);
                 if (!matches) return error.InvalidExecutionPlan;
+                const instantiate_start = if (self.profile) platform.time.monotonicNs() else 0;
                 owner.graph = try compute.ctx.instantiateGraph(owner.pending_graph);
+                if (self.profile) self.capture_instantiate_host_ns = platform.time.monotonicNs() -| instantiate_start;
                 try compute.ctx.destroyGraphChecked(&owner.pending_graph);
                 try compute.ctx.launchGraph(owner.graph);
                 self.launch_route = .recorded_and_launched;
@@ -3969,6 +3984,7 @@ pub const CudaCompute = struct {
             const layout = owner.storage_layout orelse return error.InvalidExecutionPlan;
             const source = layout.readback(owner.metadata);
             const readback_words = host[0 .. source.len / @sizeOf(u32)];
+            const readback_start = if (self.profile) platform.time.monotonicNs() else 0;
             const readback_backing = copyBoundedGraphReceipt(self.compute, source, std.mem.sliceAsBytes(readback_words)) catch |err| {
                 // A driver error can surface after earlier stream work was
                 // queued. Drain before returning this stack-backed receipt.
@@ -3980,7 +3996,12 @@ pub const CudaCompute = struct {
             };
             burst_value.drained = true;
             try layout.publishReadback(readback_words, owner.next_positions[0 .. owner.rows * 3], &owner.progress, first, second);
-            const observation = @import("../../execution/runtime_observation.zig");
+            const readback_host_ns = if (self.profile) platform.time.monotonicNs() -| readback_start else 0;
+            if (self.log_profile) if (self.launch_route) |route| {
+                std.log.info("CUDA decoder burst rows={d} route={s} submit_host_ns={d} capture_instantiate_host_ns={d} readback_host_ns={d}", .{
+                    owner.rows, @tagName(route), self.submit_host_ns, self.capture_instantiate_host_ns, readback_host_ns,
+                });
+            };
             if (observation.kernelObservationActive()) if (self.launch_route) |route| {
                 const arena = switch (route) {
                     .recorded_and_launched, .replayed => owner.admitted_arena_layout.?,
@@ -3989,6 +4010,9 @@ pub const CudaCompute = struct {
                 const planned = if (route == .learned) owner.arenaLayout() catch null else arena;
                 observation.cudaDecoderWorkspace(.{
                     .route = route,
+                    .submit_host_ns = self.submit_host_ns,
+                    .capture_instantiate_host_ns = self.capture_instantiate_host_ns,
+                    .readback_host_ns = readback_host_ns,
                     .plan_origin = if (planned != null) owner.plan.?.origin else null,
                     .planned_events = if (planned) |value| value.events else 0,
                     .planned_scratch_bytes = if (planned) |value| value.bytes else 0,
