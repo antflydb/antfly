@@ -1827,7 +1827,7 @@ const ClampSpec = struct {
         return self.input_min != null or self.input_max != null;
     }
 
-    fn clipsOutput(self: ClampSpec) bool {
+    pub fn clipsOutput(self: ClampSpec) bool {
         return self.output_min != null or self.output_max != null;
     }
 };
@@ -5172,39 +5172,34 @@ const F32AudioDeclaration = struct {
         defer if (clipped_input) |value| self.release(value);
         const packed_rows = try self.make(3 * width);
         defer self.release(packed_rows);
-        var result: [3]Value = undefined;
-        for (kinds, &result) |kind, *value| {
-            const spec = try self.bounds(kind, false);
-            const slice = try self.make(width);
-            value.* = if (spec.clipsOutput()) clipped: {
-                defer self.release(slice);
-                break :clipped try self.make(width);
-            } else slice;
-        }
-        return result;
+        var specs: [3]ClampSpec = undefined;
+        for (kinds, &specs) |kind, *spec| spec.* = try self.bounds(kind, false);
+        return grouped_audio_block.splitPackedQkv(self, packed_rows, width, specs);
     }
 
-    pub fn attend(self: *F32AudioDeclaration, input: Value) !Value {
-        const width = self.plan.recipe.hidden;
-        const use_packed = self.plan.recipe.packed_layers & (@as(u16, 1) << @intCast(self.plan.layer)) != 0;
-        const attended = attention: {
-            if (use_packed) {
-                const values = try self.packedQkv(width);
-                defer self.release(values[0]);
-                defer self.release(values[1]);
-                defer self.release(values[2]);
-                break :attention try self.make(width);
-            }
-            const q = try self.linear(.query, false, input);
-            defer self.release(q);
-            const k = try self.linear(.key, false, input);
-            defer self.release(k);
-            const v = try self.linear(.value, false, input);
-            defer self.release(v);
-            break :attention try self.make(width);
-        };
-        defer self.release(attended);
-        return self.linear(.attention_out, false, attended);
+    pub fn sliceQkv(self: *F32AudioDeclaration, _: Value, _: usize, width: usize) !Value {
+        return self.make(width);
+    }
+
+    pub fn clampQkv(self: *F32AudioDeclaration, _: Value, width: usize, _: ClampSpec) !Value {
+        return self.make(width);
+    }
+
+    pub fn relativeKey(_: *F32AudioDeclaration) !void {}
+
+    pub fn releaseRelativeKey(_: *F32AudioDeclaration, _: void) void {}
+
+    pub fn attention(self: *F32AudioDeclaration, _: Value, _: Value, _: Value, _: void) !Value {
+        return self.make(self.plan.recipe.hidden);
+    }
+
+    pub fn packedAttention(self: *F32AudioDeclaration, _: Value, _: void) !?Value {
+        if (self.plan.recipe.packed_layers & (@as(u16, 1) << @intCast(self.plan.layer)) == 0) return null;
+        const values = try self.packedQkv(self.plan.recipe.hidden);
+        defer self.release(values[0]);
+        defer self.release(values[1]);
+        defer self.release(values[2]);
+        return try self.make(self.plan.recipe.hidden);
     }
 
     pub fn attentionResidual(self: *F32AudioDeclaration, input: Value, _: Value) !Value {
@@ -5525,8 +5520,56 @@ const AudioLayer = struct {
         return result;
     }
 
-    pub fn attend(self: *const AudioLayer, input: CT) !CT {
-        return audioSelfAttention(self.cb, self.allocator, self.store, self.cfg, input, self.inputs, self.layer);
+    pub fn relativeKey(self: *const AudioLayer) !CT {
+        return self.operations().relativeKey();
+    }
+
+    pub fn releaseRelativeKey(self: *const AudioLayer, relative: CT) void {
+        self.operations().releaseRelativeKey(relative);
+    }
+
+    pub fn attention(self: *const AudioLayer, q: CT, k: CT, v: CT, relative: CT) !CT {
+        audioProfileMark(.attn_proj);
+        return self.operations().attention(q, k, v, relative);
+    }
+
+    pub fn afterAttention(_: *const AudioLayer) void {
+        audioProfileMark(.attn_kernel);
+    }
+
+    pub fn packedAttention(self: *const AudioLayer, input: CT, rel: CT) !?CT {
+        if (self.cfg.source_scalar_storage == .bf16) return null;
+        const rows = self.inputs.valid_mask.len;
+        const width = self.cfg.audio_hidden;
+        const choice = (try packedAudioQkv(self.cb, self.allocator, self.store, input, rows, width, self.layer)) orelse return null;
+        const split = switch (choice) {
+            .separate => |triple| triple,
+            .interleaved => |interleaved| blk: {
+                defer self.cb.free(interleaved.tensor);
+                if (self.cfg.attention_context_right == 0 and (self.inputs.segments.len == 0 or self.inputs.segment_valid != null)) {
+                    var params = try audioLocalAttentionParams(self.cfg, rows);
+                    params.segmented = self.inputs.segments.len != 0;
+                    params.packed_qkv = true;
+                    for (interleaved.specs, 0..) |spec, i| {
+                        if (spec.output_min) |v| {
+                            params.packed_bounds[i * 2] = v;
+                            params.packed_clamp_flags |= @as(u32, 1) << @intCast(i * 2);
+                        }
+                        if (spec.output_max) |v| {
+                            params.packed_bounds[i * 2 + 1] = v;
+                            params.packed_clamp_flags |= @as(u32, 2) << @intCast(i * 2);
+                        }
+                    }
+                    const validity = if (params.segmented) self.inputs.segment_valid.? else self.inputs.valid_ct;
+                    if (try self.cb.vtable.regions.audio_attention.packedLocalRelative.?(self.cb.ptr, interleaved.tensor, interleaved.tensor, interleaved.tensor, rel, self.inputs.scales[self.layer], validity, params)) |result| return result;
+                }
+                break :blk try splitAudioQkv(self.cb, self.allocator, interleaved.tensor, rows, width, interleaved.specs);
+            },
+        };
+        defer self.release(split.first);
+        defer self.release(split.second);
+        defer self.release(split.third);
+        return try self.attention(split.first, split.second, split.third, rel);
     }
 
     pub fn attentionResidual(self: *const AudioLayer, input: CT, attended: CT) !CT {
@@ -5656,18 +5699,26 @@ fn packedAudioQkv(cb: *const ComputeBackend, a: std.mem.Allocator, store: *Proje
 }
 
 fn splitAudioQkv(cb: *const ComputeBackend, a: std.mem.Allocator, packed_rows: CT, rows: usize, width: usize, specs: [3]ClampSpec) !ops.LinearTripleResult {
-    var results: [3]CT = undefined;
-    var made: usize = 0;
-    errdefer for (results[0..made]) |tensor| cb.free(tensor);
-    for (specs, 0..) |spec, i| {
-        const view = try cb.sliceLastDim(packed_rows, i * width, (i + 1) * width);
-        if (spec.clipsOutput()) {
-            defer cb.free(view);
-            results[i] = try clampScalarCt(cb, a, view, rows, width, spec.output_min, spec.output_max);
-        } else results[i] = view;
-        made += 1;
-    }
-    return .{ .first = results[0], .second = results[1], .third = results[2] };
+    const Split = struct {
+        pub const Value = CT;
+        cb: *const ComputeBackend,
+        allocator: std.mem.Allocator,
+        rows: usize,
+
+        pub fn release(self: *const @This(), value: CT) void {
+            self.cb.free(value);
+        }
+
+        pub fn sliceQkv(self: *const @This(), value: CT, offset: usize, columns: usize) !CT {
+            return self.cb.sliceLastDim(value, offset, offset + columns);
+        }
+
+        pub fn clampQkv(self: *const @This(), value: CT, columns: usize, spec: ClampSpec) !CT {
+            return clampScalarCt(self.cb, self.allocator, value, self.rows, columns, spec.output_min, spec.output_max);
+        }
+    };
+    const slices = try grouped_audio_block.splitPackedQkv(&Split{ .cb = cb, .allocator = a, .rows = rows }, packed_rows, width, specs);
+    return .{ .first = slices[0], .second = slices[1], .third = slices[2] };
 }
 
 fn audioRelativeKey(cb: *const ComputeBackend, a: std.mem.Allocator, store: *ProjectorWeights, cfg: AudioConfig, relative: CT, layer: usize, require_cache: bool) !?CT {
@@ -5682,72 +5733,6 @@ fn audioRelativeKey(cb: *const ComputeBackend, a: std.mem.Allocator, store: *Pro
     if (!require_cache) return try publishAudioConstant(cb, key, source, cache);
     defer cb.free(source);
     return try cb.modelConstant(key, source);
-}
-
-fn audioSelfAttention(
-    cb: *const ComputeBackend,
-    allocator: std.mem.Allocator,
-    store: *ProjectorWeights,
-    cfg: AudioConfig,
-    input: CT,
-    inputs: *const AudioLayerInputs,
-    layer: usize,
-) !CT {
-    const valid_mask = inputs.valid_mask;
-    const rows = valid_mask.len;
-    var buf: [128]u8 = undefined;
-    const prepared_relative = inputs.relative_keys.len != 0;
-    const rel = if (prepared_relative) inputs.relative_keys[layer - inputs.relative_key_start] else (try audioRelativeKey(cb, allocator, store, cfg, inputs.rel_in, layer, false)).?;
-    defer if (!prepared_relative) cb.free(rel);
-    const choice = if (cfg.source_scalar_storage == .bf16) null else try packedAudioQkv(cb, allocator, store, input, rows, cfg.audio_hidden, layer);
-    const packed_rows: ?ops.LinearTripleResult = if (choice) |value| switch (value) {
-        .separate => |triple| triple,
-        .interleaved => |interleaved| blk: {
-            defer cb.free(interleaved.tensor);
-            if (cfg.attention_context_right == 0 and (inputs.segments.len == 0 or inputs.segment_valid != null)) {
-                var params = try audioLocalAttentionParams(cfg, rows);
-                params.segmented = inputs.segments.len != 0;
-                params.packed_qkv = true;
-                for (interleaved.specs, 0..) |spec, i| {
-                    if (spec.output_min) |v| {
-                        params.packed_bounds[i * 2] = v;
-                        params.packed_clamp_flags |= @as(u32, 1) << @intCast(i * 2);
-                    }
-                    if (spec.output_max) |v| {
-                        params.packed_bounds[i * 2 + 1] = v;
-                        params.packed_clamp_flags |= @as(u32, 2) << @intCast(i * 2);
-                    }
-                }
-                const validity = if (params.segmented) inputs.segment_valid.? else inputs.valid_ct;
-                if (try cb.vtable.regions.audio_attention.packedLocalRelative.?(cb.ptr, interleaved.tensor, interleaved.tensor, interleaved.tensor, rel, inputs.scales[layer], validity, params)) |result| {
-                    defer cb.free(result);
-                    audioProfileMark(.attn_kernel);
-                    return audioSourceLinear(cb, allocator, store, cfg, result, try fmt(&buf, "a.blk.{d}.attn_out", .{layer}), rows, cfg.audio_hidden, cfg.audio_hidden, .row_major, false, false);
-                }
-            }
-            break :blk try splitAudioQkv(cb, allocator, interleaved.tensor, rows, cfg.audio_hidden, interleaved.specs);
-        },
-    } else null;
-    const out_ct = attend: {
-        var remaining_k = if (packed_rows) |value| @as(?CT, value.second) else null;
-        defer if (remaining_k) |tensor| cb.free(tensor);
-        var remaining_v = if (packed_rows) |value| @as(?CT, value.third) else null;
-        defer if (remaining_v) |tensor| cb.free(tensor);
-        const q = if (packed_rows) |value| value.first else try audioSourceLinear(cb, allocator, store, cfg, input, try fmt(&buf, "a.blk.{d}.attn_q", .{layer}), rows, cfg.audio_hidden, cfg.audio_hidden, .row_major, false, false);
-        defer cb.free(q);
-        const k = remaining_k orelse try audioSourceLinear(cb, allocator, store, cfg, input, try fmt(&buf, "a.blk.{d}.attn_k", .{layer}), rows, cfg.audio_hidden, cfg.audio_hidden, .row_major, false, false);
-        remaining_k = null;
-        defer cb.free(k);
-        const v = remaining_v orelse try audioSourceLinear(cb, allocator, store, cfg, input, try fmt(&buf, "a.blk.{d}.attn_v", .{layer}), rows, cfg.audio_hidden, cfg.audio_hidden, .row_major, false, false);
-        remaining_v = null;
-        defer cb.free(v);
-        audioProfileMark(.attn_proj);
-
-        break :attend try audioLocalAttention(cb, allocator, cfg, q, k, v, rel, layer, inputs);
-    };
-    defer cb.free(out_ct);
-    audioProfileMark(.attn_kernel);
-    return audioSourceLinear(cb, allocator, store, cfg, out_ct, try fmt(&buf, "a.blk.{d}.attn_out", .{layer}), rows, cfg.audio_hidden, cfg.audio_hidden, .row_major, false, false);
 }
 
 fn audioQueryDimScales(allocator: std.mem.Allocator, head_dim: usize, per_dim_scale: []const f32, gguf: bool) ![]f32 {

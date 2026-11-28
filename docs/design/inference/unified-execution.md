@@ -3195,6 +3195,13 @@ cases again matched eager CUDA with identical arena capacities. Four
 local Native and Metal checks passed, including the official E4B
 projector with the same 0.00563 maximum device-versus-host difference.
 
+Attention also shares projection order, packed-QKV splitting, output
+clamping, and intermediate retirement between declaration and execution.
+All nine released Spark cases kept exact eager parity and unchanged
+arena capacities. Four local checks passed, including the dedicated
+Metal packed attention clamp and mask check and the official E4B QAT
+GGUF projector.
+
 ### Isolated Metal E4B HTTP comparison at `58b3917a89`
 
 The local M4 Max used the same pinned binaries as the mixed serving

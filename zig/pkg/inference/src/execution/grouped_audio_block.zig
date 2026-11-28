@@ -69,10 +69,30 @@ fn feedForward(ctx: anytype, input: @TypeOf(ctx.*).Value, second: bool) !@TypeOf
     return ctx.add(input, scaled);
 }
 
+/// Each component owns its slice or the result of its output clamp.
+pub fn splitPackedQkv(ctx: anytype, packed_rows: @TypeOf(ctx.*).Value, width: usize, specs: anytype) ![3]@TypeOf(ctx.*).Value {
+    var results: [3]@TypeOf(ctx.*).Value = undefined;
+    var made: usize = 0;
+    errdefer for (results[0..made]) |value| ctx.release(value);
+    for (specs, &results, 0..) |spec, *result, index| {
+        const slice = try ctx.sliceQkv(packed_rows, index * width, width);
+        result.* = if (spec.clipsOutput()) clipped: {
+            defer ctx.release(slice);
+            break :clipped try ctx.clampQkv(slice, width, spec);
+        } else slice;
+        made += 1;
+    }
+    return results;
+}
+
 fn attend(ctx: anytype, input: @TypeOf(ctx.*).Value) !@TypeOf(ctx.*).Value {
     const relative = try ctx.relativeKey();
     defer ctx.releaseRelativeKey(relative);
+    const Context = @TypeOf(ctx.*);
     const attended = attention: {
+        if (@hasDecl(Context, "packedAttention")) {
+            if (try ctx.packedAttention(input, relative)) |result| break :attention result;
+        }
         const q = try ctx.linear(.query, false, input);
         defer ctx.release(q);
         const k = try ctx.linear(.key, false, input);
@@ -82,6 +102,7 @@ fn attend(ctx: anytype, input: @TypeOf(ctx.*).Value) !@TypeOf(ctx.*).Value {
         break :attention try ctx.attention(q, k, v, relative);
     };
     defer ctx.release(attended);
+    if (@hasDecl(Context, "afterAttention")) ctx.afterAttention();
     return ctx.linear(.attention_out, false, attended);
 }
 
@@ -117,7 +138,7 @@ fn convolve(ctx: anytype, input: @TypeOf(ctx.*).Value) !@TypeOf(ctx.*).Value {
 
 pub fn run(ctx: anytype, input: @TypeOf(ctx.*).Value) !@TypeOf(ctx.*).Value {
     const Context = @TypeOf(ctx.*);
-    const custom = @hasDecl(Context, "attend");
+    const custom = @hasDecl(Context, "attentionResidual");
     const ff2 = feed_forward: {
         const convolution = conv: {
             const residual = attention: {
@@ -127,7 +148,7 @@ pub fn run(ctx: anytype, input: @TypeOf(ctx.*).Value) !@TypeOf(ctx.*).Value {
                 const attended = project: {
                     const normed = if (custom) try ctx.normalize(.attention_pre, ff1) else try boundedNorm(ctx, ff1, .attention_pre, false);
                     defer ctx.release(normed);
-                    break :project if (custom) try ctx.attend(normed) else try attend(ctx, normed);
+                    break :project try attend(ctx, normed);
                 };
                 defer ctx.release(attended);
                 if (custom) break :attention try ctx.attentionResidual(ff1, attended);
