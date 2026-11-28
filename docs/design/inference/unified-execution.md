@@ -3273,6 +3273,17 @@ first completed replay. The profiled run also retired a recorded
 unrelated invalidation, while the wide replay gate remains open under
 chunked prefill.
 
+At `f2f16df5d5`, the graph planner checks whether the shortest
+remaining token budget permits a completed replay after setup. A
+ready graph can still run its final two-token burst. All 53 focused
+Spark checks passed without skips. Both 256-page chunked runs passed
+the wide declared replay gate at 113 rows and matched serial output.
+The unprofiled and profiled rates were 6.29 and 6.26 pages/s,
+respectively. Every recording in these runs had zero model EOS rows
+and a minimum remaining budget of 109 to 118 tokens. The horizon
+guard did not account for the successful 113-row replays. A paired
+repeat is needed to establish replay consistency under pressure.
+
 The M4 Max focused cohort at `061f213135` passed all seven checks
 with zero skips. It exercised the shared installed Whisper Small
 checkpoint with the Metal backend required, verified assigned packed
