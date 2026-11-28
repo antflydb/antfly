@@ -3372,6 +3372,18 @@ text, image and audio in all six baseline arms of the mixed workload.
 The candidate completed those cases. The mixed run provides no paired
 latency for those three modalities.
 
+The isolated Metal E4B comparison used the same two binaries, checkpoint,
+request bytes, scratch limit and sample schedule. The server held only
+E4B during these runs. All four modalities matched across the three
+controls and all requests completed.
+
+| Workload | Baseline p50 / p95 (ms) | Candidate p50 / p95 (ms) |
+| --- | ---: | ---: |
+| Gemma 4 E4B text | 452.87 / 454.63 | 453.35 / 454.52 |
+| Gemma 4 E4B image | 1,087.63 / 1,088.65 | 738.61 / 740.50 |
+| Gemma 4 E4B audio | 290.58 / 292.68 | 290.32 / 291.71 |
+| Gemma 4 E4B video | 1,042.02 / 1,062.67 | 706.72 / 707.68 |
+
 Native CPU used the same `e540d5ff64` server and baseline, with the DFT
 audio frontend pinned on both sides for grouped EmbeddingGemma 2 audio.
 All eleven workloads had 16 measured requests per side per phase and
