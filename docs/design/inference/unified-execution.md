@@ -437,7 +437,12 @@ preparation API do not by themselves complete these remaining requirements:
   those actual visual rows in prompt order and keeps the existing
   per-image allowance. Nine local checks passed, including repeated
   image references, agreement with prepared pixels, and rejection
-  of out-of-range processor integers.
+  of out-of-range processor integers. The fallback workspace forecast
+  now takes the peak of codec decode and resize with the live RGB
+  input, including earlier prepared images in both phases. Codec
+  allocations above the forecast still acquire credit through the
+  runtime allocator. Eighteen focused checks passed, covering retained
+  inputs, late growth, denial, cancellation and refunds.
 
 - Imported ONNX and architecture graphs share the bounded specialization owner
   in `execution/specialization_cache.zig`, with stable executable handles,

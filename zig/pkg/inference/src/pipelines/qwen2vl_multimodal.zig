@@ -215,11 +215,17 @@ pub fn imageAdmission(images: []const []const u8, config: PreprocessorConfig) !I
     for (images) |bytes| {
         const info = try image.inspectEncodedForInference(bytes, null);
         const geometry = try imageGeometry(info.width, info.height, config);
-        const preprocess = try @import("antfly_image").processing.preprocessingWorkingBytes(info.width, info.height, geometry.resized_width, geometry.resized_height, imageResample(config));
         const decode = try image.sourceDecodeWorkingBytes(info.width, info.height);
+        // Decode returns dense RGB after releasing its codec workspace.
+        const source_pixels = try std.math.mul(usize, info.width, info.height);
+        const source_rgb = try std.math.mul(usize, source_pixels, 3);
+        const preprocess = try @import("antfly_image").processing.preprocessingWorkingBytes(info.width, info.height, geometry.resized_width, geometry.resized_height, imageResample(config));
+        const working = @max(decode, try std.math.add(usize, source_rgb, preprocess));
         admission.visual_tokens = try std.math.add(usize, admission.visual_tokens, geometry.image_token_count);
-        admission.host_working_bytes = @max(admission.host_working_bytes, try std.math.add(usize, retained, try std.math.add(usize, decode, preprocess)));
-        retained = try std.math.add(usize, retained, try std.math.mul(usize, try std.math.mul(usize, geometry.resized_width, geometry.resized_height), 12));
+        admission.host_working_bytes = @max(admission.host_working_bytes, try std.math.add(usize, retained, working));
+        const output_pixels = try std.math.mul(usize, geometry.resized_width, geometry.resized_height);
+        const output_bytes = try std.math.mul(usize, output_pixels, 3 * @sizeOf(f32));
+        retained = try std.math.add(usize, retained, output_bytes);
     }
     return admission;
 }
@@ -770,6 +776,8 @@ test "model processor resampling header-only geometry matches execution for ever
         try std.testing.expectEqual(geometry.image_token_count, actual.image_token_count);
         const single = try imageAdmission(&.{png[0..24]}, config);
         const pair = try imageAdmission(&.{ png, png }, config);
+        const preprocess = try @import("antfly_image").processing.preprocessingWorkingBytes(2, 1, actual.resized_width, actual.resized_height, imageResample(config));
+        try std.testing.expectEqual(@as(usize, 6) + preprocess, single.host_working_bytes);
         try std.testing.expectEqual(actual.image_token_count, single.visual_tokens);
         try std.testing.expectEqual(actual.image_token_count * 2, pair.visual_tokens);
         try std.testing.expectEqual(single.host_working_bytes + actual.pixel_values.len * @sizeOf(f32), pair.host_working_bytes);
