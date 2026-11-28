@@ -697,6 +697,18 @@ pub const Lease = struct {
         return owner;
     }
 
+    pub fn publishAudioDeclaration(self: *Lease, bindings: @import("audio_execution_plan.zig").Bindings, events: []const @import("audio_execution_plan.zig").Plan.Declaration, published_slot: u15) !*@import("audio_execution_plan.zig").Owner {
+        const entry = self.entry orelse return error.InvalidPreparedCacheState;
+        if (entry.request != .audio_learning or entry.request.audio_learning.key != bindings.key) return error.InvalidPreparedCacheState;
+        const backing = entry.audio_learning orelse return error.MissingPreparedAudioPlan;
+        try backing.declare(bindings, events, published_slot);
+        errdefer {
+            backing.plan = .{};
+            backing.executable = null;
+        }
+        return self.publishAudioLearning();
+    }
+
     /// Adopt the existing plan in place. Its address remains stable and its
     /// funding shell retires independently of the cache backing.
     pub fn fundAudioLearning(self: *Lease, owner: *@import("audio_execution_plan.zig").Owner) !void {

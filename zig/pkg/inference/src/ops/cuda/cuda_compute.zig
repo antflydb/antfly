@@ -21474,13 +21474,21 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
     };
     const entry = try self.audio_plans.getWithCleanup(base_key, plan_cleanup);
     if (!entry.disabled and entry.owner == null) if (dispatch.workspace) |workspace| {
-        // Managed callers must obtain both leases before dispatch. This
-        // standalone route cannot publish uncharged backing in their place.
-        if (plan_cleanup.boundary != null or self.ctx.prepared_cache_funding != null) return null;
-        const owner = try plan_mod.Owner.create(std.heap.c_allocator);
-        errdefer owner.destroyUnusedOutsideExecution();
-        try owner.declare(cache_base, workspace.events, workspace.published_slot);
-        _ = try self.audio_plans.publishDeclared(cache_base, owner, plan_cleanup);
+        if (self.ctx.prepared_cache_funding) |funding| {
+            var lease = funding.take(.{ .audio_learning = .{ .key = base_key } }, .{ .host_scratch_bytes = @sizeOf(plan_mod.Owner) }) catch |err| switch (err) {
+                error.UnpreparedCacheAdmission => return null,
+                else => return err,
+            };
+            errdefer if (lease.owner != null)
+                lease.cancelBeforeSdk() catch platform.inference_process_supervisor.restartWorker();
+            entry.owner = try lease.publishAudioDeclaration(cache_base, workspace.events, workspace.published_slot);
+        } else {
+            if (plan_cleanup.boundary != null) return null;
+            const owner = try plan_mod.Owner.create(std.heap.c_allocator);
+            errdefer owner.destroyUnusedOutsideExecution();
+            try owner.declare(cache_base, workspace.events, workspace.published_slot);
+            _ = try self.audio_plans.publishDeclared(cache_base, owner, plan_cleanup);
+        }
     };
     if (entry.disabled) return null;
     if (entry.owner == null) {
