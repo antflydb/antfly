@@ -270,17 +270,19 @@ test.describe("AI workflow routes", () => {
       await themeButton.click();
     }
     await expect(page.locator("html")).toHaveClass(/dark/);
-    await page.waitForTimeout(50);
-    const sidebarTheme = await page.locator('[data-slot="sidebar-inner"]').evaluate((element) => {
-      const style = getComputedStyle(element);
-      const probe = document.createElement("div");
-      probe.style.backgroundColor = style.getPropertyValue("--sidebar-expanded");
-      document.body.appendChild(probe);
-      const tokenColor = getComputedStyle(probe).backgroundColor;
-      probe.remove();
-      return { rendered: style.backgroundColor, token: tokenColor };
-    });
-    expect(sidebarTheme.rendered).toBe(sidebarTheme.token);
+    const sidebar = page.locator('[data-slot="sidebar-inner"]');
+    await expect(async () => {
+      const sidebarTheme = await sidebar.evaluate((element) => {
+        const style = getComputedStyle(element);
+        const probe = document.createElement("div");
+        probe.style.backgroundColor = style.getPropertyValue("--sidebar-expanded");
+        document.body.appendChild(probe);
+        const tokenColor = getComputedStyle(probe).backgroundColor;
+        probe.remove();
+        return { rendered: style.backgroundColor, token: tokenColor };
+      });
+      expect(sidebarTheme.rendered).toBe(sidebarTheme.token);
+    }).toPass({ timeout: 5000 });
     await testInfo.attach("ai-workflow-dark", {
       body: await page.screenshot({ fullPage: true }),
       contentType: "image/png",
