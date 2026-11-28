@@ -3281,8 +3281,22 @@ the wide declared replay gate at 113 rows and matched serial output.
 The unprofiled and profiled rates were 6.29 and 6.26 pages/s,
 respectively. Every recording in these runs had zero model EOS rows
 and a minimum remaining budget of 109 to 118 tokens. The horizon
-guard did not account for the successful 113-row replays. A paired
-repeat is needed to establish replay consistency under pressure.
+guard did not account for the successful 113-row replays.
+
+The profiled paired repeat used `3584e01d9f` as A and `f2f16df5d5` as B.
+All 2,048 pages matched serial output and every arm completed 512
+packed chunks without retirement-capacity retries. Paired throughput
+was 6.38 pages/s for A and 6.28 for B. The candidate ran about 1.6%
+slower, beyond the spread between the same-binary controls in this
+comparison. Baseline replay reached 113 rows in two of four arms.
+Candidate replay reached 113 rows in three of four arms. The other
+candidate arm replayed at only two rows.
+
+No candidate arm declined a graph for insufficient token budget.
+One recorded 30-row graph emitted EOS in 14 rows and retired during
+page-state cleanup before replay. Its shortest remaining budget was
+108 tokens. The 113-row recordings emitted no EOS. These results
+leave both the throughput and consistent wide-replay gates open.
 
 The M4 Max focused cohort at `061f213135` passed all seven checks
 with zero skips. It exercised the shared installed Whisper Small
