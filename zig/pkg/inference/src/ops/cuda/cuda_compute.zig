@@ -4121,6 +4121,7 @@ pub const CudaCompute = struct {
         if (!self.bounded_decode_graph.mutex.tryLock()) return error.ReaderEpochBackendBusy;
         defer self.bounded_decode_graph.mutex.unlock();
         const owner = &self.bounded_decode_graph;
+        if (!owner.retirementPending()) return;
         if (dependency) |value| switch (value) {
             .recurrent => |address| if (!owner.referencesRecurrentAddress(address)) return,
             .sequence => |sequence| if (!owner.referencesSequence(sequence)) return,
@@ -59417,6 +59418,10 @@ test "captured graph prefunded nonempty program and learned workspace replay aft
     try std.testing.expectEqualSlices(u8, &sentinel, &actual);
     try CudaCompute.invalidateLightOnDecodeGraphMatching(&raw, .{ .boundary = &epoch }, .page_state_cleanup, .{ .sequence = 8 });
     try std.testing.expect(owner.graph == null);
+    const retired = owner.snapshot();
+    try CudaCompute.invalidateLightOnDecodeGraphWithCleanup(&raw, .{ .boundary = &epoch }, .eager_decode);
+    try CudaCompute.invalidateLightOnDecodeGraphWithCleanup(&raw, .{ .boundary = &epoch }, .foreground_vision);
+    try std.testing.expectEqualDeep(retired, owner.snapshot());
     try roots.unbind(&scoped, &compute);
     compute.configureRunBudget(null);
     _ = try compute.cublaslt_workspace_scratch.buffer.freeChecked(&compute.ctx);

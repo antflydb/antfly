@@ -806,6 +806,14 @@ pub const Module = struct {
         try self.arena_quota.validateLegacyRaw();
         return self.clearWithCleanup(ctx, .{ .outside_execution = true });
     }
+    pub fn retirementPending(self: *const Module) bool {
+        return self.phase != .disabled or self.active or self.graph != null or self.pending_graph != null or
+            self.metadata.ptr != 0 or self.arena.ptr != 0 or self.head.ptr != 0 or
+            self.plan != null or self.key.len != 0 or self.sequence_count != 0 or self.captured_roots_identity != 0 or
+            self.storage_layout != null or self.admitted_arena_layout != null or
+            self.metadata_quota != .none or self.arena_quota != .none;
+    }
+
     pub fn validateCleanup(self: *const Module, current: Cleanup) !void {
         try self.metadata_quota.validateCleanup(current);
         try self.arena_quota.validateCleanup(current);
