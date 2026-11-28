@@ -437,6 +437,9 @@ pub const CudaAudio = struct {
     learning_output_mismatch: u64 = 0,
     learning_host_transfer: u64 = 0,
     learning_unsealed: u64 = 0,
+    learning_admission_declined: u64 = 0,
+    declaration_admission_declined: u64 = 0,
+    disabled_plan: u64 = 0,
     arena_unavailable: u64 = 0,
     workspace_preflight_declined: u64 = 0,
     input_alias_declined: u64 = 0,
@@ -1499,9 +1502,10 @@ test "CUDA audio result observations preserve nested route counts and disabled s
         cudaAudioResult(.replayed);
         cudaAudioResult(.eager_assigned);
         cudaAudioResult(.capture_storage_declined);
-        try testing.expectEqualDeep(CudaAudio{ .replayed = 1, .eager_assigned = 1, .capture_storage_declined = 1 }, inner.snapshot().cuda_audio.?);
+        cudaAudioResult(.learning_admission_declined);
+        try testing.expectEqualDeep(CudaAudio{ .replayed = 1, .eager_assigned = 1, .capture_storage_declined = 1, .learning_admission_declined = 1 }, inner.snapshot().cuda_audio.?);
     }
-    try testing.expectEqualDeep(CudaAudio{ .warmed = 1, .learning_host_transfer = 1, .recorded_and_launched = 1, .replayed = 1, .eager_assigned = 1, .capture_storage_declined = 1 }, outer.snapshot().cuda_audio.?);
+    try testing.expectEqualDeep(CudaAudio{ .warmed = 1, .learning_host_transfer = 1, .recorded_and_launched = 1, .replayed = 1, .eager_assigned = 1, .capture_storage_declined = 1, .learning_admission_declined = 1 }, outer.snapshot().cuda_audio.?);
 }
 
 test "CUDA decoder burst timings accumulate across nested observations" {

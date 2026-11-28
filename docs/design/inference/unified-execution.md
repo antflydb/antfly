@@ -3018,7 +3018,12 @@ cuDNN provider unavailable. Eager CUDA passed at width four. The
 observed graph opt-in produced zero arena executions and zero replays
 at width two on both the previous and current binaries, and at width
 four on the current binary. F32 capture remains unqualified for this
-configuration.
+configuration. The common report now distinguishes declaration funding
+denial, learning funding denial and fallback from a disabled plan.
+Four focused Spark checks passed. The same executable's F32 probe
+recorded one warm execution, one unsealed learning run and five disabled
+plan fallbacks. It recorded zero funding denials and zero learning host
+transfers. The BF16 arm recorded one graph and replayed four times.
 
 The Spark serving comparison used the prior grouped-audio server
 from `54b7bbb92d` and the compact-input server with declared graphs on

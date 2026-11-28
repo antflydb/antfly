@@ -21857,7 +21857,10 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
         if (workspace.events.len == 0) return null;
         if (self.ctx.prepared_cache_funding) |funding| {
             var lease = funding.take(.{ .audio_learning = .{ .key = base_key, .declared_cold = true } }, .{ .host_scratch_bytes = @sizeOf(plan_mod.Owner) }) catch |err| switch (err) {
-                error.UnpreparedCacheAdmission => return null,
+                error.UnpreparedCacheAdmission => {
+                    observation.cudaAudioResult(.declaration_admission_declined);
+                    return null;
+                },
                 else => return err,
             };
             errdefer if (lease.owner != null)
@@ -21872,7 +21875,10 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
         }
         entry.declaration = .{ .source_key = key, .fingerprint = workspace.fingerprint };
     };
-    if (entry.disabled) return null;
+    if (entry.disabled) {
+        observation.cudaAudioResult(.disabled_plan);
+        return null;
+    }
     if (entry.owner == null) {
         // A warmed signature needs a learning lease before creating any
         // numerical bindings. Declined admission leaves the eager caller in
@@ -21882,7 +21888,10 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
             .{ .audio_learning = .{ .key = base_key } },
             .{ .host_scratch_bytes = @sizeOf(plan_mod.Owner) },
         ) catch |err| switch (err) {
-            error.UnpreparedCacheAdmission => return null,
+            error.UnpreparedCacheAdmission => {
+                observation.cudaAudioResult(.learning_admission_declined);
+                return null;
+            },
             else => return err,
         } else null;
         errdefer if (learning) |*token| if (token.owner != null)
