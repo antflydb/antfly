@@ -2811,6 +2811,12 @@ from 50.34/51.25 to 48.51/49.20 ms. The separate released-model fixture at
 Its 36,788,736-byte captured arena includes 132 operation scratch intervals.
 The encoder still observes the composite tensor lifetimes.
 
+At `10cbd19523`, the released grouped-audio model also matched exactly on
+local M4 Max Metal and CPU across AA, ABBA and BB with 16 measured requests
+per side. Metal p50/p95 went from 37.74/43.60 to 36.38/41.26 ms. Native CPU
+with the DFT pinned went from 227.28/233.91 to 226.39/228.98 ms. All 26 Spark
+checks passed again with zero skips and the same 36,788,736-byte capture.
+
 ### Isolated Metal E4B HTTP comparison at `58b3917a89`
 
 The local M4 Max used the same pinned binaries as the mixed serving
