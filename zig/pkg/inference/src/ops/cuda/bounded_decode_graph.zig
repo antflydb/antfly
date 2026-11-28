@@ -206,6 +206,14 @@ pub const StorageLayout = struct {
         return self.metadata_bytes - (self.layerWorkspaceOffset() catch unreachable);
     }
 
+    /// Physical prerequisites for observing a declared warm burst at any
+    /// supported graph width. The actual dispatch still proves coverage.
+    pub fn supportsDeclaredWarmup(self: StorageLayout, has_head_destination: bool) bool {
+        return (has_head_destination or self.fused_head_workspace != null) and
+            self.layer_norm != null and self.ffn_workspace != null and
+            self.recurrent_projection_joined != null and self.attention_inputs != null;
+    }
+
     /// The terminal head runs after the final normalization publishes a
     /// separate tensor. Its bank can alias the layer-live spans.
     fn layerLiveBytes(self: StorageLayout) !usize {
@@ -1308,6 +1316,8 @@ test "bounded CUDA decoder shares declared attention and recurrent workspace" {
         projection_policy.fused_recurrent_projections = true;
         try phase.prepareWorkspace(projection_policy);
         const projection_layout = phase.storage_layout;
+        try std.testing.expectEqual(gated, projection_layout.supportsDeclaredWarmup(true));
+        try std.testing.expect(!projection_layout.supportsDeclaredWarmup(false));
         const projection_owner: Module = .{
             .storage_layout = projection_layout,
             .metadata = .{ .ptr = 0x20000, .len = projection_layout.metadata_bytes },

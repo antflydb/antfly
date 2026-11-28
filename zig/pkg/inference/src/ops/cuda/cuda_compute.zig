@@ -3914,9 +3914,8 @@ pub const CudaCompute = struct {
             const WorkspaceScope = @import("../../execution/stream_workspace.zig").Scope;
             const capture = phase == .capture;
             const layout = owner.storage_layout orelse return error.InvalidExecutionPlan;
-            const check_declared_warmup = phase == .warm and owner.rows == 2 and owner.hidden == 1024 and
-                layout.shared_head_workspace != null and layout.ffn_workspace != null and layout.recurrent_projection_joined != null and
-                layout.attention_inputs != null and platform.env.getenvBool("ANTFLY_CUDA_LIGHTON_GRAPH_DECLARED_WARMUP");
+            const check_declared_warmup = phase == .warm and layout.supportsDeclaredWarmup(self.head_destination != null) and
+                platform.env.getenvBool("ANTFLY_CUDA_LIGHTON_GRAPH_DECLARED_WARMUP");
             var scope: ?WorkspaceScope = if (capture)
                 self.capture_scope orelse return error.InvalidExecutionPlan
             else if (phase == .learn or check_declared_warmup) WorkspaceScope.observe(plan) else null;
