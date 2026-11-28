@@ -69,4 +69,12 @@ test "reader workspace grows with available cohort and preserves both queued set
     try std.testing.expect(grown.head == plan.head and grown.per_item > plan.per_item);
     try std.testing.expectEqual(@as(usize, 2 * 123), try batchPeak(123, 2, 8));
     try std.testing.expectError(error.Overflow, (Decoder{ .per_item = std.math.maxInt(usize), .max_items = 4 }).peak(4));
+
+    const short = try Decoder.forPrefill(129, 2, 3, 48, 4);
+    const long = try Decoder.forPrefill(240, 8, 3, 64, 4);
+    const mixed = try short.merge(long);
+    try std.testing.expectEqual(@as(usize, 387), mixed.mixed_decode);
+    try std.testing.expectEqual(@as(usize, 931), try mixed.requiredBytes(1));
+    try std.testing.expectEqual(@as(usize, 2371), try mixed.requiredBytes(4));
+    try std.testing.expectEqual(try mixed.requiredBytes(4), try mixed.requiredBytes(128));
 }
