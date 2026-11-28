@@ -1705,8 +1705,13 @@ fn audioSourceLinear(
     var output = projected;
     errdefer cb.free(output);
     if (spec.clipsOutput()) {
-        const bounded = try audioSourceClamp(cb, output, spec.output_min, spec.output_max);
-        cb.free(output);
+        const bounded = (try cb.tryBf16SourceOperation(&.{ .clamp = .{
+            .input = output,
+            .min = spec.output_min,
+            .max = spec.output_max,
+            .reuse_owned_input = true,
+        } })) orelse return error.SourceArithmeticUnavailable;
+        if (bounded != output) cb.free(output);
         output = bounded;
     }
     if (!silu_output) return output;

@@ -22927,6 +22927,11 @@ fn bf16SourceOperationOp(ctx: *anyopaque, request: *const ops.Bf16SourceOperatio
             const count = try elementCountFromShape(input_tensor.shape);
             if (count > std.math.maxInt(u32)) return error.InvalidShape;
             const input = try sourceScalarTensor(value.input, count);
+            if (value.reuse_owned_input and canMutateOwnedSourceF32(self, input)) {
+                try self.kernels.launchSourceClampBf16ValuesF32(&self.ctx, input.buffer, input.buffer, count, value.min, value.max);
+                self.stats.launch_elementwise += 1;
+                break :result value.input;
+            }
             var operands = try SourceF32Operands(1).plan(self, .{input}, .{false}, 0);
             var output = try OwnedF32Output.alloc(self, input.shape, count);
             defer output.deinit();
@@ -23132,9 +23137,7 @@ fn roundBf16F32Op(ctx: *anyopaque, input: CT) anyerror!?CT {
     return output.intoTensor();
 }
 
-fn roundOwnedBf16F32Op(ctx: *anyopaque, input: CT) anyerror!bool {
-    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
-    const tensor = tensorFromCt(input);
+fn canMutateOwnedSourceF32(self: *const CudaCompute, tensor: *const CudaTensor) bool {
     if (!isRetainableCacheOutput(tensor) or !tensor.owns_buffer or
         tensor.immutable_graph_input or tensor.physical_storage_base or tensor.physical_lease != null or
         tensor.retained_quota.hasLease() or tensor.training_upload_generation != null or
@@ -23144,6 +23147,13 @@ fn roundOwnedBf16F32Op(ctx: *anyopaque, input: CT) anyerror!bool {
         const scope = self.execution_scope orelse return false;
         if (!scope.owns(tensor.buffer.ptr)) return false;
     }
+    return true;
+}
+
+fn roundOwnedBf16F32Op(ctx: *anyopaque, input: CT) anyerror!bool {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const tensor = tensorFromCt(input);
+    if (!canMutateOwnedSourceF32(self, tensor)) return false;
     _ = try sourceScalarTensor(input, tensor.elem_count);
     try self.kernels.launchRoundBf16F32(&self.ctx, tensor.buffer, tensor.buffer, tensor.elem_count);
     self.stats.launch_elementwise += 1;
@@ -63409,6 +63419,14 @@ test "CUDA cold audio declaration dispatches before any learning invocation" {
     try std.testing.expect(!entry.warmed);
     try std.testing.expect(entry.owner.?.plan.origin == .declared);
     try std.testing.expectEqual(executes_before + 1, compute.audio_arena_executes);
+    const allocations = compute.stats.device_alloc_calls;
+    const bounded = (try cb.tryBf16SourceOperation(&.{ .clamp = .{ .input = first, .min = 0.25, .reuse_owned_input = true } })) orelse return error.TestUnexpectedResult;
+    defer if (bounded != first) cb.free(bounded);
+    try std.testing.expect(first == bounded);
+    try std.testing.expectEqual(allocations, compute.stats.device_alloc_calls);
+    const bounded_values = try cb.toFloat32(bounded, std.testing.allocator);
+    defer std.testing.allocator.free(bounded_values);
+    try std.testing.expectEqualSlices(f32, &.{ 0.5, 0.25, 0.25, 0.5 }, bounded_values);
 }
 
 test "source GEMM row descriptors reject missing physical input before opaque CUDA access" {

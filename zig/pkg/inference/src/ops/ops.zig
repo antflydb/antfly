@@ -152,7 +152,13 @@ pub const SourceRmsLayout = enum { contiguous, channel_major };
 pub const SourceConvReduction = enum { direct_fma, tensorcore, vendor_f32 };
 pub const SourceBiasAddition = enum { gemm_addend, lt_epilogue };
 pub const Bf16SourceOperation = union(enum) {
-    clamp: struct { input: CT, min: ?f32 = null, max: ?f32 = null },
+    clamp: struct {
+        input: CT,
+        min: ?f32 = null,
+        max: ?f32 = null,
+        /// The caller may consume its unique F32 input as the output.
+        reuse_owned_input: bool = false,
+    },
     sinusoidal: struct { frequencies: CT, positions: usize, components: usize, reverse: bool = false, frequency_storage: SourceScalarStorage = .full_f32 },
     softplus: struct { input: CT },
     linear: struct {
@@ -2389,7 +2395,8 @@ pub const ComputeBackend = struct {
     /// Fixed mathematical operations, not an arbitrary callback interpreter.
     /// Every CT is borrowed synchronously; a selected operation returns exactly
     /// one owning F32 tensor whose values publish the declared BF16 boundary.
-    /// Linear with an assigned output instead returns that borrowed destination.
+    /// Assigned linear returns its destination. A consuming clamp may return
+    /// its input when the caller grants mutation and the backend proves ownership.
     pub fn tryBf16SourceOperation(self: *const ComputeBackend, request: *const Bf16SourceOperation) !?CT {
         const op = self.vtable.bf16SourceOperation orelse return null;
         if (self.vtable.operation_services) |services| {
