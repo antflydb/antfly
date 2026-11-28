@@ -2822,12 +2822,19 @@ pub const ComputeBackend = struct {
         rows: usize,
     };
 
+    pub const AudioDispatch = struct {
+        cleanup: @import("../execution/cleanup_context.zig").Context = .{},
+        control: ?InferenceExecutionControl = null,
+        defer_arena: bool = false,
+        geometry: ?GroupedAudioGeometry = null,
+    };
+
     pub const AudioExecutionRegion = struct {
         setControl: ?*const fn (ctx: *anyopaque, control: ?InferenceExecutionControl) ?InferenceExecutionControl = null,
         storage: ?*const fn (ctx: *anyopaque, begin: bool) anyerror!bool = null,
         /// run submits work synchronously. Input handles are borrowed for the
         /// callback and its returned output must own an independent handle.
-        execute: ?*const fn (ctx: *anyopaque, key: u64, inputs: []const CT, context: *anyopaque, run: *const fn (*anyopaque, []const CT) anyerror!CT, cleanup: @import("../execution/cleanup_context.zig").Context, defer_arena: bool, geometry: ?GroupedAudioGeometry) anyerror!?CT = null,
+        execute: ?*const fn (ctx: *anyopaque, key: u64, inputs: []const CT, context: *anyopaque, run: *const fn (*anyopaque, []const CT) anyerror!CT, dispatch: AudioDispatch) anyerror!?CT = null,
     };
 
     pub const TokenSelectionRegion = struct {
@@ -5931,7 +5938,13 @@ pub const ComputeBackend = struct {
         };
         try self.checkExecutionControl();
         const cleanup = if (self.call_context) |invocation| invocation.cleanup else @import("../execution/cleanup_context.zig").Context{};
-        const result = try self.observeBackendEntry(.audio_execution, op, .{ self.ptr, key, inputs, context, run, cleanup, defer_arena, geometry });
+        const dispatch: AudioDispatch = .{
+            .cleanup = cleanup,
+            .control = self.execution_control,
+            .defer_arena = defer_arena,
+            .geometry = geometry,
+        };
+        const result = try self.observeBackendEntry(.audio_execution, op, .{ self.ptr, key, inputs, context, run, dispatch });
         errdefer if (result) |ct| self.free(ct);
         try self.checkExecutionControl();
         return result;
@@ -8010,9 +8023,9 @@ test "audio execution forwards caller cleanup authority" {
     const Invocation = @import("../execution/invocation_context.zig").Context;
     const Epoch = @import("../execution/retirement_sink.zig").Epoch;
     const Fixture = struct {
-        fn execute(raw: *anyopaque, _: u64, _: []const CT, context: *anyopaque, run: *const fn (*anyopaque, []const CT) anyerror!CT, cleanup: Cleanup, _: bool, _: ?ComputeBackend.GroupedAudioGeometry) anyerror!?CT {
+        fn execute(raw: *anyopaque, _: u64, _: []const CT, context: *anyopaque, run: *const fn (*anyopaque, []const CT) anyerror!CT, dispatch: ComputeBackend.AudioDispatch) anyerror!?CT {
             const observed: *Cleanup = @ptrCast(@alignCast(raw));
-            observed.* = cleanup;
+            observed.* = dispatch.cleanup;
             return try run(context, &.{});
         }
         fn body(_: *anyopaque, _: []const CT) anyerror!CT {

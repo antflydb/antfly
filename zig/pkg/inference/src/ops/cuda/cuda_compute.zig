@@ -21427,7 +21427,8 @@ fn runAudioWithWorkspace(
 
 /// One actual warm invocation initializes caches; the next learns lifetimes.
 /// Capture uses only bounded arena addresses and validates every allocation/free.
-fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *anyopaque, run: *const fn (*anyopaque, []const CT) anyerror!CT, cleanup: CacheCleanup, _: bool, geometry: ?ops.ComputeBackend.GroupedAudioGeometry) anyerror!?CT {
+fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *anyopaque, run: *const fn (*anyopaque, []const CT) anyerror!CT, dispatch: ops.ComputeBackend.AudioDispatch) anyerror!?CT {
+    const cleanup = dispatch.cleanup;
     const observation = @import("../../execution/runtime_observation.zig");
     const plan_mod = @import("audio_execution_plan.zig");
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
@@ -21452,7 +21453,7 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
     const first_input = tensorFromCt(inputs[0]);
     const output_bytes = cache_base.output_bytes;
     if (!cache_base.fitsArena()) return null;
-    if (geometry) |group| {
+    if (dispatch.geometry) |group| {
         // A matching sealed plan is the complete capacity proof for replay.
         const existing = self.audioPlanFor(cache_base);
         const sealed = if (existing) |entry| entry.executableFor(cache_base) != null else false;
@@ -21680,6 +21681,7 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
     if (replay or capture) {
         // Capture only records the stable addresses. Stage bytes after a
         // successful recording and immediately before the common launch.
+        if (dispatch.control) |control| try control.check();
         staged_inputs = try stageAudioGraphInputs(self, arena, input_bank, inputs, spans);
         try arena.launch(&self.ctx);
         if (replay) self.audio_graph_replays += 1;
@@ -41105,7 +41107,7 @@ test "embeddinggemma2 CUDA active audio plan declines recursion and cache reclam
     compute.capability_profile = .embedding_gemma2;
     compute.embedding_gemma2_policy = .{ .audio_graph = true };
     compute.audio_execution_active = true;
-    try std.testing.expect(try audioExecutionOp(&compute, 0, undefined, undefined, undefined, .{}, false, null) == null);
+    try std.testing.expect(try audioExecutionOp(&compute, 0, undefined, undefined, undefined, .{}) == null);
     try std.testing.expectError(error.ResourceTemporarilyUnavailable, compute.evictEmbeddingGemma2Caches());
     var plan: @import("audio_execution_plan.zig").Plan = undefined;
     var scope = @import("../../execution/stream_workspace.zig").Scope{ .recipe = .{ .bound = &plan }, .base = 1 };
@@ -60451,7 +60453,7 @@ test "CUDA audio capacity decline leaves the learned plan cache untouched" {
         .rows = rows,
     };
     const inputs = [_]CT{@ptrCast(&hidden)};
-    try std.testing.expect((try audioExecutionOp(&compute, 1, &inputs, &compute, Run.call, .{}, false, geometry)) == null);
+    try std.testing.expect((try audioExecutionOp(&compute, 1, &inputs, &compute, Run.call, .{ .geometry = geometry })) == null);
     try std.testing.expectEqual(@as(u64, 0), compute.audio_plans.clock);
     try std.testing.expect(!compute.audio_execution_active);
 }
@@ -60471,7 +60473,7 @@ test "CUDA audio declines local capture ownership before any SDK query" {
     for ([_]bool{ false, true }) |context_owned| {
         compute.debug_cuda_graph_capture_active = !context_owned;
         compute.ctx.debug_graph_capture_active = context_owned;
-        try std.testing.expect((try audioExecutionOp(&compute, 1, &inputs, &compute, Run.call, .{}, false, null)) == null);
+        try std.testing.expect((try audioExecutionOp(&compute, 1, &inputs, &compute, Run.call, .{})) == null);
         try std.testing.expect(!compute.audio_execution_active);
     }
 }
@@ -60493,7 +60495,7 @@ test "CUDA audio rejects borrowed input as warm or learned publication" {
     };
     for ([_]bool{ false, true }) |warmed| {
         compute.audio_plans.entries[0] = .{ .key = base.key, .stamp = 1, .warmed = warmed };
-        try std.testing.expectError(error.AudioPlanChanged, audioExecutionOp(&compute, 71, &.{@ptrCast(&input)}, &compute, Run.call, .{}, false, null));
+        try std.testing.expectError(error.AudioPlanChanged, audioExecutionOp(&compute, 71, &.{@ptrCast(&input)}, &compute, Run.call, .{}));
         try std.testing.expectEqual(@as(usize, 1), input.resident_references.load(.acquire));
         try std.testing.expect(compute.audio_plans.entries[0].owner == null);
         try std.testing.expectEqual(warmed, compute.audio_plans.entries[0].disabled);
@@ -60520,7 +60522,7 @@ test "CUDA warmed audio declines unfunded learning before borrowing inputs" {
             return error.UnexpectedAudioExecution;
         }
     };
-    try std.testing.expect(try audioExecutionOp(&compute, 71, &.{@ptrCast(&input)}, &compute, Run.call, .{}, false, null) == null);
+    try std.testing.expect(try audioExecutionOp(&compute, 71, &.{@ptrCast(&input)}, &compute, Run.call, .{}) == null);
     try std.testing.expect(compute.audio_plans.entries[0].owner == null and !compute.audio_execution_active);
 }
 
