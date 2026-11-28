@@ -11223,6 +11223,11 @@ pub const NativeFile = struct {
         self.releaseCrossProcessRedoReaderSlot();
         self.releaseRegionBinding();
         if (self.inode_lock_ref.load(.acquire)) |entry| {
+            // Nothing may ever release on this entry again, and the
+            // registry's fairness probe runs only on a later release: cede
+            // a parked kernel lock now, or it blocks an independent flock()
+            // from this process forever. A no-op while a grant remains.
+            inode_lock.cedeParked(entry, io);
             inode_lock.unref(entry, io);
             self.inode_lock_ref.store(null, .release);
         }
@@ -13086,6 +13091,13 @@ pub const NativeFile = struct {
         if (self.reader_fence_lock) |handle| {
             handle.release(self.runtime());
             self.reader_fence_lock = null;
+            // A dedicated reader may cycle generations and then stay idle:
+            // cede its parked lock rather than leave it held with no later
+            // release to probe fairness. The writer-capable root keeps
+            // parking, since its next cycle reacquires for free.
+            if (self.read_only) {
+                if (self.inode_lock_ref.load(.acquire)) |entry| inode_lock.cedeParked(entry, self.runtime());
+            }
         }
     }
     /// Acquires this inode's shared epoch-reuse (exclusive) grant through
