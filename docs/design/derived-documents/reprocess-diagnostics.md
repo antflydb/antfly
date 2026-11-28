@@ -31,9 +31,11 @@ The log omits the source URL. Check the repair ledger for terminal failures.
 An extraction timeout reason on the published generation identifies the reported
 stage for that generation.
 
-Use `antfly_document_pipeline_phase_in_flight` to see phases active at scrape
-time and `antfly_document_pipeline_phase_duration_ns` to measure completed phase
-calls, including errors. For example, a high source-fetch gauge with flat
+Use `antfly_document_pipeline_phase_in_flight` to see phases active when the
+health metrics snapshot was built. The health endpoint refreshes its snapshot
+every five seconds, so a short phase can start and finish between snapshots.
+`antfly_document_pipeline_phase_duration_ns` records completed phase calls,
+including errors. For example, a high source-fetch gauge with flat
 completion counts indicates fetches are still in progress. The reader HTTP
 gauge counts outstanding requests to the reader provider. Compare matching phases on the storage and inference services when
 using hosted inference. Timings can overlap and metrics carry only phase labels.
