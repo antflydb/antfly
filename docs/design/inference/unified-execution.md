@@ -3228,6 +3228,32 @@ twice with zero learned events and bytes. The profiled run reached
 scratch and park admission pressure before its captured plan retired
 during page cleanup.
 
+At `3584e01d9f`, mixed prefill charges the shared decode peers once
+per cohort and retains both queued working sets. All 52 focused Spark
+checks passed without skips. In the first profiled and unprofiled
+256-page runs, both matched serial output at 6.28 pages/s, with 512
+packed prefill chunks and zero retirement-capacity retries. Scratch
+denials delayed the largest graphs and both runs replayed at only 29 rows.
+
+The profiled repeat used `c519052760` as A and `3584e01d9f` as B, under
+the same 24 GiB scratch budget and 256-row prefill limit. All eight arms
+completed 256 pages and 512 packed chunks with exact serial parity and
+zero retirement-capacity retries. Reserved decoder workspace fell from
+1,981,939,712 to 1,405,353,984 bytes in every candidate arm, a reduction
+of 550 MiB (29.1%). These numbers are the shared workspace lease sizes.
+
+| Sequence | Pages/s in run order |
+| --- | ---: |
+| AA | 6.28, 6.24 |
+| ABBA | 6.34, 6.31, 6.37, 6.30 |
+| BB | 6.34, 6.33 |
+
+Pooled paired throughput was 6.32 versus 6.34 pages/s. All four baseline
+arms recorded declared replay at 107 rows. Two candidate arms reached
+113 rows and two reached only 30 or 32 rows. The lower reservation
+preserved throughput in this comparison. Consistent wide replay under
+chunked prefill remains open.
+
 ### Released Inkling Metal checkpoint at `7f0ff56ff8`
 
 Five focused checks passed on M4 Max with zero skips. The released
