@@ -67,6 +67,8 @@ pub const StorageLayout = struct {
     ffn_workspace: ?Span = null,
     ffn_outputs: ?Span = null,
     projection_staging: ?Span = null,
+    attention_norm: ?Span = null,
+    attention_norm_mirror: ?Span = null,
     final_norm_mirror: ?Span = null,
     fused_head_workspace: ?Span = null,
     recurrent_scratch: ?@import("gated_delta.zig").PacketScratch = null,
@@ -185,6 +187,8 @@ pub const StorageLayout = struct {
             self.recurrent_output,
             self.ffn_workspace,
             self.ffn_outputs,
+            self.attention_norm,
+            self.attention_norm_mirror,
         }) |slot| if (slot) |span| {
             end = @max(end, try std.math.add(usize, span.offset, span.bytes));
         };
@@ -365,6 +369,7 @@ pub const GraphPhase = struct {
         compact_ffn: ?bool,
         projection_staging: bool,
         final_norm_mirror: bool = false,
+        attention_norm: bool = false,
     };
 
     /// Resolve layer lifetimes in submission order from the descriptor. A
@@ -377,6 +382,16 @@ pub const GraphPhase = struct {
         if (policy.recurrent_scratch) try self.declareRecurrentScratch();
         try self.declareRecurrentOutput();
         if (policy.compact_ffn) |compact| try self.declareFfnScratch(compact);
+        if (policy.attention_norm) {
+            const elements = try std.math.mul(usize, self.descriptor.rows, self.descriptor.hidden);
+            const norm_bytes = try std.math.mul(usize, elements, @sizeOf(f32));
+            const offset = try StorageLayout.aligned(try self.storage_layout.layerLiveBytes());
+            self.storage_layout.attention_norm = try self.storage_layout.declareLayerRegion(offset, norm_bytes);
+            if (policy.final_norm_mirror) {
+                const mirror_offset = try StorageLayout.aligned(try self.storage_layout.layerLiveBytes());
+                self.storage_layout.attention_norm_mirror = try self.storage_layout.declareLayerRegion(mirror_offset, try std.math.mul(usize, elements, @sizeOf(u16)));
+            }
+        }
         if (policy.projection_staging) try self.declareProjectionStaging();
         if (policy.final_norm_mirror) {
             const rows = self.descriptor.rows;
@@ -886,6 +901,19 @@ pub const Module = struct {
         const layout = self.storage_layout orelse return error.InvalidExecutionPlan;
         const span = layout.fused_head_workspace orelse return error.InvalidExecutionPlan;
         return self.bindLayerWorkspace(layout, span, span.bytes);
+    }
+
+    pub const NormStorage = struct { output: buffer.DeviceBuffer, mirror: ?buffer.DeviceBuffer };
+
+    pub fn bindAttentionNorm(self: *const Module, bytes: usize) !?NormStorage {
+        const layout = self.storage_layout orelse return error.InvalidExecutionPlan;
+        const output = layout.attention_norm orelse return null;
+        if (output.bytes != bytes) return error.InvalidExecutionPlan;
+        const mirror = if (layout.attention_norm_mirror) |span| blk: {
+            if (span.bytes != bytes / 2) return error.InvalidExecutionPlan;
+            break :blk try self.bindLayerWorkspace(layout, span, span.bytes);
+        } else null;
+        return .{ .output = try self.bindLayerWorkspace(layout, output, bytes), .mirror = mirror };
     }
 
     pub fn bindFinalNormMirror(self: *const Module, bytes: usize) !?buffer.DeviceBuffer {

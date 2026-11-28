@@ -4002,6 +4002,8 @@ pub const CudaCompute = struct {
                     .declared_ffn_scratch_bytes = if (layout.ffn_workspace) |span| span.bytes else 0,
                     .declared_ffn_output_bank_bytes = if (layout.ffn_outputs) |span| span.bytes else 0,
                     .declared_projection_staging_bytes = if (layout.projection_staging) |span| span.bytes else 0,
+                    .declared_attention_norm_bytes = if (layout.attention_norm) |span| span.bytes else 0,
+                    .declared_attention_norm_mirror_bytes = if (layout.attention_norm_mirror) |span| span.bytes else 0,
                     .declared_final_norm_mirror_bytes = if (layout.final_norm_mirror) |span| span.bytes else 0,
                     .head_bytes = layout.head_bytes,
                     .shared_head_scratch_bytes = if (layout.shared_head_workspace) |span| span.bytes else 0,
@@ -4240,6 +4242,7 @@ pub const CudaCompute = struct {
             .recurrent_scratch = !self.lighton_fused_gdn_decode_enabled or self.ctx.info.compute_major < 8,
             .compact_ffn = if (lightOnFfnBlockEnabled(cb) and lightOnDevice(self).portableKernels() and !self.lighton_bf16_decode_outputs) self.lighton_bf16_projection_outputs else null,
             .projection_staging = cudaCublasLtEnabled() and self.cublaslt != null and self.ctx.info.compute_major >= 8,
+            .attention_norm = true,
             .final_norm_mirror = cudaRmsNormBf16MirrorEnabled() and cudaCublasLtEnabled() and self.cublaslt != null and self.ctx.info.compute_major >= 8,
         }) catch |err| switch (err) {
             error.InvalidShape, error.Overflow => return .unsupported,
@@ -29907,6 +29910,20 @@ pub fn tryCapturedFinalNorm(cb: *const ops.ComputeBackend, input: CT, weight: CT
         try buffer_mod.validateRegions(4, regions, .{ source.buffer.len, gamma.buffer.len, bytes, span.len }, .{ @alignOf(f32), 1, @alignOf(f32), @alignOf(u16) }, 2);
     }
     return try rmsNormWithDestination(cb.ptr, input, weight, dim, eps, destination, mirror);
+}
+
+pub fn tryCapturedAttentionNorm(cb: *const ops.ComputeBackend, input: CT, weight: CT, dim: usize, eps: f32) !?CT {
+    if (!acceptsPhysicalImplementation(cb.vtable)) return null;
+    const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
+    const owner = &self.bounded_decode_graph;
+    if (!owner.active or self.capability_profile != .lightonocr3 or dim != owner.hidden) return null;
+    const source = tensorFromCt(input);
+    const gamma = tensorFromCt(weight);
+    const bytes = try checkedMul(source.elem_count, @sizeOf(f32));
+    const storage = (try owner.bindAttentionNorm(bytes)) orelse return null;
+    const regions = [_]buffer_mod.DeviceBuffer{ source.buffer, gamma.buffer, storage.output, storage.mirror orelse .{} };
+    try buffer_mod.validateRegions(4, regions, .{ source.buffer.len, gamma.buffer.len, bytes, regions[3].len }, .{ @alignOf(f32), 1, @alignOf(f32), @alignOf(u16) }, 2);
+    return try rmsNormWithDestination(cb.ptr, input, weight, dim, eps, storage.output, storage.mirror);
 }
 
 fn rmsNormWithDestination(ctx: *anyopaque, input: CT, weight: CT, dim: usize, eps: f32, destination: ?buffer_mod.DeviceBuffer, mirror_destination: ?buffer_mod.DeviceBuffer) anyerror!CT {
