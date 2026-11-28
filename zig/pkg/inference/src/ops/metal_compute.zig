@@ -1211,6 +1211,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     /// Widen loaded dense tensors instead of handing 16-bit weights to
     /// projection and token-lookup kernels.
     force_f32_dense_weights: bool = false,
+    /// Dense matrices occupy one immutable, page-aligned CPU/GPU allocation.
+    shared_bf16_matrices: bool = false,
     require_prepared_vision: bool = false,
     require_qwen_vision_resident: bool = false,
     embedding_stage_suspended: bool = false,
@@ -5089,7 +5091,39 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return repacked;
     }
 
+    fn prepareSharedBf16Matrix(self: *MetalCompute, tensor: *tensor_mod.Tensor) !void {
+        if (!self.shared_bf16_matrices or tensor.shape.len != 2) return;
+        if (tensor.dtype != .bf16 or tensor.data.len == 0) return error.UnsupportedSharedBf16Matrix;
+        // Embedding lookup can stage individual rows from an unaligned table.
+        // A linear slot can use only a page-aligned shared allocation.
+        if (tensor.data.len % std.heap.page_size_min != 0) return;
+        const alignment = comptime std.mem.Alignment.fromByteUnits(std.heap.page_size_min);
+        if (tensor.owns_data and tensor.data_alignment.compare(.gte, alignment)) return;
+        const allocator = self.data.allocator;
+        const data = try allocator.alignedAlloc(u8, alignment, tensor.data.len);
+        @memcpy(data, tensor.data);
+        const shape = allocator.dupe(i64, tensor.shape) catch |err| {
+            allocator.free(data);
+            return err;
+        };
+        const name = tensor.name;
+        tensor.deinit();
+        tensor.* = .{
+            .allocator = allocator,
+            .name = name,
+            .dtype = .bf16,
+            .data = data,
+            .shape = shape,
+            .owns_data = true,
+            .owns_shape = true,
+            .data_alignment = alignment,
+        };
+    }
+
     fn nativeDenseLinearBytesForRuntime(self: *MetalCompute, name: []const u8, tensor: *const tensor_mod.Tensor) !?NativeDenseBytes {
+        if (self.shared_bf16_matrices and tensor.shape.len == 2) {
+            return .{ .bytes = tensor.data, .dtype = .bf16, .owned = false };
+        }
         if (self.force_f32_dense_weights) return null;
         const position_table = std.mem.eql(u8, name, "vision_tower.patch_embedder.position_embedding_table") and tensor.shape.len == 3 and tensor.shape[0] == 2;
         const eligible = (tensor.dtype == .bf16 or tensor.dtype == .f16) and (tensor.shape.len == 2 or position_table);
@@ -16475,6 +16509,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (quantized_storage == null and !disableRuntimeEmbeddingLookup()) {
             if (weight_buf.native_dense_bytes) |bytes| {
                 if (weight_buf.native_dense_dtype != null and weight_buf.native_dense_dtype.? == .bf16) {
+                    if (self.shared_bf16_matrices) {
+                        const tensor = (try metal_runtime.decoderRuntimeStagedBf16EmbeddingLookup(self.provider_impl, bytes, ids, total, dim, rows)) orelse
+                            return error.UnsupportedSharedBf16Embedding;
+                        return self.ctFromOwnedMetalTensor(tensor);
+                    }
                     if (try metal_runtime.decoderRuntimeNativeBf16EmbeddingLookup(
                         self.provider_impl,
                         bytes,
@@ -20084,6 +20123,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 }
             }
         }
+        if (self.shared_bf16_matrices and weight_buf.native_dense_dtype == .bf16)
+            return error.UnsupportedSharedBf16Linear;
         if (input_buf.metal_tensor) |*input_metal| {
             if (weight_buf.metal_tensor) |*weight_metal| {
                 if (enableDenseDeviceDotGeneral() and
@@ -28968,6 +29009,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (self.data.lazy_weights.getPtr(name)) |entry| {
             gpu_hosted_store_mod.touchLazyWeight(self.data, entry);
             try gpu_hosted_store_mod.ensureHostLazyWeightLoadedSimple(self.data, entry);
+            if (entry.host_loaded) |*loaded| try self.prepareSharedBf16Matrix(&loaded.tensor);
 
             // Inference-only stores may borrow immutable aligned F32 weights.
             // Pin the source until the request handle is released: prepared
@@ -28993,7 +29035,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 }
             }
 
-            if (!false and preferHostLoadedWeightsDebug()) {
+            if (!self.shared_bf16_matrices and preferHostLoadedWeightsDebug()) {
                 if (entry.host_loaded) |*loaded| {
                     const cached = blk: {
                         const host = try convertTensorToOwnedF32(self.allocator, &loaded.tensor);
@@ -35767,7 +35809,12 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             weight_buf.native_dense_bytes
         else
             null;
-        const dense_bf16_no_copy_safe = dense_bf16_bytes != null and !weight_buf.native_dense_bytes_owned;
+        const require_shared_bf16 = self.shared_bf16_matrices and dense_bf16_bytes != null;
+        const dense_bf16_no_copy_safe = if (dense_bf16_bytes) |bytes|
+            !weight_buf.native_dense_bytes_owned and (!require_shared_bf16 or
+                (@intFromPtr(bytes.ptr) % std.heap.page_size_min == 0 and bytes.len % std.heap.page_size_min == 0))
+        else
+            false;
         if (getenvBool("TERMITE_METAL_TRACE_DENSE_LINEAR_PREPARE") and runtime_quantized_storage == null) {
             std.debug.print(
                 "metal_dense_prepare_request: slot={d} in={d} out={d} has_native_bf16={} native_bytes={d} no_copy_safe={}\n",
@@ -35825,16 +35872,17 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .dense_fallback_max_bytes = request.dense_fallback_max_bytes,
             .lm_head = request.lm_head,
             .lm_head_refine_slot = request.lm_head_refine_slot,
-            .prefer_q8_over_dense_bf16 = request.prefer_q8_over_dense_bf16,
+            .prefer_q8_over_dense_bf16 = !require_shared_bf16 and request.prefer_q8_over_dense_bf16,
             .allow_direct_quant_fallback = request.allow_direct_quant_fallback,
             .prefer_bf16_fallback = request.prefer_bf16_fallback,
             .prefer_f16_mps_fallback = request.prefer_f16_mps_fallback,
-            .prefer_f32_mps_fallback = request.prefer_f32_mps_fallback,
+            .prefer_f32_mps_fallback = !require_shared_bf16 and request.prefer_f32_mps_fallback,
             .require_preferred_dense_precision = request.require_preferred_dense_precision,
             .dense_f32_slot_storage = f32_storage,
             .dense_bf16_bytes = dense_bf16_bytes,
             .dense_f16_bytes = dense_f16_bytes,
             .dense_bf16_no_copy_safe = dense_bf16_no_copy_safe,
+            .require_shared_bf16 = require_shared_bf16,
         }, &self.timing_stats);
     }
 

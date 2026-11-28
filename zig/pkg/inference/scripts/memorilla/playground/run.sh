@@ -14,6 +14,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Start or stop the loopback inference and playground servers with
+# run.sh [start|stop|status]. Set A to the assets directory, D to the
+# span-copy results directory, and PY to a Python with tokenizers.
+# BACKEND=cuda defaults to the BF16 and fast-prefill research mode.
+# BACKEND=metal RESEARCH=1 selects shared BF16 weights and F32 KV.
+# RESEARCH=0 selects F32. BIN can point to a custom inference build.
+
 set -euo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 W=$(cd "$HERE/../../../../../.." && pwd)
@@ -32,18 +39,27 @@ case "$BACKEND" in
     RESEARCH=${RESEARCH:-1}
     PROCESS_MEMORY_MB=114688
     HOST_MEMORY_GIB=48
+    DEVICE_MEMORY_GIB=100
     COMBINED_MEMORY_GIB=104
     ;;
   metal)
     RESEARCH=${RESEARCH:-0}
-    PROCESS_MEMORY_MB=147456
-    HOST_MEMORY_GIB=96
-    COMBINED_MEMORY_GIB=144
+    if [ "$RESEARCH" = 1 ]; then
+      PROCESS_MEMORY_MB=32768
+      HOST_MEMORY_GIB=12
+      DEVICE_MEMORY_GIB=30
+      COMBINED_MEMORY_GIB=32
+    else
+      PROCESS_MEMORY_MB=147456
+      HOST_MEMORY_GIB=96
+      DEVICE_MEMORY_GIB=100
+      COMBINED_MEMORY_GIB=144
+    fi
     ;;
   *) echo "BACKEND must be cuda or metal"; exit 1 ;;
 esac
-if [ "$BACKEND" = metal ] && [ "$RESEARCH" != 0 ]; then
-  echo "Metal requires RESEARCH=0"; exit 1
+if [ "$RESEARCH" != 0 ] && [ "$RESEARCH" != 1 ]; then
+  echo "RESEARCH must be 0 or 1"; exit 1
 fi
 PROFILE=memorilla-span-cascade
 mkdir -p "$STATE"
@@ -85,7 +101,7 @@ write_config() {
     "inference": {
       "memory": {
         "max_host_bytes": $((HOST_MEMORY_GIB * 1024 * 1024 * 1024)),
-        "max_device_bytes": 107374182400,
+        "max_device_bytes": $((DEVICE_MEMORY_GIB * 1024 * 1024 * 1024)),
         "max_combined_bytes": $((COMBINED_MEMORY_GIB * 1024 * 1024 * 1024)),
         "max_kv_bytes": 4294967296,
         "max_scratch_bytes": 17179869184
@@ -141,7 +157,8 @@ start() {
     (
       if [ "$BACKEND" = metal ]; then
         export ANTFLY_INFERENCE_REQUIRED_BACKEND=metal
-        unset ANTFLY_MEMORILLA_RESEARCH_BF16_MATRICES ANTFLY_MEMORILLA_RESEARCH_FAST_PREFILL
+        export ANTFLY_MEMORILLA_RESEARCH_BF16_MATRICES="$RESEARCH"
+        unset ANTFLY_MEMORILLA_RESEARCH_FAST_PREFILL
       else
         export CUDA_CACHE_PATH=$W/zig/pkg/inference/.zig-cache/cuda
         if [ "$RESEARCH" = 1 ]; then

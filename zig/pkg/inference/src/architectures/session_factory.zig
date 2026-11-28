@@ -2862,8 +2862,9 @@ fn createGpuHostedSessionWithTaskOverride(
     const memorilla_generation = if (mf.memorilla_profile) |profile| blk: {
         if (backend_type != .metal or override != null or a4b_request != null or arch_config != .gpt or arch_config.gpt.family != .qwen3)
             return error.UnsupportedMemorillaArtifact;
-        if (memorilla_qualification.researchBf16Matrices() or memorilla_qualification.researchFastPrefill())
-            return error.UnsupportedMemorillaPrecision;
+        if (memorilla_qualification.researchFastPrefill()) return error.UnsupportedMemorillaPrecision;
+        if (memorilla_qualification.researchBf16Matrices() and
+            (@import("builtin").os.tag != .macos or @import("builtin").cpu.arch != .aarch64)) return error.UnsupportedMemorillaDevice;
         const before = try memorilla_qualification.artifactGeneration(allocator, std.Options.debug_io, model_path, profile, control);
         try memorilla_qualification.requireRecipe(profile, mf);
         try memorilla_qualification.verifyArtifacts(allocator, model_path, profile, control);
@@ -3159,6 +3160,7 @@ fn createGpuHostedSessionWithTaskOverride(
         .kernel_jit_load_context = .dynamic,
         .metal_jit_scope = metal_jit_scope,
         .memorilla_profile = mf.memorilla_profile,
+        .memorilla_metal_bf16 = mf.memorilla_profile != null and memorilla_qualification.researchBf16Matrices(),
         .budget_floor = budget_floor,
         .shared_cache_budget_floor = shared_cache_floor,
         .backend_data = makeGpuHostedBackendData(backend_type, .{
@@ -6622,6 +6624,7 @@ fn makeMetalHostedComputeBackend(
     );
     compute.require_f32_linears = self.arch_config == .embedding_gemma2 or self.memorilla_profile != null;
     compute.force_f32_dense_weights = self.memorilla_profile != null;
+    compute.shared_bf16_matrices = self.memorilla_metal_bf16;
     compute.qwen35_ocr_deferred_attention = switch (self.arch_config) {
         .gpt => |cfg| cfg.hasQwen35VisionArchitectureContract() and
             ((cfg.hidden_size == 1024 and cfg.intermediate_size == 3584 and cfg.num_hidden_layers == 24) or
@@ -8054,6 +8057,7 @@ const BackendData = union {
 
 const ArchSession = struct {
     memorilla_profile: ?memorilla_qualification.Profile = null,
+    memorilla_metal_bf16: bool = false,
     // Independent of the model execution lane: preparation can overlap model
     // work. Session close follows worker shutdown, like the borrowed device.
     video_coefficient_mutex: std.Io.Mutex = .init,
@@ -8884,7 +8888,8 @@ pub fn requireMemorillaProfile(session: Session, expected: memorilla_qualificati
     if (self.backend_type == .metal) {
         if (comptime !build_options.enable_metal) return error.MetalNotEnabled;
         const data = gpuBackendData(self);
-        if (!data.prefer_f32_dense_tensors or data.allow_direct_quant) return error.UnsupportedMemorillaPrecision;
+        if (!data.prefer_f32_dense_tensors or data.allow_direct_quant or
+            self.memorilla_metal_bf16 != memorilla_qualification.researchBf16Matrices()) return error.UnsupportedMemorillaPrecision;
         return;
     }
     if (comptime !build_options.enable_cuda) return error.CudaNotEnabled;
@@ -8960,7 +8965,8 @@ pub fn requireMemorillaBackend(session: Session, expected: memorilla_qualificati
         if (comptime !build_options.enable_metal) return error.MetalNotEnabled;
         if (backend.kind() != .metal) return error.UnsupportedMemorillaBackend;
         const compute: *const MetalCompute = @ptrCast(@alignCast(backend.ptr));
-        if (compute.data != gpuBackendData(self) or !compute.require_f32_linears or !compute.force_f32_dense_weights) return error.UnsupportedMemorillaPrecision;
+        if (compute.data != gpuBackendData(self) or !compute.require_f32_linears or
+            !compute.force_f32_dense_weights or compute.shared_bf16_matrices != self.memorilla_metal_bf16) return error.UnsupportedMemorillaPrecision;
         return;
     }
     if (comptime build_options.enable_cuda) {
@@ -9568,6 +9574,7 @@ pub fn getComputeBackendBorrowingSharedProvider(session: Session, allocator: std
     );
     compute.require_f32_linears = self.arch_config == .embedding_gemma2 or self.memorilla_profile != null;
     compute.force_f32_dense_weights = self.memorilla_profile != null;
+    compute.shared_bf16_matrices = self.memorilla_metal_bf16;
     var cb = compute.ownedComputeBackend();
     errdefer cb.deinit();
     try cb.beginRequest();

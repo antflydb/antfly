@@ -643,12 +643,19 @@ span-window and `read_mode: none` paths use the Metal profile. Supply the
 `model_identity` returned by that encoder on the same Metal server as
 `encoder_execution_identity`.
 
-The Metal profile uses F32 weights and fresh F32 decoder KV. Set finite host,
-device, combined, KV and scratch limits and provision memory for both model
-working sets. Leave the CUDA BF16 and fast-prefill research flags unset.
-The standalone released and copy17 research profiles still require CUDA.
-The Metal route is experimental pending an end-to-end run on the pinned
-checkpoints.
+The default Metal profile widens the checkpoint weights to F32. On Apple
+silicon, set `ANTFLY_MEMORILLA_RESEARCH_BF16_MATRICES=1` to keep the pinned
+Qwen3 matrices in BF16 and share their storage with the GPU. Token lookup
+stages only the rows it needs. Both modes use F32 decoder KV and F32
+normalization, residuals and reader arithmetic. The BF16 mode has its own
+encoder and decoder execution identities. Leave
+`ANTFLY_MEMORILLA_RESEARCH_FAST_PREFILL` unset on Metal.
 
-The playground launcher accepts `BACKEND=metal` with the same bundle
-and tokenizer inputs as the CUDA launcher.
+Set finite host, device, combined, KV and scratch limits and provision
+memory for both working sets. The two pinned BF16 checkpoints total
+about 23 GiB before the reader, request scratch and KV. The standalone
+released and copy17 research profiles still require CUDA.
+
+The playground launcher accepts `BACKEND=metal RESEARCH=1` for BF16 and
+`BACKEND=metal RESEARCH=0` for F32, with the same bundle and tokenizer inputs
+as the CUDA launcher. Metal serving remains experimental.

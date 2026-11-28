@@ -11955,7 +11955,9 @@ fn estimateBaseModelLoadAdmission(
         const qualified = @import("../models/memorilla_qualification.zig");
         try qualified.requireRecipe(profile, man);
         var amounts = try qualified.residencyPlan(man.allocator, profile, model_path);
-        if (backend_runtime.backend == .metal) {
+        if (backend_runtime.backend == .metal and qualified.researchBf16Matrices()) {
+            amounts = qualified.metalBf16ResidencyPlan(amounts.resident.host_weight_bytes);
+        } else if (backend_runtime.backend == .metal) {
             // The Metal store keeps widened host weights for lazy device upload.
             amounts.peak.host_weight_bytes = try std.math.add(usize, amounts.peak.host_weight_bytes, amounts.peak.backend_weight_bytes);
             amounts.resident.host_weight_bytes = amounts.peak.host_weight_bytes;

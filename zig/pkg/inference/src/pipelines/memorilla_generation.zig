@@ -458,13 +458,13 @@ pub const Decoder = struct {
     tokenizer: tok.Tokenizer,
     execution_mutex: *std.atomic.Mutex,
     execution_lane: ?*control_mod.ExecutionLane = null,
-    policy: enum { cuda_f32, metal_f32, native_f32_reference } = .cuda_f32,
+    policy: enum { cuda_f32, metal_f32_kv, native_f32_reference } = .cuda_f32,
 
     pub fn fromQualifiedSession(session: @import("../backends/session.zig").Session, backend: *const CB, tokenizer: tok.Tokenizer, mutex: *std.atomic.Mutex) !Decoder {
         const factory = @import("../architectures/session_factory.zig");
         try factory.requireMemorillaBackend(session, .qwen3_decoder_f32_kv_f32_v1, backend);
         const config = try factory.requireMemorillaDecoderF32(session);
-        return .{ .backend = backend, .config = config, .tokenizer = tokenizer, .execution_mutex = mutex, .policy = if (backend.kind() == .metal) .metal_f32 else .cuda_f32 };
+        return .{ .backend = backend, .config = config, .tokenizer = tokenizer, .execution_mutex = mutex, .policy = if (backend.kind() == .metal) .metal_f32_kv else .cuda_f32 };
     }
 
     fn validate(self: Decoder) !void {
@@ -473,11 +473,11 @@ pub const Decoder = struct {
             if (self.backend.kind() != .native) return error.UnsupportedMemorillaBackend;
             return;
         }
-        if (self.policy == .metal_f32) {
+        if (self.policy == .metal_f32_kv) {
             if (comptime !build_options.enable_metal) return error.MetalNotEnabled;
             if (self.backend.kind() != .metal) return error.UnsupportedMemorillaBackend;
             const compute: *const @import("../ops/metal_compute.zig").MetalCompute = @ptrCast(@alignCast(self.backend.ptr));
-            if (!compute.require_f32_linears) return error.UnqualifiedMemorillaDecoderPrecision;
+            if (!compute.require_f32_linears or !compute.force_f32_dense_weights) return error.UnqualifiedMemorillaDecoderPrecision;
             return;
         }
         if (self.backend.kind() != .cuda) return error.UnsupportedMemorillaBackend;
@@ -734,7 +734,7 @@ fn run(a: A, decoder: Decoder, cb: *const CB, prompt: Prompt, request: Request, 
     }
     // One speculative verification of `request.draft_text` after the first
     // token (greedy only: no trace, teacher forcing, thinking or ignore_eos).
-    const speculate = (request.draft_text != null or request.draft_context != null) and request.mode == .plain and request.teacher_forced_ids == null and
+    const speculate = cb.kind() == .cuda and (request.draft_text != null or request.draft_context != null) and request.mode == .plain and request.teacher_forced_ids == null and
         request.trace == null and !request.ignore_eos and speculativeDraftsEnabled();
     while (generated.items.len < request.max_new_tokens) {
         const step = generated.items.len;
@@ -882,13 +882,21 @@ fn testConfig() gpt_model.Config {
 }
 
 test "Memorilla Metal Qwen3 tapped encoder and F32 KV decoder match native" {
+    try testMetalQwen3(false);
+}
+
+test "Memorilla Metal shared BF16 Qwen3 projections and F32 KV match native" {
+    try testMetalQwen3(true);
+}
+
+fn testMetalQwen3(comptime bf16: bool) !void {
     if (comptime !build_options.enable_metal) return error.SkipZigTest;
     if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
     const a = std.testing.allocator;
     const native = @import("../ops/native_compute.zig");
     const Tensor = @import("../backends/tensor.zig").Tensor;
     const hidden = 128;
-    const vocab = 8;
+    const vocab = if (bf16) 128 else 8;
     var config = testConfig();
     config.hidden_size = hidden;
     config.intermediate_size = hidden;
@@ -903,10 +911,12 @@ test "Memorilla Metal Qwen3 tapped encoder and F32 KV decoder match native" {
     defer native_store.deinitOwned();
     const dimensions = [_]i64{hidden};
     const matrix_dimensions = [_]i64{ hidden, hidden };
-    const embedding_dimensions = [_]i64{ vocab, hidden };
+    const head_dimensions = [_]i64{ vocab, hidden };
+    // The released encoder's token table is not a multiple of a Metal page.
+    const embedding_dimensions = [_]i64{ if (bf16) vocab - 1 else vocab, hidden };
     const specs = [_]struct { name: []const u8, shape: []const i64 }{
         .{ .name = "model.embed_tokens.weight", .shape = &embedding_dimensions },
-        .{ .name = "lm_head.weight", .shape = &embedding_dimensions },
+        .{ .name = "lm_head.weight", .shape = &head_dimensions },
         .{ .name = "model.layers.0.self_attn.q_proj.weight", .shape = &matrix_dimensions },
         .{ .name = "model.layers.0.self_attn.k_proj.weight", .shape = &matrix_dimensions },
         .{ .name = "model.layers.0.self_attn.v_proj.weight", .shape = &matrix_dimensions },
@@ -926,6 +936,30 @@ test "Memorilla Metal Qwen3 tapped encoder and F32 KV decoder match native" {
         const values = try a.alloc(f32, count);
         defer a.free(values);
         for (values, 0..) |*value, j| value.* = if (spec.shape.len == 1) 1 else @sin(@as(f32, @floatFromInt((j + 1) * (index + 1))) * 0.17) * 0.1;
+        if (bf16 and spec.shape.len == 2) {
+            const bytes = try a.alloc(u8, count * 2);
+            errdefer a.free(bytes);
+            for (values, 0..) |*value, offset| {
+                const bits: u32 = @bitCast(value.*);
+                const rounded: u16 = @truncate((bits + 0x7fff + ((bits >> 16) & 1)) >> 16);
+                value.* = @bitCast(@as(u32, rounded) << 16);
+                std.mem.writeInt(u16, bytes[offset * 2 ..][0..2], rounded, .little);
+            }
+            const key = try a.dupe(u8, spec.name);
+            errdefer a.free(key);
+            try metal_weights.store.lazy_weights.putNoClobber(a, key, .{
+                .tensor_ref = .{ .name = key, .byte_len = bytes.len },
+                .host_loaded = .{ .tensor = .{
+                    .allocator = a,
+                    .name = key,
+                    .dtype = .bf16,
+                    .shape = spec.shape,
+                    .data = bytes,
+                    .owns_data = true,
+                    .owns_shape = false,
+                } },
+            });
+        }
         const native_key = try a.dupe(u8, spec.name);
         {
             errdefer a.free(native_key);
@@ -933,12 +967,17 @@ test "Memorilla Metal Qwen3 tapped encoder and F32 KV decoder match native" {
             errdefer tensor.deinit();
             try native_store.resident_weights.putNoClobber(a, native_key, .{ .tensor = tensor });
         }
-        const metal_key = try a.dupe(u8, spec.name);
-        errdefer a.free(metal_key);
-        try metal_weights.insertWeightFromTensor(metal_key, &native_store.resident_weights.getPtr(native_key).?.tensor);
+        if (!bf16 or spec.shape.len == 1) {
+            const metal_key = try a.dupe(u8, spec.name);
+            errdefer a.free(metal_key);
+            try metal_weights.insertWeightFromTensor(metal_key, &native_store.resident_weights.getPtr(native_key).?.tensor);
+        }
     }
     var metal_cb = try metal_weights.compute(std.testing.io);
     defer metal_cb.deinit();
+    const metal_compute: *@import("../ops/metal_compute.zig").MetalCompute = @ptrCast(@alignCast(metal_cb.ptr));
+    metal_compute.force_f32_dense_weights = true;
+    metal_compute.shared_bf16_matrices = bf16;
     var native_compute = native.NativeCompute.init(a, &native_store, null);
     defer native_compute.deinit();
     const native_cb = native_compute.computeBackend();
@@ -985,11 +1024,23 @@ test "Memorilla Metal Qwen3 tapped encoder and F32 KV decoder match native" {
         defer reservation.deinit();
         const rows = try cb.fromFloat32Shape(&features, &.{ 1, hidden });
         defer cb.free(rows);
-        const decoder = Decoder{ .backend = cb, .config = config, .tokenizer = TestTokenizer.handle(), .execution_mutex = &mutex, .policy = if (cb.kind() == .metal) .metal_f32 else .native_f32_reference };
+        const decoder = Decoder{ .backend = cb, .config = config, .tokenizer = TestTokenizer.handle(), .execution_mutex = &mutex, .policy = if (cb.kind() == .metal) .metal_f32_kv else .native_f32_reference };
         var result = try generate(a, decoder, &text, .{ .backend = cb, .tensor = rows }, .{ .max_new_tokens = 2, .teacher_forced_ids = &.{ 3, 4 }, .trace = .{ .context = scores, .logits = Scores.record } }, &reservation, .{}, .{ .native_call_policy = .in_process });
         defer result.deinit();
         try std.testing.expectEqualSlices(i32, &.{ 3, 4 }, result.token_ids.?);
         try std.testing.expectEqual(@as(usize, 3), scores.count);
+    }
+    if (bf16) {
+        for (specs) |spec| {
+            if (spec.shape.len != 2) continue;
+            const tensor = metal_weights.store.lazy_weights.getPtr(spec.name).?.host_loaded.?.tensor;
+            try std.testing.expectEqual(.bf16, tensor.dtype);
+            if (std.mem.eql(u8, spec.name, "model.embed_tokens.weight")) {
+                try std.testing.expect(tensor.data.len % std.heap.page_size_min != 0);
+            } else {
+                try std.testing.expect(tensor.data_alignment.toByteUnits() >= std.heap.page_size_min);
+            }
+        }
     }
     for (expected.rows, actual.rows) |want, got| {
         for (want, got) |x, y| try std.testing.expectApproxEqAbs(x, y, 0.001);

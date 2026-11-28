@@ -2794,6 +2794,30 @@ pub fn decoderRuntimeNativeBf16EmbeddingLookup(
     dim: usize,
     rows: usize,
 ) !?MetalTensor {
+    return decoderRuntimeBf16EmbeddingLookup(self, bytes, mmap_source_bytes, ids, total, dim, rows, false);
+}
+
+pub fn decoderRuntimeStagedBf16EmbeddingLookup(
+    self: anytype,
+    bytes: []const u8,
+    ids: []const i64,
+    total: usize,
+    dim: usize,
+    rows: usize,
+) !?MetalTensor {
+    return decoderRuntimeBf16EmbeddingLookup(self, bytes, null, ids, total, dim, rows, true);
+}
+
+fn decoderRuntimeBf16EmbeddingLookup(
+    self: anytype,
+    bytes: []const u8,
+    mmap_source_bytes: ?[]const u8,
+    ids: []const i64,
+    total: usize,
+    dim: usize,
+    rows: usize,
+    stage_rows_only: bool,
+) !?MetalTensor {
     const runtime = self.raw_decode_runtime orelse return null;
     if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
     if (total == 0 or dim == 0 or rows == 0 or ids.len != total) return null;
@@ -2813,9 +2837,9 @@ pub fn decoderRuntimeNativeBf16EmbeddingLookup(
     var output = try MetalTensor.deviceAllocate(runtime, total * dim * @sizeOf(f32), .private, &shape);
     errdefer output.deinit();
 
-    const row_staging_candidate = mmap_source_bytes != null and
+    const row_staging_candidate = stage_rows_only or (mmap_source_bytes != null and
         !nativeBf16EmbeddingRowStagingDisabled() and
-        expected_bytes >= nativeBf16EmbeddingRowStagingMinBytes();
+        expected_bytes >= nativeBf16EmbeddingRowStagingMinBytes());
     if (row_staging_candidate) {
         const staged_rc = termite_metal_decode_runtime_embedding_lookup_bf16_staged_rows_device(
             runtime,
@@ -2829,6 +2853,10 @@ pub fn decoderRuntimeNativeBf16EmbeddingLookup(
             output.deviceByteOffset(),
         );
         if (staged_rc == 0) return output;
+        if (stage_rows_only) {
+            output.deinit();
+            return null;
+        }
     }
 
     var prepared = false;
@@ -11653,6 +11681,8 @@ pub fn decoderRuntimePrepareLinear(self: anytype, request: anytype, stats: anyty
         else
             -1;
         if (rc != 0) {
+            if (@hasField(@TypeOf(request), "require_shared_bf16") and request.require_shared_bf16)
+                return error.UnsupportedSharedBf16Linear;
             rc = termite_metal_decode_runtime_prepare_linear_bf16(
                 runtime,
                 request.slot,

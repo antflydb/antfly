@@ -235,6 +235,18 @@ pub fn residencyPlan(a: A, profile: Profile, directory: []const u8) !ResidencyPl
     return .{ .peak = peak, .resident = resident };
 }
 
+/// The stored BF16 matrices are shared CPU/GPU pages on Apple silicon.
+pub fn metalBf16ResidencyPlan(source_bytes: usize) ResidencyPlan {
+    const resident: memory.AdmissionAmounts = .{
+        .backend_weight_bytes = source_bytes,
+        // F32 norms, zero biases, Metal slot metadata and persistent state.
+        .backend_scratch_bytes = 128 * 1024 * 1024,
+    };
+    var peak = resident;
+    peak.host_scratch_bytes = 256 * 1024 * 1024;
+    return .{ .peak = peak, .resident = resident };
+}
+
 pub fn role(profile: Profile) Role {
     return switch (profile) {
         .qwen3_encoder_f32_v1, .qwen3_encoder_lora_research_f32_v1 => .encoder,
@@ -272,13 +284,28 @@ pub fn executionIdentity(profile: Profile) [64]u8 {
 
 pub fn executionIdentityForBackend(profile: Profile, backend: @import("../backends/backends.zig").BackendType) [64]u8 {
     if (backend != .metal) return executionIdentity(profile);
+    return metalExecutionIdentity(profile, researchBf16Matrices());
+}
+
+fn metalExecutionIdentity(profile: Profile, bf16: bool) [64]u8 {
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
-    hash.update("antfly.memorilla.execution.metal-f32.v1\x00");
+    hash.update(if (bf16) "antfly.memorilla.execution.metal-bf16-weights-f32-kv.v1\x00" else "antfly.memorilla.execution.metal-f32.v1\x00");
     hash.update(@tagName(profile));
     hash.update(canonicalManifest(profile));
     if (isResearch(profile)) hash.update("research-lock-in-directory") else hash.update(lock_bytes);
     hash.update(question_recipe);
     return std.fmt.bytesToHex(hash.finalResult(), .lower);
+}
+
+test "Memorilla Metal BF16 has its own identity and charges shared weights once" {
+    const profile: Profile = .qwen3_encoder_f32_v1;
+    try std.testing.expect(!std.mem.eql(u8, &metalExecutionIdentity(profile, true), &metalExecutionIdentity(profile, false)));
+    try std.testing.expect(!std.mem.eql(u8, &metalExecutionIdentity(profile, true), &executionIdentity(profile)));
+    const source = 8 * 1024 * 1024 * 1024;
+    const plan = metalBf16ResidencyPlan(source);
+    try std.testing.expectEqual(source, plan.resident.backend_weight_bytes);
+    try std.testing.expectEqual(@as(usize, 0), plan.resident.host_weight_bytes);
+    try std.testing.expect(plan.peak.host_scratch_bytes != 0);
 }
 
 /// Exact `model_manifest.json` bytes a directory must carry for `profile`.
