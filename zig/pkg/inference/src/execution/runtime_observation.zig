@@ -376,6 +376,7 @@ pub const KernelScope = struct {
     cuda_vendor_convolution: ?CudaVendorConvolution = null,
     cuda_decoder_workspace: ?CudaDecoderWorkspace = null,
     cuda_decoder_declines: ?CudaDecoderDeclines = null,
+    cuda_decoder_retirements: ?CudaDecoderRetirements = null,
     attached: bool = false,
     /// Must be called only after the owner reaches final address-stable storage.
     pub fn begin(self: *KernelScope) void {
@@ -632,6 +633,46 @@ noinline fn cudaDecoderDeclinedEnabled(reason: CudaDecoderDeclines.Reason) void 
         if (scope.cuda_decoder_declines == null) scope.cuda_decoder_declines = .{};
         switch (reason) {
             inline else => |tag| @field(scope.cuda_decoder_declines.?, @tagName(tag)) +|= 1,
+        }
+    }
+}
+
+/// Successful destruction of a previously bound decoder cohort.
+pub const CudaDecoderRetirements = struct {
+    before_recording: u64 = 0,
+    before_replay: u64 = 0,
+    after_replay: u64 = 0,
+    unavailable: u64 = 0,
+    last: Event,
+
+    pub const Reason = enum {
+        state_mutation,
+        reader_epoch,
+        foreground_step,
+        foreground_vision,
+        foreground_prefill,
+        page_state_cleanup,
+        mixed_prefill,
+        eager_decode,
+        binding_changed,
+        epoch_finished,
+    };
+    pub const Stage = enum { before_recording, before_replay, after_replay, unavailable };
+    pub const Event = struct { reason: Reason, stage: Stage, rows: usize };
+};
+
+pub inline fn cudaDecoderRetired(event: CudaDecoderRetirements.Event) void {
+    if (active_kernels != null) cudaDecoderRetiredEnabled(event);
+}
+
+noinline fn cudaDecoderRetiredEnabled(event: CudaDecoderRetirements.Event) void {
+    var active = active_kernels;
+    while (active) |scope| : (active = scope.previous) {
+        if (scope.cuda_decoder_retirements == null) scope.cuda_decoder_retirements = .{ .last = event };
+        const result = &scope.cuda_decoder_retirements.?;
+        result.last = event;
+        switch (event.stage) {
+            inline else => |stage| @field(result, @tagName(stage)) +|= 1,
         }
     }
 }

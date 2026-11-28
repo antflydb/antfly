@@ -119,6 +119,7 @@ pub const Report = struct {
     cuda_vendor_convolution: ?@import("runtime_observation.zig").CudaVendorConvolution = null,
     cuda_decoder_workspace: ?@import("runtime_observation.zig").CudaDecoderWorkspace = null,
     cuda_decoder_declines: ?@import("runtime_observation.zig").CudaDecoderDeclines = null,
+    cuda_decoder_retirements: ?@import("runtime_observation.zig").CudaDecoderRetirements = null,
     /// Available from the corresponding successfully published physical Frame.
     assigned_regions: ?@import("stats.zig").AssignedRegions = null,
     owned_program_fallbacks: ?ProgramFallbacks = null,
@@ -157,6 +158,7 @@ pub const Report = struct {
         report.cuda_vendor_convolution = value.runtime.cuda_vendor_convolution;
         report.cuda_decoder_workspace = value.runtime.cuda_decoder_workspace;
         report.cuda_decoder_declines = value.runtime.cuda_decoder_declines;
+        report.cuda_decoder_retirements = value.runtime.cuda_decoder_retirements;
         if (value.pending_interval != null) report.synchronous_interval = .pending_phase_only;
         if (value.error_name) |failure| report.failure = @import("runtime_observation.zig").FailureText.init(failure.view());
         if (value.program_error) |failure| {
@@ -448,6 +450,7 @@ test "uniform report retains bounded CUDA decoder workspace after completed publ
     var scope: observation.KernelScope = undefined;
     scope.begin();
     observation.cudaDecoderDeclined(.missing_kv_binding);
+    observation.cudaDecoderRetired(.{ .reason = .page_state_cleanup, .stage = .before_recording, .rows = 113 });
     var warmed = workspace;
     warmed.route = .warmed;
     warmed.plan_origin = null;
@@ -467,11 +470,14 @@ test "uniform report retains bounded CUDA decoder workspace after completed publ
         observation.cudaDecoderDeclined(.admission_or_revalidation);
         observation.cudaDecoderDeclined(.unbacked_kv_pages);
         observation.cudaDecoderDeclined(.workspace_admission);
+        const retired: observation.CudaDecoderRetirements.Event = .{ .reason = .binding_changed, .stage = .before_replay, .rows = 96 };
+        observation.cudaDecoderRetired(retired);
         observation.cudaDecoderWorkspace(workspace);
         _ = nested.finish();
         var replayed = workspace;
         replayed.replayed_bursts = 1;
         try std.testing.expectEqual(replayed, nested.cuda_decoder_workspace.?);
+        try std.testing.expectEqualDeep(observation.CudaDecoderRetirements{ .before_replay = 1, .last = retired }, nested.cuda_decoder_retirements.?);
         try std.testing.expectEqualDeep(observation.CudaDecoderDeclines{ .admission_or_revalidation = 1, .unbacked_kv_pages = 1, .workspace_admission = 1 }, nested.cuda_decoder_declines.?);
     }
     _ = scope.finish();
@@ -484,6 +490,12 @@ test "uniform report retains bounded CUDA decoder workspace after completed publ
     expected.recorded_bursts = 1;
     expected.replayed_bursts = 1;
     try std.testing.expectEqual(expected, source.snapshot().?.report.?.cuda_decoder_workspace.?);
+    try std.testing.expectEqualDeep(observation.CudaDecoderRetirements{
+        .before_recording = 1,
+        .before_replay = 1,
+        .last = .{ .reason = .binding_changed, .stage = .before_replay, .rows = 96 },
+    }, source.snapshot().?.report.?.cuda_decoder_retirements.?);
+
     try std.testing.expectEqualDeep(observation.CudaDecoderDeclines{ .missing_kv_binding = 1, .admission_or_revalidation = 1, .unbacked_kv_pages = 1, .workspace_admission = 1 }, source.snapshot().?.report.?.cuda_decoder_declines.?);
 }
 

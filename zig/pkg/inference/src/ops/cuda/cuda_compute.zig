@@ -3681,7 +3681,7 @@ pub const CudaCompute = struct {
         if (!owner.mutex.tryLock()) return error.ReaderEpochBackendBusy;
         defer owner.mutex.unlock();
         if (owner.epoch_id != epoch) return;
-        try self.clearCapturedGraphWithCleanup(current);
+        try self.retireCapturedGraph(current, .epoch_finished);
         owner.epoch_id = 0;
     }
     pub fn endLightOnDecodeGraphEpoch(cb: *const ops.ComputeBackend, epoch: u64) void {
@@ -4101,7 +4101,7 @@ pub const CudaCompute = struct {
         if (!acceptsPhysicalImplementation(cb.vtable)) return error.UnsupportedReaderEpochBackend;
         try beginRequestUsing(cb.ptr, current);
     }
-    pub const GraphRetirement = enum { state_mutation, reader_epoch, foreground_step, foreground_vision, foreground_prefill, page_state_cleanup, mixed_prefill, eager_decode };
+    pub const GraphRetirement = @import("../../execution/runtime_observation.zig").CudaDecoderRetirements.Reason;
 
     pub fn invalidateLightOnDecodeGraphWithCleanup(cb: *const ops.ComputeBackend, current: CacheCleanup, reason: GraphRetirement) !void {
         return invalidateLightOnDecodeGraphMatching(cb, current, reason, null);
@@ -4122,11 +4122,7 @@ pub const CudaCompute = struct {
         defer self.bounded_decode_graph.mutex.unlock();
         const owner = &self.bounded_decode_graph;
         if (!owner.retirementPending() or !owner.references(dependency)) return;
-        if (owner.phase != .disabled and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
-            std.debug.print("LIGHTONOCR3 cuda_model_graph_retired reason={s} phase={s} epoch={d} rows={d} progress={d}\n", .{
-                @tagName(reason), @tagName(owner.phase), owner.epoch_id, owner.rows, owner.progress,
-            });
-        try self.clearCapturedGraphWithCleanup(current);
+        try self.retireCapturedGraph(current, reason);
     }
     pub fn externalPrefillEnabled(cb: *const ops.ComputeBackend) bool {
         if (!acceptsPhysicalImplementation(cb.vtable)) return false;
@@ -4355,8 +4351,7 @@ pub const CudaCompute = struct {
             }
             // Exact invalid graph dies under the ACTUAL B before outside
             // reservation, so its quota returns when this caller parks.
-            try owner.clearWithCleanup(&self.ctx, current);
-            if (self.captured_cache_roots) |roots| roots.releaseRoots(self, current);
+            try self.retireCapturedGraph(current, .binding_changed);
             phase.old = owner.snapshot();
             phase.mode = .storage;
             return .outside;
@@ -4389,6 +4384,27 @@ pub const CudaCompute = struct {
         if (phase.mode == .arena and !phase.matchesOwner(owner)) return error.PreparedCachePlanChanged;
         try phase.bind(current);
     }
+    fn retireCapturedGraph(self: *CudaCompute, current: CacheCleanup, reason: GraphRetirement) !void {
+        const observation = @import("../../execution/runtime_observation.zig");
+        const owner = &self.bounded_decode_graph;
+        const phase = owner.phase;
+        const epoch = owner.epoch_id;
+        const rows = owner.rows;
+        const progress = owner.progress;
+        const recorded = owner.graph != null;
+        try self.clearCapturedGraphWithCleanup(current);
+        if (rows == 0) return;
+        if (observation.kernelObservationActive()) observation.cudaDecoderRetired(.{
+            .reason = reason,
+            .stage = if (phase == .disabled) .unavailable else if (!recorded) .before_recording else if (progress <= 2) .before_replay else .after_replay,
+            .rows = rows,
+        });
+        if (phase != .disabled and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
+            std.debug.print("LIGHTONOCR3 cuda_model_graph_retired reason={s} phase={s} epoch={d} rows={d} progress={d}\n", .{
+                @tagName(reason), @tagName(phase), epoch, rows, progress,
+            });
+    }
+
     pub fn clearCapturedGraphWithCleanup(self: *CudaCompute, current: CacheCleanup) !void {
         try self.bounded_decode_graph.clearWithCleanup(&self.ctx, current);
         if (self.captured_cache_roots) |roots| roots.releaseRoots(self, current);
@@ -59405,6 +59421,10 @@ test "captured graph prefunded nonempty program and learned workspace replay aft
     try std.testing.expectEqual(workspace_pointer, compute.cublaslt_workspace_scratch.buffer.ptr);
     try std.testing.expect(compute.run_budget == &budget);
     try std.testing.expectEqualDeep(exact_owned, domain.controller.snapshot());
+    const observation = @import("../../execution/runtime_observation.zig");
+    var retirements: observation.KernelScope = undefined;
+    retirements.begin();
+    defer _ = retirements.finish();
     owner.invalidateMatching(&compute.ctx, .{ .sequence = 9 });
     owner.invalidateMatching(&compute.ctx, .{ .recurrent = 0x7000 });
     try CudaCompute.invalidateLightOnDecodeGraphMatching(&raw, .{ .boundary = &epoch }, .page_state_cleanup, .{ .sequence = 9 });
@@ -59420,6 +59440,11 @@ test "captured graph prefunded nonempty program and learned workspace replay aft
     try CudaCompute.invalidateLightOnDecodeGraphWithCleanup(&raw, .{ .boundary = &epoch }, .eager_decode);
     try CudaCompute.invalidateLightOnDecodeGraphWithCleanup(&raw, .{ .boundary = &epoch }, .foreground_vision);
     try std.testing.expectEqualDeep(retired, owner.snapshot());
+    try std.testing.expectEqualDeep(observation.CudaDecoderRetirements{
+        .before_replay = 1,
+        .last = .{ .reason = .page_state_cleanup, .stage = .before_replay, .rows = 2 },
+    }, retirements.cuda_decoder_retirements.?);
+
     try roots.unbind(&scoped, &compute);
     compute.configureRunBudget(null);
     _ = try compute.cublaslt_workspace_scratch.buffer.freeChecked(&compute.ctx);
