@@ -259,6 +259,7 @@ export type {
   DocumentArtifactReprocessShardCursor,
   DocumentArtifactReprocessStatus,
   DocumentArtifactReprocessWorker,
+  DocumentArtifactRetryBacklog,
   DocumentArtifactTableReprocessRequest,
   DocumentArtifactTableReprocessResponse,
   // Schema types

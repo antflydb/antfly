@@ -34,7 +34,8 @@ class DocumentArtifactReprocessStatus:
                 The worker services multiple documents and producers. Sequence values use the shard's enrichment replay sequence
                 space.
             last_retry (DocumentArtifactReprocessRetry | Unset): Most recent durable deferral for this accepted extraction
-                attempt. The deadline can be in the past if replay has since resumed.
+                attempt, retained independently of publication status. This is a historical observation and does not imply the
+                attempt is still waiting.
     """
 
     requested_generation: int

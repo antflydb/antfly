@@ -274,6 +274,7 @@ export type DocumentArtifactReprocessStatus =
   components["schemas"]["DocumentArtifactReprocessStatus"];
 export type DocumentArtifactReprocessWorker =
   components["schemas"]["DocumentArtifactReprocessWorker"];
+export type DocumentArtifactRetryBacklog = components["schemas"]["DocumentArtifactRetryBacklog"];
 export type DocumentArtifactReprocessShardCursor =
   components["schemas"]["DocumentArtifactReprocessShardCursor"];
 export type DocumentArtifactReprocessJobStartRequest =

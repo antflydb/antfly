@@ -9834,7 +9834,7 @@ export interface components {
             worker?: components["schemas"]["DocumentArtifactReprocessWorker"];
             last_retry?: components["schemas"]["DocumentArtifactReprocessRetry"];
         };
-        /** @description Most recent durable deferral for this accepted extraction attempt. The deadline can be in the past if replay has since resumed. */
+        /** @description Most recent durable deferral for this accepted extraction attempt, retained independently of publication status. This is a historical observation and does not imply the attempt is still waiting. */
         DocumentArtifactReprocessRetry: {
             /** @enum {string} */
             reason: "provider_capacity" | "provider_retry_after" | "transient";
@@ -9843,6 +9843,27 @@ export interface components {
              * @description Unix timestamp in milliseconds before which this attempt is deferred.
              */
             retry_at_ms: number;
+            /**
+             * @description Enrichment stage identified by the retry outcome, when available. Enrichment is used when the failure does not identify a narrower stage.
+             * @enum {string}
+             */
+            stage?: "source_fetch" | "pdf_prepare" | "pdf_inspect" | "pdf_render" | "ocr" | "publication" | "enrichment";
+            /** @description Stable error identifier associated with the deferral, when available. */
+            error_code?: string;
+        };
+        /** @description Shard-wide retry debt sampled from the replay worker. */
+        DocumentArtifactRetryBacklog: {
+            /** Format: uint32 */
+            active_tickets: number;
+            /** Format: uint32 */
+            sleeping_tickets: number;
+            /** Format: uint64 */
+            oldest_unresolved_sequence?: number;
+            /**
+             * @description Admission constraint preventing replay from admitting fresh work, when blocked.
+             * @enum {string}
+             */
+            admission_blocked_by?: "document_workset" | "backlog_ticket_limit" | "backlog_byte_limit";
         };
         /** @description Sample of the owning shard's enrichment worker, when present. The worker services multiple documents and producers. Sequence values use the shard's enrichment replay sequence space. */
         DocumentArtifactReprocessWorker: {
@@ -9861,8 +9882,9 @@ export interface components {
              * @description Latest enrichment replay watermark requested of the worker.
              */
             target_sequence: number;
-            /** @description Whether parked requests have filled the worker's bounded retry queue. */
+            /** @description Whether retry debt is preventing the worker from admitting new source groups. */
             retry_queue_full: boolean;
+            backlog?: components["schemas"]["DocumentArtifactRetryBacklog"];
             /** @description Whether the worker has retry work. */
             retrying: boolean;
             /**
@@ -9872,6 +9894,13 @@ export interface components {
             next_retry_at_ms?: number;
             /** @description Whether the shard's worker has failed. */
             failed: boolean;
+            /** @description Latest known worker error such as a publication wait. This is shard-wide. */
+            last_error_code?: string;
+            /**
+             * Format: uint64
+             * @description Unix timestamp of the last observed worker activity, when available. This is shard-wide.
+             */
+            last_progress_at_ms?: number;
             /** @description Whether a background worker has started. Embedded callers can also drive replay inline. */
             background_running: boolean;
         };
