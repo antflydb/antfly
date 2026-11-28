@@ -4003,6 +4003,7 @@ pub const CudaCompute = struct {
                     .declared_ffn_output_bank_bytes = if (layout.ffn_outputs) |span| span.bytes else 0,
                     .declared_projection_staging_bytes = if (layout.projection_staging) |span| span.bytes else 0,
                     .declared_attention_residual_bytes = if (layout.attention_residual) |span| span.bytes else 0,
+                    .declared_attention_inputs_bytes = if (layout.attention_inputs) |span| span.bytes else 0,
                     .declared_attention_norm_bytes = if (layout.attention_norm) |span| span.bytes else 0,
                     .declared_attention_norm_mirror_bytes = if (layout.attention_norm_mirror) |span| span.bytes else 0,
                     .declared_final_norm_mirror_bytes = if (layout.final_norm_mirror) |span| span.bytes else 0,
@@ -4245,6 +4246,7 @@ pub const CudaCompute = struct {
             .compact_ffn = if (lightOnFfnBlockEnabled(cb) and lightOnDevice(self).portableKernels() and !self.lighton_bf16_decode_outputs) self.lighton_bf16_projection_outputs else null,
             .projection_staging = cudaCublasLtEnabled() and self.cublaslt != null and self.ctx.info.compute_major >= 8,
             .attention_norm = true,
+            .fused_attention_inputs = lightOnProjectionResidualEnabled(cb),
             .final_norm_mirror = cudaRmsNormBf16MirrorEnabled() and cudaCublasLtEnabled() and self.cublaslt != null and self.ctx.info.compute_major >= 8,
         }) catch |err| switch (err) {
             error.InvalidShape, error.Overflow => return .unsupported,
@@ -4468,7 +4470,7 @@ pub const CudaCompute = struct {
             if (tensor.buffer.ptr == 0 or tensor.buffer.len < try checkedMul(n, if (i == 1) @as(usize, 2) else 4)) return error.InvalidShape;
         }
         const staged = (try stageBf16ActivationForCublasLt(self, input, rows, hidden)) orelse return null;
-        const output = try self.allocLightOnF32Tensor(rows, hidden);
+        const output = try self.allocLightOnF32Tensor(rows, hidden, null);
         errdefer cb.free(output);
         errdefer self.ctx.synchronize() catch {};
         try self.lighton_vision_fused.init(&self.ctx);
@@ -4485,12 +4487,11 @@ pub const CudaCompute = struct {
         return output;
     }
 
-    fn allocLightOnF32Tensor(self: *CudaCompute, rows: usize, width: usize) !CT {
-        const shape = try allocShape2(self.allocator, rows, width);
-        errdefer self.allocator.free(shape);
-        var output = try allocDeviceBuffer(self, try checkedMul(try checkedMul(rows, width), 4));
-        errdefer releaseDeviceBuffer(self, &output);
-        return createTensor(self, output, shape, rows * width);
+    fn allocLightOnF32Tensor(self: *CudaCompute, rows: usize, width: usize, destination: ?buffer_mod.DeviceBuffer) !CT {
+        const count = try checkedMul(rows, width);
+        const bytes = try checkedMul(count, @sizeOf(f32));
+        var output = try OwnedF32Output.fromOwnedShapeDestination(self, try allocShape2(self.allocator, rows, width), count, bytes, destination);
+        return output.intoTensor();
     }
 
     pub const LightOnAttentionInputs = struct { query: CT, key: CT, gate: CT };
@@ -4512,11 +4513,15 @@ pub const CudaCompute = struct {
         const position_buffer = (try cachedLightOnMropePositions(self, positions)) orelse return null;
         const q_count = rows * query_heads * 256;
         const k_count = rows * key_heads * 256;
-        const query = try self.allocLightOnF32Tensor(rows, query_heads * 256);
+        const destinations = if (self.bounded_decode_graph.active)
+            try self.bounded_decode_graph.bindAttentionInputs(try @import("bounded_decode_graph.zig").AttentionInputs.init(rows, query_heads, key_heads, 256))
+        else
+            null;
+        const query = try self.allocLightOnF32Tensor(rows, query_heads * 256, if (destinations) |value| value[0] else null);
         errdefer cb.free(query);
-        const output_key = try self.allocLightOnF32Tensor(rows, key_heads * 256);
+        const output_key = try self.allocLightOnF32Tensor(rows, key_heads * 256, if (destinations) |value| value[1] else null);
         errdefer cb.free(output_key);
-        const gate = try self.allocLightOnF32Tensor(rows, query_heads * 256);
+        const gate = try self.allocLightOnF32Tensor(rows, query_heads * 256, if (destinations) |value| value[2] else null);
         errdefer cb.free(gate);
         errdefer self.ctx.synchronize() catch {};
         try self.lighton_attention_inputs.run(&self.ctx, .{

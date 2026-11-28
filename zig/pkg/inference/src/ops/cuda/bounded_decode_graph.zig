@@ -52,6 +52,27 @@ test "bounded CUDA decoder row eligibility follows attention packet boundaries" 
     try std.testing.expect(!supportsRows(max_rows + 1, true));
 }
 
+pub const AttentionInputs = struct {
+    query_bytes: usize,
+    key_bytes: usize,
+    bytes: usize,
+
+    pub fn init(rows: usize, heads: usize, kv_heads: usize, dim: usize) !AttentionInputs {
+        const row_bytes = try std.math.mul(usize, try std.math.mul(usize, rows, dim), @sizeOf(f32));
+        const q = try std.math.mul(usize, row_bytes, heads);
+        const k = try std.math.mul(usize, row_bytes, kv_heads);
+        return .{ .query_bytes = q, .key_bytes = k, .bytes = try std.math.add(usize, try std.math.mul(usize, q, 2), k) };
+    }
+
+    pub fn bind(self: AttentionInputs, backing: buffer.DeviceBuffer) ![3]buffer.DeviceBuffer {
+        return .{
+            try backing.borrowRange(0, self.query_bytes),
+            try backing.borrowRange(self.query_bytes, self.key_bytes),
+            try backing.borrowRange(self.query_bytes + self.key_bytes, self.query_bytes),
+        };
+    }
+};
+
 /// Exact independently retained buffers for a captured two-column sequence.
 /// Pure geometry is available to cold admission before any SDK teardown or
 /// allocation. It contains no page/key/weight pointer and grants no byte credit.
@@ -68,6 +89,7 @@ pub const StorageLayout = struct {
     ffn_outputs: ?Span = null,
     projection_staging: ?Span = null,
     attention_residual: ?Span = null,
+    attention_inputs: ?Span = null,
     attention_norm: ?Span = null,
     attention_norm_mirror: ?Span = null,
     final_norm_mirror: ?Span = null,
@@ -189,6 +211,7 @@ pub const StorageLayout = struct {
             self.ffn_workspace,
             self.ffn_outputs,
             self.attention_residual,
+            self.attention_inputs,
             self.attention_norm,
             self.attention_norm_mirror,
         }) |slot| if (slot) |span| {
@@ -372,6 +395,7 @@ pub const GraphPhase = struct {
         projection_staging: bool,
         final_norm_mirror: bool = false,
         attention_norm: bool = false,
+        fused_attention_inputs: bool = false,
     };
 
     /// Resolve layer lifetimes in submission order from the descriptor. A
@@ -398,6 +422,12 @@ pub const GraphPhase = struct {
             const bytes = self.storage_layout.attention_norm.?.bytes;
             const offset = try StorageLayout.aligned(try self.storage_layout.layerLiveBytes());
             self.storage_layout.attention_residual = try self.storage_layout.declareLayerRegion(offset, bytes);
+        }
+        if (policy.fused_attention_inputs and self.descriptor.attention_layers != 0) {
+            const geometry = self.descriptor.attention_geometry orelse return error.InvalidShape;
+            const inputs = try AttentionInputs.init(self.descriptor.rows, geometry.heads, geometry.kv_heads, geometry.dim);
+            const offset = try StorageLayout.aligned(try self.storage_layout.layerLiveBytes());
+            self.storage_layout.attention_inputs = try self.storage_layout.declareLayerRegion(offset, inputs.bytes);
         }
         if (policy.projection_staging) try self.declareProjectionStaging();
         if (policy.final_norm_mirror) try self.declareFinalNormMirror();
@@ -923,6 +953,13 @@ pub const Module = struct {
         const layout = self.storage_layout orelse return error.InvalidExecutionPlan;
         const span = layout.fused_head_workspace orelse return error.InvalidExecutionPlan;
         return self.bindLayerWorkspace(layout, span, span.bytes);
+    }
+
+    pub fn bindAttentionInputs(self: *const Module, inputs: AttentionInputs) !?[3]buffer.DeviceBuffer {
+        const layout = self.storage_layout orelse return error.InvalidExecutionPlan;
+        const span = layout.attention_inputs orelse return null;
+        if (span.bytes != inputs.bytes) return error.InvalidExecutionPlan;
+        return try inputs.bind(try self.bindLayerWorkspace(layout, span, inputs.bytes));
     }
 
     pub fn bindAttentionResidual(self: *const Module, bytes: usize) !?buffer.DeviceBuffer {
