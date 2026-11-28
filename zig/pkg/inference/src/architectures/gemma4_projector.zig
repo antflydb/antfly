@@ -1763,7 +1763,11 @@ pub fn encodeEmbeddingGemma2AudioBounded(cb: *const ComputeBackend, allocator: s
     return .{ .embeddings = try cb.toFloat32(result.embeddings, allocator), .tokens = result.tokens };
 }
 
-pub const ResidentEncodedAudio = struct { embeddings: CT, tokens: usize };
+pub const ResidentEncodedAudio = struct {
+    embeddings: CT,
+    tokens: usize,
+    output_ownership: ResidentProjectedImages.OutputOwnership = .unknown,
+};
 pub fn encodePreparedEmbeddingGemma2AudioBatchResident(cb: *const ComputeBackend, a: std.mem.Allocator, prepared: []const *const PreparedAudio) !ResidentProjectedImages {
     if (prepared.len == 0 or prepared.len > audio_schedule.GroupedRows.max_clips) return error.InvalidInputShape;
     var admitted_recipe: ?AudioCacheRecipe = null;
@@ -1790,7 +1794,7 @@ pub fn encodePreparedEmbeddingGemma2AudioBatchResident(cb: *const ComputeBackend
     };
     errdefer cb.free(result.embeddings);
     try storage.finish();
-    return .{ .allocator = a, .backend = cb, .embeddings = result.embeddings, .tokens_per_image = lengths, .hidden_size = 512, .batches_executed = 1, .max_batch_executed = count };
+    return .{ .allocator = a, .backend = cb, .embeddings = result.embeddings, .tokens_per_image = lengths, .hidden_size = 512, .batches_executed = 1, .max_batch_executed = count, .output_ownership = result.output_ownership };
 }
 
 fn audioFeatureCohort(cb: *const ComputeBackend, a: std.mem.Allocator, prepared: []const *const PreparedAudio, features: *[audio_schedule.GroupedRows.max_clips]AudioFeatures) !usize {
@@ -2462,7 +2466,7 @@ fn encodeAudioFeatureCohortResidentWithinStorage(cb: *const ComputeBackend, allo
         projected_owned = false;
         audioProfileMark(.readback);
         if (profile_enabled) profile.finish(subsampled.seq_len);
-        return .{ .embeddings = projected, .tokens = valid_count };
+        return .{ .embeddings = projected, .tokens = valid_count, .output_ownership = .completed_fresh_destination };
     }
     const resident: ?CT = frame_snapshot orelse if (contiguous_first) |first|
         try cb.snapshotRows2D(allocator, projected, first, valid_count, cfg.text_hidden)

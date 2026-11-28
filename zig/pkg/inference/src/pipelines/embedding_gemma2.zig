@@ -2088,7 +2088,8 @@ fn projectCohortParts(a: std.mem.Allocator, session: Session, cb: *const Compute
                 for (wave.audio[0..wave.count], audio[0..wave.count]) |*clip, *dest| dest.* = clip;
             }
             var projected = if (image) try projectPreparedImages(true, cb, a, wave.images[0..wave.count], scratch, base, control, options.timings, null, scheduler.retained, scheduler.lane.credit(), scheduler.lane) else try projector.encodePreparedEmbeddingGemma2AudioBatchResident(cb, a, audio[0..wave.count]);
-            defer projected.deinit();
+            var projection_owned = true;
+            defer if (projection_owned) projected.deinit() else projected.allocator.free(projected.tokens_per_image);
             if (@import("antfly_platform").env.getenvBool("ANTFLY_GEMMA4_GROUP_BROKER_TRACE")) std.debug.print("gemma4-group-tower kind={s} items={d}\n", .{ if (image) "image" else "audio", projected.max_batch_executed });
             var first: usize = 0;
             for (projected.tokens_per_image, wave.indexes[0..wave.count]) |tokens, slot| {
@@ -2106,12 +2107,22 @@ fn projectCohortParts(a: std.mem.Allocator, session: Session, cb: *const Compute
                     first += tokens;
                     continue;
                 }
-                const view = try cb.sliceRows2D(a, projected.embeddings, first, tokens, 512);
-                const escaped = if (cb.embedding_stage != null) StageLane.escapeCurrent(cb, view) catch |err| {
-                    cb.free(view);
-                    return err;
-                } else view;
-                if (cb.embedding_stage != null) cb.free(view);
+                const escaped = if (!image and wave.count == 1 and projected.output_ownership == .completed_fresh_destination) whole: {
+                    if (cb.embedding_stage != null) {
+                        if (cb.kind() == .cuda) {
+                            try scheduler.lane.prepareCudaInputHandoff(&projected.embeddings);
+                        } else {
+                            try scheduler.lane.retainProjectedOutput(&projected);
+                        }
+                    }
+                    projection_owned = false;
+                    break :whole projected.embeddings;
+                } else sliced: {
+                    const view = try cb.sliceRows2D(a, projected.embeddings, first, tokens, 512);
+                    if (cb.embedding_stage == null) break :sliced view;
+                    defer cb.free(view);
+                    break :sliced try StageLane.escapeCurrent(cb, view);
+                };
                 result.parts[ref.group][ref.part] = .{ .id = if (image) 258880 else 258881, .embeddings = &.{}, .tensor = escaped, .tokens = tokens };
                 first += tokens;
             }
