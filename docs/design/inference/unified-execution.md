@@ -3260,6 +3260,15 @@ had no graph scratch-funding denials. Consistent wide replay under
 chunked prefill therefore also depends on graph lifetime across foreground
 work and page transitions.
 
+The M4 Max focused cohort at `061f213135` passed all seven checks
+with zero skips. It exercised the shared installed Whisper Small
+checkpoint with the Metal backend required, verified assigned packed
+prefill, and checked prepared initial rows and decode against ordinary
+execution. Other checks verified the resident publication retirement
+guard, the foreign Metal encoder handoff without host transport, and
+the mixed reader workspace bounds. This cohort qualifies the listed
+paths for correctness and ownership.
+
 ### Released Inkling Metal checkpoint at `7f0ff56ff8`
 
 Five focused checks passed on M4 Max with zero skips. The released
