@@ -996,6 +996,18 @@ unsafe extern "C" {
         artifact_id_b64: antfly_slice,
         out: *mut antfly_buffer,
     ) -> antfly_error_code;
+    pub fn antfly_db_artifact_dependencies_json(
+        db: *mut antfly_db,
+        doc_key: antfly_slice,
+        artifact_name: antfly_slice,
+        out: *mut antfly_buffer,
+    ) -> antfly_error_code;
+    pub fn antfly_db_dependency_impact_json(
+        db: *mut antfly_db,
+        request_json: antfly_slice,
+        out: *mut antfly_buffer,
+    ) -> antfly_error_code;
+    pub fn antfly_db_refresh_context_dependencies(db: *mut antfly_db) -> antfly_error_code;
     pub fn antfly_decode_artifact_id_json(
         artifact_id_b64: antfly_slice,
         out: *mut antfly_buffer,
