@@ -3026,6 +3026,16 @@ held 184 MiB before and after the run. The uninstrumented repeat
 shows no HTTP tail increase on this workload. The controls limit
 attribution of the small gain to the declaration change alone.
 
+A same-binary Spark experiment at `8d4b13c954` raised the two-page
+reader's configured vision and packed prefill limits from one to two.
+All 240 outputs matched exactly. The two paired candidate arms each
+ran 26 requests including warmup and executed only eight and nine
+two-item vision groups. Neither arm dispatched a two-item prefill.
+Paired HTTP median/p95 moved from 462.83/471.72 to 465.06/477.76 ms.
+Candidate-only p95 varied by 8.08 ms. The experiment did not
+demonstrate a prefill batching improvement, and serving keeps the
+existing defaults for this workload.
+
 The same binary passed exact two-page output and observed graph replay
 with declared warmup disabled. With the opt-in enabled and recurrent
 fusion disabled, serial output parity passed and the graph correctly
