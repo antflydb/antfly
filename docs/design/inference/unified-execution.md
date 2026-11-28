@@ -1514,7 +1514,7 @@ deletion and qualification gates.
 
 | Requirement | State | Evidence and remaining gate |
 | --- | --- | --- |
-| Shared liveness and authoritative storage | Partial | Assigned execution and admitted storage share dependency analysis. Metal image and video bind workspaces through the vision region. CUDA attention and recurrent scratch and outputs, dense FFN scratch, and alternating FFN output slots share an admitted layer bank. Released LightOnOCR replay at `211c80a1f9` verified the attention and recurrent output bounds and a 2,002,944-byte layer bank. Grouped audio declares operation scratch within a partially observed schedule. Composite audio and decoder lifetimes and the remaining Metal scopes are still open. The compatibility table identifies opaque vendor workspaces with separate accounting. |
+| Shared liveness and authoritative storage | Partial | Assigned execution and admitted storage share dependency analysis. Metal image and video bind workspaces through the vision region. CUDA attention and recurrent scratch and outputs, dense FFN scratch, and alternating FFN output slots share an admitted layer bank. Released LightOnOCR replay at `211c80a1f9` verified the attention and recurrent output bounds and a 2,002,944-byte layer bank. The released BF16 CUDA grouped audio encoder derives the complete cross-operation lifetime schedule before its first dispatch. Composite decoder lifetimes, other audio policies and the remaining Metal scopes are still open. The compatibility table identifies opaque vendor workspaces with separate accounting. |
 | Stable addresses and CUDA capture | Partial | Released T5-small replayed at prefixes 1, 8, 32 and 64. Released EmbeddingGemma 2 grouped audio captured and replayed using a 36,788,736-byte arena at `a7d8bcfa6a`. The fixture cancelled a replay before staging, then replayed the same graph successfully. The context-level projector guard declines unplanned cuBLASLt staging before allocation. LightOnOCR-3-4B shared logits backing replayed at up to 98 rows with exact parity across repeated 128-page, 24 GiB runs. The full-width default had no wide replay in the ABBA pair, while the shared arena was 1.55% slower on average. The later `211c80a1f9` LightOnOCR-3-0.8B comparison matched the serial output in every arm and reached 64-row replay in one of four arms. Sustained wide replay and ordinary/capture throughput parity remain open. |
 | Runtime-owned state and physical policy | Partial | `decoder_storage.zig` owns Gemma 4 replay capacity and `decoder_prefill.zig` owns chunk selection, eager binding and scheduled cancellation. The shared frame owner controls media view retirement. Metal HTTP acquires and pins the existing per-layer input table before decoder state advances. Residual task-bound state and cache policy need provider-specific verification and migration. |
 | Resident placement | Partial | The released fused T5-small step retired its encoder activations before decoding on CPU, Metal and CUDA. Spark recorded 393,216 device-to-device gather bytes and zero gather downloads. Imported ONNX handoff tests exercise exact output custody and host fallback on all three providers. Metal verifies a scalar token readback and a one-row fallback. At `bd0e05a4e3`, Spark passed the device gather and consumed a retained audio output view without a device copy. Other eligible stateful and opaque producer/consumer pairs still need qualification. |
@@ -2816,6 +2816,14 @@ local M4 Max Metal and CPU across AA, ABBA and BB with 16 measured requests
 per side. Metal p50/p95 went from 37.74/43.60 to 36.38/41.26 ms. Native CPU
 with the DFT pinned went from 227.28/233.91 to 226.39/228.98 ms. All 26 Spark
 checks passed again with zero skips and the same 36,788,736-byte capture.
+
+On Spark GB10, `a1e8a50b22` passed all 30 focused checks with zero skips.
+The released EmbeddingGemma 2 BF16 two-clip cohort admitted and bound the
+complete declaration on its first invocation. Across seven executions it
+created one graph, replayed four times, and returned exactly repeated
+embeddings. The planned and captured arena both measured 36,788,736 bytes
+with 132 operation scratch intervals. Two local CPU contract checks passed
+for the full-range declaration and last-use compiler.
 
 ### Isolated Metal E4B HTTP comparison at `58b3917a89`
 
