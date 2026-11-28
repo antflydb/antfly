@@ -3348,6 +3348,17 @@ above 64 rows in both arms. In all four arms per side, each runtime
 missed wide replay once. This comparison did not reproduce the
 combined changes' 2.6% slowdown. Direct attribution remains open.
 
+The next unprofiled comparison held prompt cleanup fixed, using
+`3d0ba0620a` as A and `f2f16df5d5` as B. It isolated the combined
+replay-horizon and recording telemetry changes using the same 24 GiB
+scratch limit. All eight arms completed 256 pages with exact serial
+parity and zero retirement-capacity retries. Pooled paired throughput
+was 6.24 versus 6.34 pages/s. The control arms measured 6.26–6.27
+pages/s for A and 6.28–6.29 for B. All four A arms replayed at 113
+rows. Three B arms reached 113 rows and one reached only 30 rows.
+The earlier throughput drop did not reproduce in this comparison.
+Reliable wide replay through page retirement remains open.
+
 At `0cd7a9e823`, all 55 focused Spark checks passed without skips.
 The physical graph fixture preserved the replay after an unrelated
 page moved, retired it for the referenced page, then verified that
