@@ -5250,16 +5250,41 @@ pub const CudaCompute = struct {
             break :create owner;
         };
         const combined = combined_owner.buffer;
-        const staged = (try stageBf16ActivationForCublasLt(self, input, rows, hidden)) orelse return null;
+        const activation = (try acquireBf16ActivationForCublasLt(self, input, rows, hidden, rows)) orelse return null;
+        const staged = activation.buffer;
         const count = try checkedMul(rows, total_width);
         const joined_bytes = try checkedMul(count, @sizeOf(f32));
         const owner = &self.bounded_decode_graph;
         const assigned = owner.active and rows == owner.rows and hidden == owner.hidden;
         const destination = if (assigned) try owner.bindJoinedRecurrentProjection(joined_bytes) else null;
+        var assigned_outputs: [4]?buffer_mod.DeviceBuffer = @splat(null);
+        if (assigned) {
+            for (widths, &assigned_outputs, 0..) |width, *output_destination, index| {
+                const bytes = try checkedMul(try checkedMul(rows, width), @sizeOf(f32));
+                output_destination.* = try owner.bindRecurrentProjection(@fromBackingInt(@intCast(index)), bytes);
+            }
+        }
+        if (destination) |dst| {
+            // The joined result is written before splitting into the four
+            // projections, while staged activations and packed weights are live.
+            const regions = [_]buffer_mod.DeviceBuffer{
+                staged,
+                combined,
+                dst,
+                assigned_outputs[0] orelse return error.InvalidExecutionPlan,
+                assigned_outputs[1] orelse return error.InvalidExecutionPlan,
+                assigned_outputs[2] orelse return error.InvalidExecutionPlan,
+                assigned_outputs[3] orelse return error.InvalidExecutionPlan,
+            };
+            const needs = [_]usize{ staged.len, combined.len, joined_bytes, regions[3].len, regions[4].len, regions[5].len, regions[6].len };
+            try buffer_mod.validateRegions(7, regions, needs, .{ 2, 2, 4, 4, 4, 4, 4 }, 2);
+        }
         var joined = destination orelse try allocDeviceBuffer(self, joined_bytes);
         defer if (destination == null) releaseDeviceBuffer(self, &joined);
+        try convertBf16ActivationForCublasLt(self, input, activation, rows);
         if (!try runCublasLtBf16Matmul(self, joined, staged, combined, cublasLtWorkspace(self), rows, hidden, total_width)) return null;
         self.stats.bf16_cublaslt_linear_calls += 1;
+        errdefer self.ctx.synchronize() catch {};
         var outputs: [4]CT = undefined;
         var created: usize = 0;
         errdefer for (outputs[0..created]) |output| cb.free(output);
@@ -5267,8 +5292,7 @@ pub const CudaCompute = struct {
             if (assigned) {
                 const elements = try checkedMul(rows, width);
                 const bytes = try checkedMul(elements, @sizeOf(f32));
-                const output_destination = try owner.bindRecurrentProjection(@fromBackingInt(@intCast(i)), bytes);
-                var output = try OwnedF32Output.fromOwnedShapeDestination(self, try allocShape2(self.allocator, rows, width), elements, bytes, output_destination);
+                var output = try OwnedF32Output.fromOwnedShapeDestination(self, try allocShape2(self.allocator, rows, width), elements, bytes, assigned_outputs[i]);
                 outputs[i] = output.intoTensor();
             } else {
                 outputs[i] = (try cb.allocUninitF32Shape(&.{ @intCast(rows), @intCast(width) })).?;
@@ -5276,7 +5300,6 @@ pub const CudaCompute = struct {
             created += 1;
         }
         try self.lighton_recurrent.init(&self.ctx);
-        errdefer self.ctx.synchronize() catch {};
         try self.lighton_recurrent.splitProjections(&self.ctx, .{ tensorFromCt(outputs[0]).buffer.ptr, tensorFromCt(outputs[1]).buffer.ptr, tensorFromCt(outputs[2]).buffer.ptr, tensorFromCt(outputs[3]).buffer.ptr, joined.ptr }, @intCast(count), @intCast(mixed_dim), @intCast(z_dim), @intCast(heads));
         if (destination) |span| owner.bound_recurrent_joined_projection_bytes = span.len;
         self.lighton_fused_projection_calls += 1;
