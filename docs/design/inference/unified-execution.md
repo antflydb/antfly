@@ -1555,8 +1555,8 @@ deletion and qualification gates.
 
 | Requirement | State | Evidence and remaining gate |
 | --- | --- | --- |
-| Shared liveness and authoritative storage | Partial | Assigned execution and admitted storage share dependency analysis. Metal image and video use the admitted vision region. CUDA decoder attention, recurrent projections, norm adjustment and dense FFN share admitted layer storage. At `e32afca66d`, the released cache-disabled 0.8B reader replayed with no learned bytes and the 4B graph recorded zero allocations at 98 rows. Released BF16 grouped audio derives its lifetimes before dispatch. At `ee73544213`, the Metal planner owns the column-bias destination and the subsequent integer gather output, including immutable index validation before submission. The corresponding Spark CUDA regression cohort passed all eight checks, including early rejection of both column-bias operand orders by the flat assigned path. Other decoder and audio representations and specialized Metal scopes remain open. Opaque vendor workspace retains separate accounting. |
-| Stable addresses and CUDA capture | Partial | Released T5-small captured and replayed at prefixes 1, 8, 32 and 64. Released BF16 grouped audio captured and replayed within its 36,788,736-byte arena, including cancellation before staging and successful later replay. The released two-page LightOnOCR reader skipped its learning burst with declared warmup. At `e32afca66d`, 4B replayed a declared zero-byte plan at 60 rows and an observed zero-byte plan at 98 rows. At `4985997ee6`, both timed 256-page 4B runs replayed declared zero-byte plans at 98 rows with exact serial parity and zero retirement-capacity retries. Paired ordinary/capture throughput and other signatures remain open. |
+| Shared liveness and authoritative storage | Partial | Assigned execution and admitted storage share dependency analysis. Metal image and video use the admitted vision region. CUDA decoder attention, recurrent projections, norm adjustment and dense FFN share admitted layer storage. At `e32afca66d`, the released cache-disabled 0.8B reader replayed with no learned bytes and the 4B graph recorded zero allocations at 98 rows. Released BF16 and F32 grouped audio derive their lifetimes before dispatch. F32 warms vendor storage once and binds the declared schedule without learning allocation lifetimes. At `ee73544213`, the Metal planner owns the column-bias destination and the subsequent integer gather output, including immutable index validation before submission. The corresponding Spark CUDA regression cohort passed all eight checks, including early rejection of both column-bias operand orders by the flat assigned path. Other decoder and audio representations and specialized Metal scopes remain open. Opaque vendor workspace retains separate accounting. |
+| Stable addresses and CUDA capture | Partial | Released T5-small captured and replayed at prefixes 1, 8, 32 and 64. Released BF16 grouped audio captured and replayed within its 36,788,736-byte arena, including cancellation before staging and successful later replay. At `ec457e03ca`, declared F32 captured and replayed with exact eager parity at widths two through four, with and without RMS mirrors. The released two-page LightOnOCR reader skipped its learning burst with declared warmup. At `e32afca66d`, 4B replayed a declared zero-byte plan at 60 rows and an observed zero-byte plan at 98 rows. At `4985997ee6`, both timed 256-page 4B runs replayed declared zero-byte plans at 98 rows with exact serial parity and zero retirement-capacity retries. Paired ordinary/capture throughput and other signatures remain open. |
 | Runtime-owned state and physical policy | Partial | `decoder_storage.zig` owns Gemma 4 replay capacity and `decoder_prefill.zig` owns chunk selection, eager binding and scheduled cancellation. The shared frame owner controls media view retirement. Metal HTTP acquires and pins the existing per-layer input table before decoder state advances. Residual task-bound state and cache policy need provider-specific verification and migration. |
 | Resident placement | Partial | Released T5-small retired encoder activations before fused suffix execution and kept all 24 cache slots independently owned at prefixes 1, 8, 32 and 64 on CPU, Metal and CUDA. Spark recorded 393,216 device-to-device gather bytes and zero gather downloads. Imported ONNX handoff tests exercise exact output custody and host fallback on all three providers. Metal verifies a scalar token readback and a one-row fallback. At `bd0e05a4e3`, Spark passed the device gather and consumed a retained audio output view without a device copy. Other eligible stateful and opaque producer/consumer pairs still need qualification. |
 | Task orchestration | Partial | Media tasks call shared frame and projection retirement owners. Scheduled generation routes publish independent outputs through runtime callbacks. Some hardware-specific paths still choose or own physical transitions in model and task code. |
@@ -3158,7 +3158,27 @@ declared BF16 and declared or observed F32 at widths two through four,
 with exact eager parity after changing the samples. Declared F32 also
 passed with the packed projection policy enabled. Planned and captured
 arena sizes matched the previous observed capacities. Three local
-audio and Metal checks passed. HTTP latency for this change is pending.
+audio and Metal checks passed.
+
+The Spark production HTTP server at `ec457e03ca` compared observed and
+declared F32 workspaces in the same binary. All 576 measured requests
+succeeded and matched output hashes across AA, ABBA and BB. Each arm
+had eight warmups and 16 measured requests per width. All 12 processes
+reported full F32, with cuDNN unavailable and RMS mirrors enabled. An
+unrelated CUDA context held 184 MiB throughout.
+
+| Clips | Observed p50 / p95 (ms) | Declared p50 / p95 (ms) |
+| --- | ---: | ---: |
+| 2 | 20.11 / 20.76 | 19.80 / 20.33 |
+| 3 | 22.39 / 23.58 | 22.43 / 23.33 |
+| 4 | 24.83 / 25.75 | 24.96 / 25.88 |
+
+All three median changes and the two- and four-clip p95 changes fell
+within the respective same-policy spreads. The three-clip p95 improved
+by 0.25 ms. The untimed declared-policy run
+recorded 15 arena executions and six graph replays. The timed arms
+measure warm whole-request latency. The physical fixture above
+establishes that the declared route skips allocation learning.
 
 ### Isolated Metal E4B HTTP comparison at `58b3917a89`
 
