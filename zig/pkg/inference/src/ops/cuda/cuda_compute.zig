@@ -8002,12 +8002,12 @@ pub const CudaCompute = struct {
         const inputs = try Inputs.describe(&shapes, rows, recipe.hidden, recipe.context_left, recipe.heads);
         const execution_key = recipe.key(segments[0..recipe.count], 0, recipe.blocks);
         const base = try self.audioCacheBase(execution_key, inputs[0..Inputs.activeCount(!recipe.source_bf16)], null);
-        if (!try audioWorkspaceLowerBoundFits(recipe, segments[0..recipe.count], rows, base)) return;
         const entry = self.audioPlanFor(base) orelse return;
+        const executable = entry.executableFor(base);
+        if (executable == null and !try audioWorkspaceLowerBoundFits(recipe, segments[0..recipe.count], rows, base)) return;
         if (entry.owner == null or !entry.owner.?.managed)
             try builder.add(.{ .audio_learning = .{ .key = base.key } });
-        if (entry.executableFor(base)) |executable|
-            try builder.add(audioArenaRequest(executable));
+        if (executable) |plan| try builder.add(audioArenaRequest(plan));
     }
 
     pub fn visionArenaRequest(self: *const CudaCompute, batch: usize, grid_x: usize, grid_y: usize, rotary: bool) !CacheFunding.Request {
@@ -21453,7 +21453,10 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
     const output_bytes = cache_base.output_bytes;
     if (!cache_base.fitsArena()) return null;
     if (geometry) |group| {
-        if (!try CudaCompute.audioWorkspaceLowerBoundFits(group.recipe.*, group.segments, group.rows, cache_base)) {
+        // A matching sealed plan is the complete capacity proof for replay.
+        const existing = self.audioPlanFor(cache_base);
+        const sealed = if (existing) |entry| entry.executableFor(cache_base) != null else false;
+        if (!sealed and !try CudaCompute.audioWorkspaceLowerBoundFits(group.recipe.*, group.segments, group.rows, cache_base)) {
             observation.cudaAudioResult(.workspace_preflight_declined);
             return null;
         }
