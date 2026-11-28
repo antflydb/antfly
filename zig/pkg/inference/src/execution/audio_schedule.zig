@@ -141,7 +141,8 @@ pub const WorkspaceDeclaration = struct {
     }
 
     pub const Step = struct {
-        output_bytes: usize,
+        /// Null for an assigned write, in-place operation, or barrier.
+        output_bytes: ?usize = null,
         scratch_bytes: usize = 0,
         /// Indices of outputs from preceding steps, in retirement order.
         reads: []const u15 = &.{},
@@ -151,10 +152,14 @@ pub const WorkspaceDeclaration = struct {
     /// The caller owns the result's events and frees them after the Stage ends.
     pub fn compile(a: std.mem.Allocator, steps: []const Step, publication: u15) !WorkspaceDeclaration {
         if (publication >= steps.len or steps.len > Workspace.Plan.slot_capacity) return error.InvalidExecutionPlan;
-        var slot_count = steps.len;
+        if (steps[publication].output_bytes == null) return error.InvalidExecutionPlan;
+        var slot_count: usize = 0;
         for (steps) |step| {
-            if (step.output_bytes == 0 or step.output_bytes > Workspace.limit or step.scratch_bytes > Workspace.limit)
-                return error.InvalidExecutionPlan;
+            if (step.output_bytes) |bytes| {
+                if (bytes == 0 or bytes > Workspace.limit) return error.InvalidExecutionPlan;
+                slot_count += 1;
+            }
+            if (step.scratch_bytes > Workspace.limit) return error.InvalidExecutionPlan;
             slot_count += @intFromBool(step.scratch_bytes != 0);
         }
         if (slot_count > Workspace.Plan.slot_capacity) return error.InvalidExecutionPlan;
@@ -163,7 +168,7 @@ pub const WorkspaceDeclaration = struct {
         for (steps, temporaries, 0..) |step, *temporary, index| {
             temporary.* = .{ .last_use = index, .slot = undefined };
             for (step.reads) |input| {
-                if (input >= index) return error.InvalidExecutionPlan;
+                if (input >= index or steps[input].output_bytes == null) return error.InvalidExecutionPlan;
                 temporaries[input].last_use = index;
             }
         }
@@ -172,11 +177,13 @@ pub const WorkspaceDeclaration = struct {
         try events.ensureTotalCapacityPrecise(a, slot_count * 2 - 1);
         var next_slot: usize = 0;
         for (steps, temporaries, 0..) |step, *temporary, index| {
-            temporary.slot = std.math.cast(u15, next_slot) orelse return error.InvalidExecutionPlan;
-            next_slot += 1;
-            events.appendAssumeCapacity(.{ .allocate = step.output_bytes });
+            if (step.output_bytes) |bytes| {
+                temporary.slot = @intCast(next_slot);
+                next_slot += 1;
+                events.appendAssumeCapacity(.{ .allocate = bytes });
+            }
             if (step.scratch_bytes != 0) {
-                const scratch = std.math.cast(u15, next_slot) orelse return error.InvalidExecutionPlan;
+                const scratch: u15 = @intCast(next_slot);
                 next_slot += 1;
                 events.appendAssumeCapacity(.{ .allocate_scratch = step.scratch_bytes });
                 events.appendAssumeCapacity(.{ .release = scratch });
@@ -186,7 +193,7 @@ pub const WorkspaceDeclaration = struct {
                 // Repeated reads are legal, but retire the producing slot once.
                 temporaries[input].last_use = steps.len;
             };
-            if (index != publication and temporary.last_use == index)
+            if (step.output_bytes != null and index != publication and temporary.last_use == index)
                 events.appendAssumeCapacity(.{ .release = temporary.slot });
         }
         return init(try events.toOwnedSlice(a), temporaries[publication].slot);
@@ -203,9 +210,10 @@ test "audio workspace compiler retires each producer after its last consumer" {
     const steps = [_]WorkspaceDeclaration.Step{
         .{ .output_bytes = 256, .scratch_bytes = 512 },
         .{ .output_bytes = 256, .reads = &.{0} },
+        .{ .reads = &.{0} },
         .{ .output_bytes = 256, .reads = &.{ 0, 0, 1 } },
     };
-    const declaration = try WorkspaceDeclaration.compile(a, &steps, 2);
+    const declaration = try WorkspaceDeclaration.compile(a, &steps, 3);
     defer a.free(declaration.events);
     const expected = [_]Plan.Declaration{
         .{ .allocate = 256 },
@@ -219,9 +227,10 @@ test "audio workspace compiler retires each producer after its last consumer" {
     try std.testing.expectEqualDeep(&expected, declaration.events);
     try std.testing.expectEqual(@as(u15, 3), declaration.published_slot);
 
+    try std.testing.expectError(error.InvalidExecutionPlan, WorkspaceDeclaration.compile(a, &steps, 2));
     var invalid = steps;
     invalid[0].reads = &.{1};
-    try std.testing.expectError(error.InvalidExecutionPlan, WorkspaceDeclaration.compile(a, &invalid, 2));
+    try std.testing.expectError(error.InvalidExecutionPlan, WorkspaceDeclaration.compile(a, &invalid, 3));
 }
 
 /// Copied operation geometry only. The actual Stage certifies the model and
