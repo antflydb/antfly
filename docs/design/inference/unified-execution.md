@@ -2949,6 +2949,32 @@ controls limit attribution of the difference to the workspace policy.
 Graph selection stays opt-in. F32 and ungrouped audio retain their existing
 execution and ownership paths.
 
+At `54b7bbb92d`, the released BF16 grouped encoder uses the shared block
+in eager execution as well. An eager block resolves the same relative-key
+constant before the Q/K/V projections and releases its own handle.
+Captured execution borrows the admitted constants and the declaration
+does not charge them as scratch. On Spark, all nine focused CUDA checks
+passed. Reusing the same test binary, the released model passed again
+with observed allocation and with graphs disabled from initialization.
+The same-session eager comparison was bit-for-bit equal to captured
+execution and did not increment the arena or replay counters. Both
+capture policies retained the 36,788,736-byte arena and 132 operation
+scratch intervals.
+
+The HTTP comparison against `4b17a05de6` ran with graphs disabled on
+both binaries. All 576 measured requests succeeded and the output hashes
+matched across AA, ABBA, and BB for distinct unequal-length clips. Spark
+shared the GPU with the same 184 MiB CUDA context throughout.
+
+| Clips | Previous p50 / p95 (ms) | Shared eager block p50 / p95 (ms) |
+| --- | ---: | ---: |
+| 2 | 31.86 / 32.81 | 32.13 / 33.04 |
+| 3 | 34.87 / 35.78 | 34.75 / 35.59 |
+| 4 | 39.44 / 40.26 | 39.41 / 39.66 |
+
+The largest paired median increase was 0.27 ms at width two. Both
+same-binary controls showed variation of that size at this width.
+
 ### Isolated Metal E4B HTTP comparison at `58b3917a89`
 
 The local M4 Max used the same pinned binaries as the mixed serving
