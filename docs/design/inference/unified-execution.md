@@ -2868,8 +2868,12 @@ replay on each request, including warmups. One other GPU context held
 472.01/481.77 ms to 466.74/497.06 ms. The two baseline-only arms reached
 472.97 and 478.79 ms at p95, and the two candidate-only arms reached
 495.87 and 498.25 ms. The median improved 1.1% and the p95 was 3.2% higher.
-The tail requires a repeat on the current revision before performance
-qualification can close.
+The corresponding CPU image preprocessing p95 moved from 27.11 to
+20.69 ms. Subtracting each request’s measured preprocessing time still
+gave 455.79 versus 479.98 ms at p95, so preprocessing did not explain
+the increase. This remainder also includes admission, device execution
+and publication. The tail requires a repeat on the current revision
+before performance qualification can close.
 
 ### Isolated Metal E4B HTTP comparison at `58b3917a89`
 
