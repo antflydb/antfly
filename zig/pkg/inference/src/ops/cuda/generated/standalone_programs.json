@@ -281,7 +281,8 @@
       "lighton_ragged_prefix_conv",
       "lighton_ragged_recurrent_prefix_only",
       "lighton_ragged_prefix_gated_norm",
-      "lighton_decode_fused_p2"
+      "lighton_decode_fused_p2",
+      "antfly_gdn_decode_p2_device_pages"
     ],
     "nvcc_flags": [
       "--fmad=false",

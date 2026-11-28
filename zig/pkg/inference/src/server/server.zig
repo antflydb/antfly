@@ -48826,6 +48826,16 @@ test "LightOnOCR3 real checkpoint transcribes the invoice fixture" {
             const recurrent_output = report.rows * geometry.qwen35_linear_num_value_heads * geometry.qwen35_linear_value_head_dim * @sizeOf(f32);
             try std.testing.expectEqual(attention_output, report.declared_attention_output_bytes);
             try std.testing.expectEqual(recurrent_output, report.declared_recurrent_output_bytes);
+            if (platform.env.getenvBool("ANTFLY_CUDA_LIGHTON_GRAPH_DEVICE_RECURRENT_PAGES")) {
+                var recurrent_layers: usize = 0;
+                for (0..geometry.num_hidden_layers) |layer| {
+                    recurrent_layers += @intFromBool(geometry.layerUsesQwen35LinearAttention(layer));
+                }
+                const row_bytes = @sizeOf(@import("../ops/cuda/gated_delta.zig").BatchPage);
+                try std.testing.expectEqual(report.rows * recurrent_layers * row_bytes, report.recurrent_page_table_bytes);
+                try std.testing.expect(report.recurrent_page_table_bytes != 0);
+            }
+
             const attention_bytes = std.mem.alignForward(usize, report.attention_scratch_bytes, alignment) + report.declared_attention_output_bytes;
             const recurrent_bytes = std.mem.alignForward(usize, report.recurrent_scratch_bytes, alignment) + report.declared_recurrent_output_bytes;
             if (report.declared_ffn_scratch_bytes != 0) {

@@ -3389,6 +3389,18 @@ Released LightOnOCR-3-0.8B replayed a declared two-row graph with zero
 workspace events. The change was qualified for custody and released
 output behavior. Wide throughput and dependent page churn remain open.
 
+The opt-in CUDA recurrent page table places each layer's history and
+state addresses in the graph metadata allocation before recording.
+Both fused decode steps use the same table and choose opposite history
+orders. The released 0.8B reader confirmed the exact table byte count
+and replayed a declared two-row graph with zero workspace events.
+All three focused Spark checks passed. Pinned SM121 assembly used 162
+registers, 2,120 bytes of shared memory and zero spill bytes for the
+previous kernel, the regenerated inline variant and the device-table
+variant. The graph still checks the full cohort key and retires on a
+referenced page release. Attention still captures its block table by
+value.
+
 The M4 Max focused cohort at `061f213135` passed all seven checks
 with zero skips. It exercised the shared installed Whisper Small
 checkpoint with the Metal backend required, verified assigned packed

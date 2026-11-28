@@ -260,6 +260,18 @@ pub const Module = struct {
         self.cached_batch_calls += 1;
     }
 
+    pub fn runFusedDecodeWithDevicePages(self: *Module, ctx: *context.CudaContext, params: *RaggedParams, pages: buffer.DeviceBuffer, step: u32) !void {
+        if (params.base.items == 0 or params.base.items > max_packet_rows or step > 1) return error.InvalidExecutionPlan;
+        _ = try buffer.validateRegion(pages, @as(usize, params.base.items) * @sizeOf(BatchPage), @alignOf(BatchPage));
+        var address = pages.ptr;
+        var history_step = step;
+        var packet = [_]?*anyopaque{ @ptrCast(params), &address, &history_step };
+        try self.program.launch(ctx, .decode_fused_p2_device_pages, 1, params.base.items * params.base.value_heads, 256, &packet);
+        self.fused_decode_calls += 1;
+        self.fused_decode_pages += params.base.items;
+        self.cached_batch_calls += 1;
+    }
+
     fn launchFusedDecode(self: *Module, ctx: *context.CudaContext, params: *RaggedParams, packet: []?*anyopaque, pages: usize) !void {
         try self.program.launch(ctx, .decode_fused_p2, 1, params.base.items * params.base.value_heads, 256, packet);
         self.fused_decode_calls += 1;

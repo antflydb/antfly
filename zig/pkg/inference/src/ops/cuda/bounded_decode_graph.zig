@@ -85,6 +85,7 @@ pub const StorageLayout = struct {
     tokens: Span,
     positions: Span,
     counter: Span,
+    recurrent_page_table: ?Span = null,
     attention_workspace: ?Span = null,
     attention_output: ?Span = null,
     recurrent_workspace: ?Span = null,
@@ -242,7 +243,8 @@ pub const StorageLayout = struct {
     }
 
     fn layerWorkspaceOffset(self: StorageLayout) !usize {
-        return aligned(try std.math.add(usize, self.counter.offset, self.counter.bytes));
+        const final = self.recurrent_page_table orelse self.counter;
+        return aligned(try std.math.add(usize, final.offset, final.bytes));
     }
 
     fn aligned(bytes: usize) !usize {
@@ -326,6 +328,7 @@ pub const Descriptor = struct {
     norm_weight_offset: f32 = 0,
     recurrent_heads: ?struct { key: usize, value: usize } = null,
     recurrent_projection_widths: ?[4]usize = null,
+    recurrent_page_key_start: ?usize = null,
     attention_layers: usize,
     recurrent_layers: usize,
     ffn_intermediate: usize = 0,
@@ -344,6 +347,14 @@ pub const Descriptor = struct {
             .adaptive_bank, .shared_layer_packets => |rows| rows,
         };
         var storage = try StorageLayout.initWithHeadLimit(self.rows, self.hidden, self.vocab, self.key.len, packet_rows);
+        if (self.recurrent_page_key_start != null) {
+            const count = try std.math.mul(usize, self.rows, self.recurrent_layers);
+            const bytes = try std.math.mul(usize, count, @sizeOf(@import("gated_delta.zig").BatchPage));
+            if (bytes == 0 or bytes > plan_mod.limit) return error.InvalidShape;
+            storage.recurrent_page_table = .{ .offset = storage.metadata_bytes, .bytes = bytes };
+            storage.metadata_bytes = try storage.layerWorkspaceOffset();
+        }
+
         if (self.head_storage == .shared_layer_packets) {
             const elements = try std.math.mul(usize, @min(self.rows, packet_rows), self.vocab);
             const bytes = try std.math.mul(usize, elements, @sizeOf(f32));
@@ -788,6 +799,8 @@ pub const Module = struct {
     next_positions: [3 * max_rows]u32 = @splat(0),
     progress: u32 = 0,
     capture_step: u32 = 0,
+    recurrent_page_layer: usize = 0,
+    recurrent_page_table_staged: bool = false,
     active: bool = false,
     captures: u64 = 0,
     replays: u64 = 0,
@@ -879,6 +892,22 @@ pub const Module = struct {
     }
     pub const Dependency = union(enum) { recurrent: u64, sequence: u64 };
 
+    pub fn nextRecurrentPageLayer(self: *Module, rows: usize) !?buffer.DeviceBuffer {
+        const layout = self.storage_layout orelse return error.InvalidExecutionPlan;
+        const table = layout.recurrent_page_table orelse return null;
+        if (!self.active or !self.recurrent_page_table_staged or rows != self.rows or self.recurrent_page_layer >= self.recurrent_layers) return error.InvalidExecutionPlan;
+        const row_bytes = try std.math.mul(usize, rows, @sizeOf(@import("gated_delta.zig").BatchPage));
+        const offset = try std.math.mul(usize, self.recurrent_page_layer, row_bytes);
+        const result = try table.bind(self.metadata).borrowRange(offset, row_bytes);
+        self.recurrent_page_layer += 1;
+        return result;
+    }
+
+    pub fn recurrentPageTable(self: *const Module) ?buffer.DeviceBuffer {
+        const layout = self.storage_layout orelse return null;
+        return if (layout.recurrent_page_table) |span| span.bind(self.metadata) else null;
+    }
+
     pub fn invalidate(self: *Module, ctx: *context.CudaContext) void {
         self.invalidateMatching(ctx, null);
     }
@@ -921,6 +950,7 @@ pub const Module = struct {
         self.hidden = hidden;
         self.vocab = vocab;
         self.storage_layout = layout;
+        self.recurrent_page_table_staged = false;
         @memcpy(self.base_positions[0..positions_.len], positions_);
         @memcpy(self.next_positions[0..positions_.len], positions_);
         self.phase = .warm;

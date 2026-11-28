@@ -3725,6 +3725,33 @@ pub const CudaCompute = struct {
         if (reserve) _ = cublasLtWorkspace(self);
         return self.currentGraphVendorWorkspace();
     }
+    pub fn lightOnDeviceRecurrentPagesEnabled(cb: *const ops.ComputeBackend) bool {
+        if (!acceptsPhysicalImplementation(cb.vtable) or !platform.env.getenvBool("ANTFLY_CUDA_LIGHTON_GRAPH_DEVICE_RECURRENT_PAGES")) return false;
+        const self: *const CudaCompute = @ptrCast(@alignCast(cb.ptr));
+        return self.lighton_fused_gdn_decode_enabled and self.lazy_host_store == null and
+            !self.resident_training_cache and self.ctx.info.compute_major >= 8;
+    }
+
+    fn stageBoundedRecurrentPages(self: *CudaCompute, descriptor: @import("bounded_decode_graph.zig").Descriptor) !void {
+        const start = descriptor.recurrent_page_key_start orelse return;
+        const table = self.bounded_decode_graph.recurrentPageTable() orelse return error.InvalidExecutionPlan;
+        const gdn = @import("gated_delta.zig");
+        const count = try checkedMul(descriptor.rows, descriptor.recurrent_layers);
+        const bindings = try self.allocator.alloc(gdn.BatchPage, count);
+        defer self.allocator.free(bindings);
+        var cursor = start;
+        for (bindings, 0..) |*binding, index| {
+            const row = index % descriptor.rows;
+            if (row % gdn.max_packet_rows == 0) cursor = try checkedAdd(cursor, 4);
+            if (cursor > descriptor.key.len or descriptor.key.len - cursor < 3) return error.InvalidExecutionPlan;
+            const page = descriptor.key[cursor..][0..3];
+            binding.* = .{ .state = page[0], .history = page[1], .next_history = page[2] };
+            if (binding.state == 0 or binding.history == 0 or binding.next_history == 0) return error.InvalidExecutionPlan;
+            cursor += 3;
+        }
+        try copyFromHostTracked(self, table, std.mem.sliceAsBytes(bindings));
+    }
+
     pub fn lightOnGraphStateOwned(cb: *const ops.ComputeBackend, state: *const @import("gated_delta.zig").State) bool {
         const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
         const eligible = state.ctx == &self.ctx and state.initialized and !state.failed and
@@ -3886,9 +3913,11 @@ pub const CudaCompute = struct {
         }
         pub fn beginStep(self: *@This(), step: usize) void {
             self.compute.bounded_decode_graph.capture_step = @intCast(step);
+            self.compute.bounded_decode_graph.recurrent_page_layer = 0;
         }
         pub fn advance(self: *@This()) !void {
             const owner = &self.compute.bounded_decode_graph;
+            if (owner.recurrentPageTable() != null and owner.recurrent_page_layer != owner.recurrent_layers) return error.InvalidExecutionPlan;
             try self.compute.lighton_attention.advanceGraph(&self.compute.ctx, owner.positions().ptr, owner.counter().ptr, @intCast(owner.rows * 3));
         }
         pub fn run(self: *@This(), context: *anyopaque, callback: *const fn (*anyopaque, *@This()) anyerror!void) !void {
@@ -4068,6 +4097,7 @@ pub const CudaCompute = struct {
                     .shared_layer_workspace_bytes = layout.layerWorkspaceBytes(),
                     .attention_scratch_bytes = if (layout.attention_workspace) |span| span.bytes else 0,
                     .recurrent_scratch_bytes = owner.bound_recurrent_scratch_bytes,
+                    .recurrent_page_table_bytes = if (layout.recurrent_page_table) |span| span.bytes else 0,
                     .declared_attention_output_bytes = if (layout.attention_output) |span| span.bytes else 0,
                     .declared_recurrent_joined_projection_bytes = if (layout.recurrent_projection_joined) |span| span.bytes else 0,
                     .bound_recurrent_joined_projection_bytes = owner.bound_recurrent_joined_projection_bytes,
@@ -4435,7 +4465,7 @@ pub const CudaCompute = struct {
         const vendor = self.currentGraphVendorWorkspace() orelse return error.PreparedCachePlanChanged;
         if (!std.meta.eql(vendor, graph_phase.vendor_workspace)) return error.PreparedCachePlanChanged;
         const descriptor = graph_phase.descriptor;
-        if (graph_phase.expected_compute != @intFromPtr(self) or descriptor.epoch != epoch or descriptor.rows != rows or descriptor.hidden != hidden or descriptor.vocab != vocab or descriptor.future_tokens != future_tokens or descriptor.minimum_remaining_tokens != expected.minimum_remaining_tokens or !std.meta.eql(descriptor.attention_geometry, expected.attention_geometry) or !std.meta.eql(descriptor.recurrent_heads, expected.recurrent_heads) or !std.meta.eql(descriptor.recurrent_projection_widths, expected.recurrent_projection_widths) or descriptor.attention_layers != expected.attention_layers or descriptor.recurrent_layers != expected.recurrent_layers or descriptor.ffn_intermediate != expected.ffn_intermediate or descriptor.attention_q_gate != expected.attention_q_gate or descriptor.norm_weight_offset != expected.norm_weight_offset or !std.meta.eql(descriptor.head_storage, expected.head_storage) or !std.mem.eql(u64, descriptor.key, key) or !std.mem.eql(u32, descriptor.positions, positions) or !std.mem.eql(u64, descriptor.sequences, expected.sequences)) return error.PreparedCachePlanChanged;
+        if (graph_phase.expected_compute != @intFromPtr(self) or descriptor.epoch != epoch or descriptor.rows != rows or descriptor.hidden != hidden or descriptor.vocab != vocab or descriptor.future_tokens != future_tokens or descriptor.minimum_remaining_tokens != expected.minimum_remaining_tokens or descriptor.recurrent_page_key_start != expected.recurrent_page_key_start or !std.meta.eql(descriptor.attention_geometry, expected.attention_geometry) or !std.meta.eql(descriptor.recurrent_heads, expected.recurrent_heads) or !std.meta.eql(descriptor.recurrent_projection_widths, expected.recurrent_projection_widths) or descriptor.attention_layers != expected.attention_layers or descriptor.recurrent_layers != expected.recurrent_layers or descriptor.ffn_intermediate != expected.ffn_intermediate or descriptor.attention_q_gate != expected.attention_q_gate or descriptor.norm_weight_offset != expected.norm_weight_offset or !std.meta.eql(descriptor.head_storage, expected.head_storage) or !std.mem.eql(u64, descriptor.key, key) or !std.mem.eql(u32, descriptor.positions, positions) or !std.mem.eql(u64, descriptor.sequences, expected.sequences)) return error.PreparedCachePlanChanged;
         const owner = &self.bounded_decode_graph;
         while (!owner.mutex.tryLock()) std.atomic.spinLoopHint();
         var claimed = false;
@@ -4463,6 +4493,10 @@ pub const CudaCompute = struct {
         }
         const head_destination = try owner.bindExecutionStorage();
         const capture_scope = if (owner.phase == .capture) try owner.bindArena() else null;
+        if (!owner.recurrent_page_table_staged and descriptor.recurrent_page_key_start != null) {
+            try self.stageBoundedRecurrentPages(descriptor);
+            owner.recurrent_page_table_staged = true;
+        }
         if (self.captured_cache_roots) |roots| try roots.beginGeneration(self, current);
         try self.lighton_attention.init(&self.ctx);
         if (owner.phase == .warm and owner.storage_layout.?.fused_head_workspace != null)
@@ -5585,7 +5619,12 @@ pub const CudaCompute = struct {
             }
             errdefer self.ctx.synchronize() catch {};
             for (states) |state| state.failed = true;
-            try self.lighton_recurrent.runFusedDecode(&self.ctx, &decode_params);
+            const owner = &self.bounded_decode_graph;
+            const pages = if (owner.active) try owner.nextRecurrentPageLayer(states.len) else null;
+            if (pages) |table|
+                try self.lighton_recurrent.runFusedDecodeWithDevicePages(&self.ctx, &decode_params, table, owner.capture_step)
+            else
+                try self.lighton_recurrent.runFusedDecode(&self.ctx, &decode_params);
             for (states) |state| {
                 std.mem.swap(buffer_mod.DeviceBuffer, &state.history[0], &state.history[1]);
                 state.failed = false;
@@ -5797,8 +5836,18 @@ pub const CudaCompute = struct {
         else
             buffer_mod.DeviceBuffer{};
         for (states) |state| state.failed = true;
+        const owner = &self.bounded_decode_graph;
+        const pages = if (planned and only_decode) try owner.nextRecurrentPageLayer(states.len) else null;
+        const page_bytes = @sizeOf(@import("gated_delta.zig").BatchPage);
+        var page_offset: usize = 0;
         for (packets[0..packet_count], packet_rows[0..packet_count], packet_scratch[0..packet_count]) |*params, count, required| {
-            try self.lighton_recurrent.runRaggedWithPrefill(&self.ctx, params, count, fused_decode, workspace.ptr, if (required != 0) workspace_bytes else 0);
+            if (pages) |table| {
+                const packet_bytes = @as(usize, params.base.items) * page_bytes;
+                try self.lighton_recurrent.runFusedDecodeWithDevicePages(&self.ctx, params, try table.borrowRange(page_offset, packet_bytes), owner.capture_step);
+                self.lighton_recurrent.ragged_batch_calls += 1;
+                self.lighton_recurrent.ragged_query_rows += count;
+                page_offset += packet_bytes;
+            } else try self.lighton_recurrent.runRaggedWithPrefill(&self.ctx, params, count, fused_decode, workspace.ptr, if (required != 0) workspace_bytes else 0);
         }
         for (states) |state| {
             std.mem.swap(buffer_mod.DeviceBuffer, &state.history[0], &state.history[1]);
