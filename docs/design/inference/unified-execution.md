@@ -3314,6 +3314,23 @@ include waits. The comparison changes both independent prompt cleanup
 and the replay-horizon check. It leaves attribution between those two
 changes open.
 
+At `0cd7a9e823`, all 55 focused Spark checks passed without skips.
+The physical graph fixture preserved the replay after an unrelated
+page moved, retired it for the referenced page, then verified that
+repeated cleanup left the retired snapshot unchanged. Released Whisper
+Small cancelled during cross-cache construction, retained the prepared
+weights, rebuilt the cache, and produced the same English transcript
+on all five calls.
+
+Both 256-page 4B runs matched serial output with 512 packed prefill
+chunks each and zero retirement-capacity retries. The unprofiled run
+replayed declared graphs at 113 rows twice and reached 6.20 pages/s.
+The profiled run reached 6.33 pages/s without replay. Four rows emitted
+EOS in its recorded 31-row burst, and page cleanup retired the graph
+before the first completed replay. The cleanup change passed the
+ownership fixture, while wide replay under profiled chunking remains
+unqualified.
+
 The M4 Max focused cohort at `061f213135` passed all seven checks
 with zero skips. It exercised the shared installed Whisper Small
 checkpoint with the Metal backend required, verified assigned packed
