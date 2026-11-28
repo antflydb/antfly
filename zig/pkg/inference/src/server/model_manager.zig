@@ -10346,9 +10346,12 @@ pub const ModelManager = struct {
         // The shared-BF16 Memorilla profile prepares only its admitted
         // request slots. The generic prewarm can treat an encoder's
         // unaligned embedding table as a tied decoder output projection.
-        const memorilla_shared_bf16 = model.manifest.memorilla_profile != null and
-            @import("../models/memorilla_qualification.zig").researchBf16Matrices();
-        if (build_options.enable_metal and !memorilla_shared_bf16 and
+        const qualification = @import("../models/memorilla_qualification.zig");
+        const memorilla_shared_weights = if (model.manifest.memorilla_profile) |profile|
+            qualification.researchBf16Matrices() or qualification.metalQ4Decoder(profile)
+        else
+            false;
+        if (build_options.enable_metal and !memorilla_shared_weights and
             self.canPrewarmBeforeModelPublication() and
             shouldUseMetalWholeModelExecutor(session))
         {
@@ -11960,8 +11963,10 @@ fn estimateBaseModelLoadAdmission(
         const qualified = @import("../models/memorilla_qualification.zig");
         try qualified.requireRecipe(profile, man);
         var amounts = try qualified.residencyPlan(man.allocator, profile, model_path);
-        if (backend_runtime.backend == .metal and qualified.researchBf16Matrices()) {
-            amounts = qualified.metalBf16ResidencyPlan(amounts.resident.host_weight_bytes);
+        if (qualified.metalQ4Decoder(profile) and backend_runtime.backend != .metal)
+            return error.UnsupportedMemorillaBackend;
+        if (backend_runtime.backend == .metal and (qualified.metalQ4Decoder(profile) or qualified.researchBf16Matrices())) {
+            amounts = qualified.metalSharedWeightResidencyPlan(amounts.resident.host_weight_bytes);
         } else if (backend_runtime.backend == .metal) {
             // The Metal store keeps widened host weights for lazy device upload.
             amounts.peak.host_weight_bytes = try std.math.add(usize, amounts.peak.host_weight_bytes, amounts.peak.backend_weight_bytes);

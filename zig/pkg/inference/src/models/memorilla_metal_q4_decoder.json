@@ -1,0 +1,42 @@
+{
+  "files": [
+    {
+      "git_blob_sha1": "d46195ac87f837ad233d02b2f80f148bf7c005e0",
+      "path": "config.json",
+      "size_bytes": 728
+    },
+    {
+      "git_blob_sha1": "20a8a9156fc8c3f25295ca067f61fdf120d517c5",
+      "path": "generation_config.json",
+      "size_bytes": 239
+    },
+    {
+      "git_blob_sha1": "31349551d90c7606f325fe0f11bbb8bd5fa0d7c7",
+      "path": "merges.txt",
+      "size_bytes": 1671853
+    },
+    {
+      "path": "tokenizer.json",
+      "sha256": "aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4",
+      "size_bytes": 11422654
+    },
+    {
+      "git_blob_sha1": "417d038a63fa3de29cfde265caedae14d1a58d92",
+      "path": "tokenizer_config.json",
+      "size_bytes": 9732
+    },
+    {
+      "git_blob_sha1": "4783fe10ac3adce15ac8f358ef5462739852c569",
+      "path": "vocab.json",
+      "size_bytes": 2776833
+    },
+    {
+      "path": "Qwen3-8B-Q4_K_M.gguf",
+      "size_bytes": 5027783488,
+      "sha256": "d98cdcbd03e17ce47681435b5150e34c1417f50b5c0019dd560e4882c5745785"
+    }
+  ],
+  "model": "Qwen/Qwen3-8B",
+  "revision": "7c41481f57cb95916b40956ab2f0b139b296d974",
+  "repo": "Qwen/Qwen3-8B-GGUF"
+}

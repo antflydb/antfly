@@ -19,7 +19,8 @@
 # span-copy results directory, and PY to a Python with tokenizers.
 # BACKEND=cuda defaults to the BF16 and fast-prefill research mode.
 # BACKEND=metal RESEARCH=1 selects shared BF16 weights and F32 KV.
-# RESEARCH=0 selects F32. BIN can point to a custom inference build.
+# DECODER_PRECISION=q4_k_m selects the pinned GGUF in DECODER_DIR.
+# RESEARCH=0 selects F32 for dense weights. BIN can point to a custom build.
 
 set -euo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -34,6 +35,16 @@ BUNDLE=${BUNDLE:-$D/span1-35k-cascade/hybrid-span-bundle}
 STATE=${STATE:-$W/.benchmark-results/memorilla/playground}
 RANKING=${RANKING:-dense}
 BACKEND=${BACKEND:-cuda}
+DECODER_PRECISION=${DECODER_PRECISION:-dense}
+case "$DECODER_PRECISION" in
+  dense) DECODER_DIR=${DECODER_DIR:-$A/managed-f32/decoder} ;;
+  q4_k_m)
+    [ "$BACKEND" = metal ] || { echo "DECODER_PRECISION=q4_k_m requires BACKEND=metal"; exit 1; }
+    : "${DECODER_DIR:?set DECODER_DIR to the managed Q4_K_M decoder directory}"
+    RESEARCH=${RESEARCH:-1}
+    ;;
+  *) echo "DECODER_PRECISION must be dense or q4_k_m"; exit 1 ;;
+esac
 case "$BACKEND" in
   cuda)
     RESEARCH=${RESEARCH:-1}
@@ -44,7 +55,12 @@ case "$BACKEND" in
     ;;
   metal)
     RESEARCH=${RESEARCH:-0}
-    if [ "$RESEARCH" = 1 ]; then
+    if [ "$RESEARCH" = 1 ] && [ "$DECODER_PRECISION" = q4_k_m ]; then
+      PROCESS_MEMORY_MB=17408
+      HOST_MEMORY_GIB=12
+      DEVICE_MEMORY_GIB=15
+      COMBINED_MEMORY_GIB=17
+    elif [ "$RESEARCH" = 1 ]; then
       PROCESS_MEMORY_MB=27648
       HOST_MEMORY_GIB=12
       DEVICE_MEMORY_GIB=26
@@ -128,7 +144,7 @@ write_config() {
         "name": "$PROFILE",
         "reader_kind": "hybrid_research",
         "encoder": "$A/managed-f32/encoder",
-        "decoder": "$A/managed-f32/decoder",
+        "decoder": "$DECODER_DIR",
         "memory_module_path": "$BUNDLE",
         "released_memory_module_path": "$A/bundles/stage3",
         "max_documents": 64,
@@ -155,9 +171,13 @@ start() {
     fi
     write_config
     (
+      unset ANTFLY_MEMORILLA_METAL_Q4_DECODER
       if [ "$BACKEND" = metal ]; then
         export ANTFLY_INFERENCE_REQUIRED_BACKEND=metal
         export ANTFLY_MEMORILLA_RESEARCH_BF16_MATRICES="$RESEARCH"
+        if [ "$DECODER_PRECISION" = q4_k_m ]; then
+          export ANTFLY_MEMORILLA_METAL_Q4_DECODER=1
+        fi
         unset ANTFLY_MEMORILLA_RESEARCH_FAST_PREFILL
       else
         export CUDA_CACHE_PATH=$W/zig/pkg/inference/.zig-cache/cuda

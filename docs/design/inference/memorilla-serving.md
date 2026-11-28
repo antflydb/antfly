@@ -659,3 +659,17 @@ released and copy17 research profiles still require CUDA.
 The playground launcher accepts `BACKEND=metal RESEARCH=1` for BF16 and
 `BACKEND=metal RESEARCH=0` for F32, with the same bundle and tokenizer inputs
 as the CUDA launcher. Metal serving remains experimental.
+
+
+For the optional Q4_K_M decoder, pull the managed bundle
+`hf:Qwen/Qwen3-8B-GGUF:memorilla-q4-k-m-gguf-bundle-v1`. It combines
+[Qwen's pinned Q4_K_M weights](https://huggingface.co/Qwen/Qwen3-8B-GGUF/blob/7c41481f57cb95916b40956ab2f0b139b296d974/Qwen3-8B-Q4_K_M.gguf)
+with the dense decoder's pinned tokenizer, chat template and configuration.
+Select the managed bundle as the decoder and set
+`ANTFLY_MEMORILLA_METAL_Q4_DECODER=1`. The decoder keeps F32 KV and
+publishes a distinct execution identity. Encoder precision remains
+independently selected by `ANTFLY_MEMORILLA_RESEARCH_BF16_MATRICES`.
+
+In the playground, set `BACKEND=metal DECODER_PRECISION=q4_k_m` and
+`DECODER_DIR` to that managed directory. The launcher defaults to BF16 for
+the encoder in this mode. Omit `DECODER_PRECISION` to keep the dense decoder.

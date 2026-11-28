@@ -13,11 +13,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Immutable, opt-in F32 production variants for the qualified Memorilla pair.
+//! Immutable Memorilla model bundles for the dense pair and the Metal Q4 decoder.
 const std = @import("std");
 const base = @import("qwen3_embedding_catalog.zig");
 pub const Bundle = base.EmbeddingBundle;
 pub const variant = "memorilla-f32-safetensors-bundle-v1";
+pub const metal_q4_variant = "memorilla-q4-k-m-gguf-bundle-v1";
+pub const metal_q4_decoder = base.Artifact{
+    .repo = "Qwen/Qwen3-8B-GGUF",
+    .revision = "7c41481f57cb95916b40956ab2f0b139b296d974",
+    .path = "Qwen3-8B-Q4_K_M.gguf",
+    .size = 5027783488,
+    .sha256 = "d98cdcbd03e17ce47681435b5150e34c1417f50b5c0019dd560e4882c5745785",
+};
 pub const decoder_manifest = "{\"type\":\"generator\",\"memorilla_profile\":\"qwen3_decoder_f32_kv_f32_v1\"}\n";
 pub const decoder_manifest_sha256 = "6a7ac5cea6394f055b894c70d6c5eacd3da622587422746f0dee3b87e63f42e1";
 const decoder_artifacts = [_]base.Artifact{
@@ -58,14 +66,28 @@ const encoder_artifacts = [_]base.Artifact{
     .{ .repo = "Qwen/Qwen3-Embedding-4B", .revision = "5cf2132abc99cad020ac570b19d031efec650f2b", .path = "tokenizer_config.json", .size = 7256, .sha256 = "2f58f4bbd7bbce15d683f525954ef3a92cd82f5e06415a9c513859bf8ab72436" },
     .{ .repo = "Qwen/Qwen3-Embedding-4B", .revision = "5cf2132abc99cad020ac570b19d031efec650f2b", .path = "vocab.json", .size = 2776833, .sha256 = "ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910" },
 };
+const metal_q4_artifacts = blk: {
+    var selected: [7]base.Artifact = undefined;
+    var count: usize = 0;
+    for (decoder_artifacts) |artifact| {
+        if (std.mem.indexOf(u8, artifact.path, ".safetensors") != null) continue;
+        selected[count] = artifact;
+        count += 1;
+    }
+    std.debug.assert(count == selected.len - 1);
+    selected[count] = metal_q4_decoder;
+    break :blk selected;
+};
+
 pub const bundles = [_]Bundle{
+    .{ .id = "memorilla-decoder-metal-q4-k-m-v1", .variant = metal_q4_variant, .source_repo = metal_q4_decoder.repo, .generated_model_manifest = decoder_manifest, .artifact_list = &metal_q4_artifacts },
     .{ .id = "memorilla-decoder-f32-v1", .variant = variant, .source_repo = "Qwen/Qwen3-8B", .generated_model_manifest = decoder_manifest, .artifact_list = &decoder_artifacts },
     .{ .id = "memorilla-encoder-f32-v1", .variant = variant, .source_repo = "Qwen/Qwen3-Embedding-4B", .generated_model_manifest = encoder_manifest, .artifact_list = &encoder_artifacts },
 };
 pub fn findBundleForHubRef(owner: []const u8, name: []const u8, selected: []const u8) ?*const Bundle {
     for (&bundles) |*bundle| {
         const slash = std.mem.indexOfScalar(u8, bundle.source_repo, '/') orelse continue;
-        if (std.mem.eql(u8, selected, variant) and std.mem.eql(u8, owner, bundle.source_repo[0..slash]) and std.mem.eql(u8, name, bundle.source_repo[slash + 1 ..])) return bundle;
+        if (std.mem.eql(u8, selected, bundle.variant) and std.mem.eql(u8, owner, bundle.source_repo[0..slash]) and std.mem.eql(u8, name, bundle.source_repo[slash + 1 ..])) return bundle;
     }
     return null;
 }

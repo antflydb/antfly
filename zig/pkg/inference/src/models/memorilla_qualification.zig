@@ -199,6 +199,14 @@ test "Memorilla execution proof rejects reduced precision and every host fallbac
 /// in-directory lock (`research_lock_file`).
 pub const Profile = enum { qwen3_encoder_f32_v1, qwen3_encoder_lora_research_f32_v1, qwen3_decoder_f32_kv_f32_v1 };
 pub const Role = enum { encoder, decoder };
+pub const metal_q4_decoder_file = catalog.metal_q4_decoder.path;
+const metal_q4_decoder_lock = @embedFile("memorilla_metal_q4_decoder.json");
+
+pub fn metalQ4Decoder(profile: Profile) bool {
+    return profile == .qwen3_decoder_f32_kv_f32_v1 and
+        !@import("builtin").is_test and @import("antfly_platform").env.getenvBool("ANTFLY_MEMORILLA_METAL_Q4_DECODER");
+}
+
 pub const lock_bytes = @embedFile("memorilla_v1_base_models.json");
 pub const research_lock_file = "memorilla_lock.json";
 pub const research_lock_schema = "antfly.memorilla.research-encoder-lock.v1";
@@ -235,8 +243,8 @@ pub fn residencyPlan(a: A, profile: Profile, directory: []const u8) !ResidencyPl
     return .{ .peak = peak, .resident = resident };
 }
 
-/// The stored BF16 matrices are shared CPU/GPU pages on Apple silicon.
-pub fn metalBf16ResidencyPlan(source_bytes: usize) ResidencyPlan {
+/// The model lease accounts once for shared CPU/GPU weights on Apple silicon.
+pub fn metalSharedWeightResidencyPlan(source_bytes: usize) ResidencyPlan {
     const resident: memory.AdmissionAmounts = .{
         .backend_weight_bytes = source_bytes,
         // F32 norms, zero biases, Metal slot metadata and persistent state.
@@ -284,7 +292,45 @@ pub fn executionIdentity(profile: Profile) [64]u8 {
 
 pub fn executionIdentityForBackend(profile: Profile, backend: @import("../backends/backends.zig").BackendType) [64]u8 {
     if (backend != .metal) return executionIdentity(profile);
+    if (metalQ4Decoder(profile)) return metalQ4ExecutionIdentity();
     return metalExecutionIdentity(profile, researchBf16Matrices());
+}
+
+fn metalQ4ExecutionIdentity() [64]u8 {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update("antfly.memorilla.execution.metal-q4-k-m-f32-kv.v1\x00");
+    hash.update(catalog.decoder_manifest);
+    hash.update(metal_q4_decoder_lock);
+    hash.update(question_recipe);
+    return std.fmt.bytesToHex(hash.finalResult(), .lower);
+}
+
+test "Memorilla Q4 decoder preserves the dense decoder sidecars and has a distinct identity" {
+    const a = std.testing.allocator;
+    var quantized = try loadPinnedLock(a, .qwen3_decoder_f32_kv_f32_v1, true);
+    defer quantized.deinit();
+    var dense = try loadPinnedLock(a, .qwen3_decoder_f32_kv_f32_v1, false);
+    defer dense.deinit();
+    try std.testing.expect(pinnedPath(quantized.entries, metal_q4_decoder_file));
+    try std.testing.expect(!pinnedPath(quantized.entries, "model.safetensors.index.json"));
+    for (quantized.entries.array.items) |entry| {
+        const name = (try member(entry, "path")).string;
+        if (std.mem.eql(u8, name, metal_q4_decoder_file)) {
+            try std.testing.expectEqualStrings(catalog.metal_q4_decoder.sha256, (try member(entry, "sha256")).string);
+            try std.testing.expectEqual(@as(i64, catalog.metal_q4_decoder.size), (try member(entry, "size_bytes")).integer);
+            continue;
+        }
+        var matched = false;
+        for (dense.entries.array.items) |original| {
+            if (!std.mem.eql(u8, name, (try member(original, "path")).string)) continue;
+            const digest_key = if (entry.object.contains("sha256")) "sha256" else "git_blob_sha1";
+            try std.testing.expectEqualStrings((try member(original, digest_key)).string, (try member(entry, digest_key)).string);
+            matched = true;
+            break;
+        }
+        try std.testing.expect(matched);
+    }
+    try std.testing.expect(!std.mem.eql(u8, &metalQ4ExecutionIdentity(), &metalExecutionIdentity(.qwen3_decoder_f32_kv_f32_v1, true)));
 }
 
 fn metalExecutionIdentity(profile: Profile, bf16: bool) [64]u8 {
@@ -302,7 +348,7 @@ test "Memorilla Metal BF16 has its own identity and charges shared weights once"
     try std.testing.expect(!std.mem.eql(u8, &metalExecutionIdentity(profile, true), &metalExecutionIdentity(profile, false)));
     try std.testing.expect(!std.mem.eql(u8, &metalExecutionIdentity(profile, true), &executionIdentity(profile)));
     const source = 8 * 1024 * 1024 * 1024;
-    const plan = metalBf16ResidencyPlan(source);
+    const plan = metalSharedWeightResidencyPlan(source);
     try std.testing.expectEqual(source, plan.resident.backend_weight_bytes);
     try std.testing.expectEqual(@as(usize, 0), plan.resident.host_weight_bytes);
     try std.testing.expect(plan.peak.host_scratch_bytes != 0);
@@ -319,7 +365,9 @@ pub fn canonicalManifest(profile: Profile) []const u8 {
 
 pub fn requireRecipe(profile: Profile, manifest: anytype) !void {
     try requireRoleRecipe(profile, manifest);
-    if (manifest.nativeWeightArtifactKind() != .sharded_safetensors)
+    const kind = manifest.nativeWeightArtifactKind() orelse return error.UnsupportedMemorillaArtifact;
+    const expected: @TypeOf(kind) = if (metalQ4Decoder(profile)) .gguf else .sharded_safetensors;
+    if (kind != expected)
         return error.UnsupportedMemorillaArtifact;
 }
 
@@ -449,9 +497,13 @@ fn loadLock(a: A, profile: Profile, directory: []const u8) !Lock {
         const research = try loadResearchLock(a, directory);
         return .{ .parsed = research.parsed, .entries = research.files };
     }
-    var parsed = try std.json.parseFromSlice(std.json.Value, a, lock_bytes, .{});
+    return loadPinnedLock(a, profile, metalQ4Decoder(profile));
+}
+
+fn loadPinnedLock(a: A, profile: Profile, quantized_decoder: bool) !Lock {
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, if (quantized_decoder) metal_q4_decoder_lock else lock_bytes, .{});
     errdefer parsed.deinit();
-    const model = try member(try member(parsed.value, "models"), @tagName(role(profile)));
+    const model = if (quantized_decoder) parsed.value else try member(try member(parsed.value, "models"), @tagName(role(profile)));
     const entries = try member(model, "files");
     if (entries != .array) return error.InvalidMemorillaSourceLock;
     return .{ .parsed = parsed, .entries = entries };
@@ -493,7 +545,7 @@ pub fn artifactGeneration(a: A, io: std.Io, directory: []const u8, profile: Prof
     const entries = lock.entries;
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
     hash.update("antfly.memorilla.artifact-generation.v1\x00");
-    hash.update(&executionIdentity(profile));
+    hash.update(if (metalQ4Decoder(profile)) &metalQ4ExecutionIdentity() else &executionIdentity(profile));
     for (entries.array.items) |entry| {
         const path = try member(entry, "path");
         if (path != .string) return error.InvalidMemorillaSourceLock;
@@ -581,27 +633,35 @@ pub fn verifyArtifacts(a: A, directory: []const u8, profile: Profile, control: C
     try control.check();
 }
 
+fn requireSelectedPath(a: A, io: std.Io, directory: []const u8, selected_path: ?[]const u8, filename: []const u8) !void {
+    const selected = selected_path orelse return error.UnsupportedMemorillaArtifact;
+    const expected = try std.fs.path.join(a, &.{ directory, filename });
+    defer a.free(expected);
+    const actual_real = try std.Io.Dir.cwd().realPathFileAlloc(io, selected, a);
+    defer a.free(actual_real);
+    const expected_real = try std.Io.Dir.cwd().realPathFileAlloc(io, expected, a);
+    defer a.free(expected_real);
+    if (!std.mem.eql(u8, actual_real, expected_real)) return error.UnsupportedMemorillaArtifact;
+}
+
 pub fn verifySelectedPaths(a: A, io: std.Io, directory: []const u8, manifest: anytype) !void {
+    const profile = manifest.memorilla_profile orelse return error.UnsupportedMemorillaArtifact;
+    if (metalQ4Decoder(profile)) {
+        try requireSelectedPath(a, io, directory, manifest.gguf_path, metal_q4_decoder_file);
+        if (manifest.safetensors_index_path != null) return error.UnsupportedMemorillaArtifact;
+    } else {
+        try requireSelectedPath(a, io, directory, manifest.safetensors_index_path, "model.safetensors.index.json");
+        if (manifest.gguf_path != null) return error.UnsupportedMemorillaArtifact;
+    }
     inline for (.{
-        .{ "safetensors_index_path", "model.safetensors.index.json" },
         .{ "config_path", "config.json" },
         .{ "tokenizer_json_path", "tokenizer.json" },
         .{ "tokenizer_config_path", "tokenizer_config.json" },
         .{ "model_manifest_path", "model_manifest.json" },
-    }) |pair| {
-        const selected = @field(manifest, pair[0]) orelse return error.UnsupportedMemorillaArtifact;
-        const expected = try std.fs.path.join(a, &.{ directory, pair[1] });
-        defer a.free(expected);
-        const actual_real = try std.Io.Dir.cwd().realPathFileAlloc(io, selected, a);
-        defer a.free(actual_real);
-        const expected_real = try std.Io.Dir.cwd().realPathFileAlloc(io, expected, a);
-        defer a.free(expected_real);
-        if (!std.mem.eql(u8, actual_real, expected_real)) return error.UnsupportedMemorillaArtifact;
-    }
-    inline for (.{ "onnx_path", "safetensors_path", "gguf_path", "gguf_projector_path", "special_tokens_map_path", "preprocessor_config_path", "processor_config_path", "vocab_txt_path", "text_projection_path", "visual_projection_path", "visual_model_path", "audio_model_path", "audio_projection_path" }) |field| {
+    }) |pair| try requireSelectedPath(a, io, directory, @field(manifest, pair[0]), pair[1]);
+    inline for (.{ "onnx_path", "safetensors_path", "gguf_projector_path", "special_tokens_map_path", "preprocessor_config_path", "processor_config_path", "vocab_txt_path", "text_projection_path", "visual_projection_path", "audio_model_path", "audio_projection_path" }) |field| {
         if (@field(manifest, field) != null) return error.UnsupportedMemorillaArtifact;
     }
-    const profile = manifest.memorilla_profile orelse return error.UnsupportedMemorillaArtifact;
     var lock = try loadLock(a, profile, directory);
     defer lock.deinit();
     for (optional_paths) |name| {

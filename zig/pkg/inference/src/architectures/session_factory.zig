@@ -1985,6 +1985,7 @@ fn createCudaSessionWithRequiredProfile(
         try memorilla_qualification.requireCudaEnvironment();
         if (override != null or a4b_request != null or required_profile_override != null)
             return error.IncompatibleCudaLoadPolicies;
+        if (memorilla_qualification.metalQ4Decoder(profile)) return error.UnsupportedMemorillaBackend;
         try memorilla_qualification.requireRecipe(profile, model_manifest);
         try memorilla_qualification.verifyArtifacts(allocator, model_path, profile, load_control orelse .{});
         try memorilla_qualification.verifySelectedPaths(allocator, profile_io, model_path, model_manifest);
@@ -2859,11 +2860,12 @@ fn createGpuHostedSessionWithTaskOverride(
     const model_weight_bytes = estimateNativeWeightBytes(allocator, mf) catch 0;
 
     var arch_config = try detectArchitecture(allocator, model_path, mf);
+    const memorilla_metal_q4 = if (mf.memorilla_profile) |profile| memorilla_qualification.metalQ4Decoder(profile) else false;
     const memorilla_generation = if (mf.memorilla_profile) |profile| blk: {
         if (backend_type != .metal or override != null or a4b_request != null or arch_config != .gpt or arch_config.gpt.family != .qwen3)
             return error.UnsupportedMemorillaArtifact;
         if (memorilla_qualification.researchFastPrefill()) return error.UnsupportedMemorillaPrecision;
-        if (memorilla_qualification.researchBf16Matrices() and
+        if ((memorilla_metal_q4 or memorilla_qualification.researchBf16Matrices()) and
             (@import("builtin").os.tag != .macos or @import("builtin").cpu.arch != .aarch64)) return error.UnsupportedMemorillaDevice;
         const before = try memorilla_qualification.artifactGeneration(allocator, std.Options.debug_io, model_path, profile, control);
         try memorilla_qualification.requireRecipe(profile, mf);
@@ -2881,7 +2883,8 @@ fn createGpuHostedSessionWithTaskOverride(
     // which was fast but measurably changed the normalized embedding. Keep
     // this exception exact-geometry qualified; all other BERT checkpoints
     // retain the existing direct-quant policy.
-    const session_direct_quant_enabled = mf.memorilla_profile == null and sessionDirectQuantEnabled(direct_quant_enabled, mf, arch_config);
+    const session_direct_quant_enabled = memorilla_metal_q4 or
+        (mf.memorilla_profile == null and sessionDirectQuantEnabled(direct_quant_enabled, mf, arch_config));
     const quant_mode = gpuHostedQuantExecutionMode(session_direct_quant_enabled);
     var metal_jit_scope: MetalJitRouteScope = if (build_options.enable_metal)
         metal_runtime.MetalJitRouteScope.none()
@@ -3160,7 +3163,8 @@ fn createGpuHostedSessionWithTaskOverride(
         .kernel_jit_load_context = .dynamic,
         .metal_jit_scope = metal_jit_scope,
         .memorilla_profile = mf.memorilla_profile,
-        .memorilla_metal_bf16 = mf.memorilla_profile != null and memorilla_qualification.researchBf16Matrices(),
+        .memorilla_metal_q4 = memorilla_metal_q4,
+        .memorilla_metal_bf16 = mf.memorilla_profile != null and !memorilla_metal_q4 and memorilla_qualification.researchBf16Matrices(),
         .budget_floor = budget_floor,
         .shared_cache_budget_floor = shared_cache_floor,
         .backend_data = makeGpuHostedBackendData(backend_type, .{
@@ -8058,6 +8062,7 @@ const BackendData = union {
 const ArchSession = struct {
     memorilla_profile: ?memorilla_qualification.Profile = null,
     memorilla_metal_bf16: bool = false,
+    memorilla_metal_q4: bool = false,
     // Independent of the model execution lane: preparation can overlap model
     // work. Session close follows worker shutdown, like the borrowed device.
     video_coefficient_mutex: std.Io.Mutex = .init,
@@ -8888,8 +8893,9 @@ pub fn requireMemorillaProfile(session: Session, expected: memorilla_qualificati
     if (self.backend_type == .metal) {
         if (comptime !build_options.enable_metal) return error.MetalNotEnabled;
         const data = gpuBackendData(self);
-        if (!data.prefer_f32_dense_tensors or data.allow_direct_quant or
-            self.memorilla_metal_bf16 != memorilla_qualification.researchBf16Matrices()) return error.UnsupportedMemorillaPrecision;
+        const quantized = memorilla_qualification.metalQ4Decoder(expected);
+        if (!data.prefer_f32_dense_tensors or data.allow_direct_quant != quantized or self.memorilla_metal_q4 != quantized or
+            self.memorilla_metal_bf16 != (!quantized and memorilla_qualification.researchBf16Matrices())) return error.UnsupportedMemorillaPrecision;
         return;
     }
     if (comptime !build_options.enable_cuda) return error.CudaNotEnabled;
@@ -10413,11 +10419,11 @@ pub fn configureReservedGenerationWorkspace(
     session.generation_workspace = &self.generation_workspace.?;
 }
 
-fn sharedCacheWeightBaseline(resident: runtime.tier.memory.AdmissionAmounts, shared_bf16: bool) runtime.tier.cache.Budget {
+fn sharedCacheWeightBaseline(resident: runtime.tier.memory.AdmissionAmounts, shared_weights: bool) runtime.tier.cache.Budget {
     // The Metal unified allocation is tracked by the host-visible cache but
     // covered by the model's backend lease. Private backend cache growth
     // still needs its own admission.
-    return if (shared_bf16)
+    return if (shared_weights)
         .{ .host_limit_bytes = resident.backend_weight_bytes }
     else
         .{ .host_limit_bytes = resident.host_weight_bytes, .backend_limit_bytes = resident.backend_weight_bytes };
@@ -10458,9 +10464,10 @@ pub fn configureSharedCacheAdmissionForSession(
         .limits = limits,
         .device = self.backend_type == .metal,
     });
-    const baseline = sharedCacheWeightBaseline(resident, self.memorilla_metal_bf16);
+    const shared_weights = self.memorilla_metal_bf16 or self.memorilla_metal_q4;
+    const baseline = sharedCacheWeightBaseline(resident, shared_weights);
     const hard_budget = runtime.tier.cache.Budget{
-        .host_limit_bytes = if (self.memorilla_metal_bf16 and limits.host_limit_bytes != 0)
+        .host_limit_bytes = if (shared_weights and limits.host_limit_bytes != 0)
             @max(limits.host_limit_bytes, baseline.host_limit_bytes)
         else
             limits.host_limit_bytes,
