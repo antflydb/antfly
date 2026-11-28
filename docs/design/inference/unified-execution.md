@@ -2825,6 +2825,24 @@ embeddings. The planned and captured arena both measured 36,788,736 bytes
 with 132 operation scratch intervals. Two local CPU contract checks passed
 for the full-range declaration and last-use compiler.
 
+The paired Spark HTTP comparison used one `a1e8a50b22` server binary with
+CUDA media batching and audio graphs enabled on both sides. Every embedding
+matched exactly across the observed-only, ABBA, and declared-only controls.
+Three- and four-clip requests used unequal lengths. Each group width had
+32 measured requests per side and zero failures.
+
+| Clips | Observed p50 / p95 (ms) | Declared p50 / p95 (ms) |
+| --- | ---: | ---: |
+| 2 | 26.91 / 29.66 | 27.26 / 27.95 |
+| 3 | 32.25 / 34.89 | 32.53 / 33.35 |
+| 4 | 36.08 / 38.11 | 36.50 / 37.38 |
+
+The paired median differences were 0.28–0.42 ms. The observed-only median
+spread was 0.75–1.33 ms. Every paired p95 improved. One unrelated GPU
+context held 184 MiB before and after the comparison. A separate untimed
+public serving run recorded 18 arena executions and nine graph replays
+across six requests at each group width.
+
 ### Isolated Metal E4B HTTP comparison at `58b3917a89`
 
 The local M4 Max used the same pinned binaries as the mixed serving
