@@ -4101,7 +4101,7 @@ pub const CudaCompute = struct {
         if (!acceptsPhysicalImplementation(cb.vtable)) return error.UnsupportedReaderEpochBackend;
         try beginRequestUsing(cb.ptr, current);
     }
-    pub const GraphRetirement = enum { state_mutation, reader_epoch, foreground_step, page_state_cleanup, projected_image_cleanup, mixed_prefill, eager_decode };
+    pub const GraphRetirement = enum { state_mutation, reader_epoch, foreground_step, foreground_vision, foreground_prefill, page_state_cleanup, projected_image_cleanup, mixed_prefill, eager_decode };
 
     pub fn invalidateLightOnDecodeGraphWithCleanup(cb: *const ops.ComputeBackend, current: CacheCleanup, reason: GraphRetirement) !void {
         return invalidateLightOnDecodeGraphMatching(cb, current, reason, null);

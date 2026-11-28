@@ -85,6 +85,8 @@ class GraphRetirementTests(unittest.TestCase):
             "LIGHTONOCR3 cuda_model_graph_reset phase=disabled rows=64\n"
             "LIGHTONOCR3 cuda_model_graph_retired reason=mixed_prefill "
             "phase=replay epoch=3 rows=64 progress=12\n"
+            "LIGHTONOCR3 cuda_model_graph_retired reason=foreground_vision "
+            "phase=capture epoch=3 rows=98 progress=2\n"
         )
         self.assertEqual(
             graph_retirements(text),
@@ -95,7 +97,8 @@ class GraphRetirementTests(unittest.TestCase):
                     epoch=3,
                     rows=64,
                     progress=12,
-                )
+                ),
+                dict(reason="foreground_vision", phase="capture", epoch=3, rows=98, progress=2),
             ],
         )
 

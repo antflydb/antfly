@@ -729,9 +729,9 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
             try ctx.pageAccess(control, true).acquire();
         }
 
-        pub fn lockStep(ctx: *LightOnStreamContext, control: InferenceExecutionControl) !void {
+        pub fn lockStep(ctx: *LightOnStreamContext, control: InferenceExecutionControl, reason: @import("../ops/cuda/cuda_compute.zig").CudaCompute.GraphRetirement) !void {
             try ctx.pageAccess(control, true).acquire();
-            ctx.invalidateCudaDecodeGraph(.foreground_step);
+            ctx.invalidateCudaDecodeGraph(reason);
         }
         // Private park/restore owner only: it already owns the pause reservation.
         // This method neither invalidates the graph nor waits on its OWN pause.

@@ -9883,7 +9883,7 @@ pub const Node = struct {
             try request.control.check();
             if (comptime build_options.enable_cuda) if (request.ctx.model.session.backend() == .cuda)
                 try request.ctx.preparePinnedInputUpload(try qwen3vl_projector.planResidentCudaPatchUploadBytesAtMost(request.ctx.cfg, images, limits, LightOnStreamContext.pinnedInputUploadCapacity()), request.control);
-            try request.ctx.lockStep(request.control);
+            try request.ctx.lockStep(request.control, .foreground_vision);
             defer request.ctx.unlockStep();
             var cb = request.pageBackend();
             return request.encodeResident(&cb, allocator, images, limits);
@@ -9899,7 +9899,7 @@ pub const Node = struct {
             if (images.len != 1) {
                 if (comptime build_options.enable_cuda) if (ctx.model.session.backend() == .cuda)
                     try ctx.preparePinnedInputUpload(try qwen3vl_projector.planResidentCudaPatchUploadBytesAtMost(ctx.cfg, images, limits, LightOnStreamContext.pinnedInputUploadCapacity()), request.control);
-                try ctx.lockStep(request.control);
+                try ctx.lockStep(request.control, .foreground_vision);
                 defer ctx.unlockStep();
                 var cb = request.pageBackend();
                 return qwen3vl_projector.encodeProjectedImagesResident(&cb, allocator, ctx.cfg, images, limits);
@@ -9944,7 +9944,7 @@ pub const Node = struct {
                 try request.control.check();
                 return projected;
             }
-            try ctx.lockStep(request.control);
+            try ctx.lockStep(request.control, .foreground_vision);
             defer ctx.unlockStep();
             ctx.cpu_preprocess_items += 1;
             ctx.cpu_preprocess_ns +|= elapsed;
@@ -9983,7 +9983,7 @@ pub const Node = struct {
                 null;
             const batch_items = if (geometry) |shape| @min(ctx.features.vision_batch_items, shape.max_items) else 1;
             if (batch_items <= 1) {
-                try ctx.lockStep(request.control);
+                try ctx.lockStep(request.control, .foreground_vision);
                 defer ctx.unlockStep();
                 var cb = request.pageBackend();
                 return request.encodeResident(&cb, allocator, images, limits);
@@ -10091,7 +10091,7 @@ pub const Node = struct {
         // Published results may let a follower retire before our defers run.
         var completed_turn = leader.*;
         defer ctx.coordinator.finishTurn(&completed_turn, .prefill);
-        ctx.lockStep(control) catch |err| {
+        ctx.lockStep(control, .foreground_prefill) catch |err| {
             for (items) |item| item.slot.fail(err);
             return;
         };
@@ -10130,7 +10130,7 @@ pub const Node = struct {
         }
         var group = executor_microbatch.ExecutionControl{ .items = items };
         const control = lightOnMicrobatchExecutionControl(&group);
-        ctx.lockStep(control) catch |err| {
+        ctx.lockStep(control, .foreground_vision) catch |err| {
             for (items) |item| item.slot.fail(err);
             return;
         };
@@ -10181,7 +10181,7 @@ pub const Node = struct {
         }
         var group = executor_microbatch.ExecutionControl{ .items = items };
         const control = lightOnMicrobatchExecutionControl(&group);
-        ctx.lockStep(control) catch |err| {
+        ctx.lockStep(control, .foreground_vision) catch |err| {
             for (items) |item| item.slot.fail(err);
             return;
         };
@@ -57150,7 +57150,7 @@ test "LightOn reader actual public CUDA loader prepares immutable norm caches be
         const uploads = compute.ocr_pinned_input_uploads;
         for (0..2) |_| {
             try ctx.preparePinnedInputUpload(bytes, factory.control); // warm metadata no supplier
-            try ctx.lockStep(factory.control);
+            try ctx.lockStep(factory.control, .foreground_step);
             defer ctx.unlockStep();
             const actual_input = try cb.fromFloat32(temporal);
             defer cb.free(actual_input);
@@ -57216,7 +57216,7 @@ test "LightOn reader actual public CUDA loader prepares immutable norm caches be
         try std.testing.expect(probe.failure == null);
         // Retire an actual per-page state under NOW's step/cohort and B;
         // an old origin or another page's pause cannot license this refund.
-        try ctx.lockStep(factory.control);
+        try ctx.lockStep(factory.control, .foreground_step);
         owned_page.beginState();
         var peer_state = generation.NativeDecodeState.initPaged(a, &ctx.manager, ctx.pool, null);
         peer_state.kv_storage = &ctx.storage;
@@ -58025,7 +58025,7 @@ test "LightOn public CUDA Reader Executor H1024 captures and replays exact two-p
             // The unchanged production recipe requires actual immutable BF16
             // embedding/head storage; an F32 checkpoint must still decline.
             {
-                try actual.lockStep(factory.control);
+                try actual.lockStep(factory.control, .foreground_step);
                 defer actual.unlockStep();
                 const profile = try page[0].cudaProfileSnapshot(actual);
                 try std.testing.expectEqual(compute.stats.profile_collection_failures, profile.profile_collection_failures);
@@ -58107,7 +58107,7 @@ test "LightOn public CUDA Reader Executor H1024 captures and replays exact two-p
                     // Same actual checkpoint embedding operation used by the
                     // maintained prompt adapter. No image tensors, fake source
                     // pointers, eager model execution or route flags are used.
-                    try actual.lockStep(factory.control);
+                    try actual.lockStep(factory.control, .foreground_step);
                     defer actual.unlockStep();
                     const current = @import("../execution/cleanup_context.zig").Context{ .boundary = actual.cleanup_owner.epoch(), .operation = cb.operationToken() };
                     const weight = try @import("../architectures/gpt.zig").getEmbeddingWeight(cb, cfg);
