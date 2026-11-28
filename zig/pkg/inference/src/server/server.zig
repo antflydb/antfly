@@ -48822,6 +48822,9 @@ test "LightOnOCR3 real checkpoint transcribes the invoice fixture" {
             const recurrent_projection_bytes = 2 * report.rows * (recurrent_key_width + recurrent_value_width + geometry.qwen35_linear_num_value_heads) * @sizeOf(f32);
             if (report.declared_recurrent_joined_projection_bytes != 0 or platform.env.getenvBool("ANTFLY_CUDA_ENABLE_LIGHTON_FUSED_PROJECTIONS"))
                 try std.testing.expectEqual(recurrent_projection_bytes, report.declared_recurrent_joined_projection_bytes);
+            try std.testing.expect(report.bound_recurrent_joined_projection_bytes <= report.declared_recurrent_joined_projection_bytes);
+            if (platform.env.getenvBool("ANTFLY_CUDA_ENABLE_LIGHTON_FUSED_PROJECTIONS"))
+                try std.testing.expectEqual(recurrent_projection_bytes, report.bound_recurrent_joined_projection_bytes);
             const serial_bytes = @max(attention_bytes, recurrent_bytes, report.declared_ffn_scratch_bytes, report.declared_recurrent_joined_projection_bytes);
             const layer_and_outputs_bytes = if (report.declared_ffn_output_bank_bytes != 0) std.mem.alignForward(usize, serial_bytes, alignment) + report.declared_ffn_output_bank_bytes else serial_bytes;
             const norm_bytes = report.rows * geometry.hidden_size * @sizeOf(f32);
@@ -48865,7 +48868,7 @@ test "LightOnOCR3 real checkpoint transcribes the invoice fixture" {
             }
             const shared_bytes = @max(through_head_bytes, mirror_offset + mirror_bytes);
             try std.testing.expectEqual(shared_bytes, report.shared_layer_workspace_bytes);
-            std.debug.print("LIGHTONOCR3 observed_cuda_workspace rows={d} readback_bytes={d} backing={s} route={s} attention_scratch_bytes={d} recurrent_scratch_bytes={d} shared_layer_workspace_bytes={d} attention_output_bytes={d} recurrent_output_bytes={d}\n", .{ report.rows, report.readback_bytes, @tagName(report.readback_backing), @tagName(report.route), report.attention_scratch_bytes, report.recurrent_scratch_bytes, report.shared_layer_workspace_bytes, report.declared_attention_output_bytes, report.declared_recurrent_output_bytes });
+            std.debug.print("LIGHTONOCR3 observed_cuda_workspace rows={d} readback_bytes={d} backing={s} route={s} attention_scratch_bytes={d} recurrent_scratch_bytes={d} shared_layer_workspace_bytes={d} attention_output_bytes={d} recurrent_output_bytes={d} recurrent_joined_bytes={d} attention_gates_in_place={d} learned_events={d} learned_bytes={d}\n", .{ report.rows, report.readback_bytes, @tagName(report.readback_backing), @tagName(report.route), report.attention_scratch_bytes, report.recurrent_scratch_bytes, report.shared_layer_workspace_bytes, report.declared_attention_output_bytes, report.declared_recurrent_output_bytes, report.bound_recurrent_joined_projection_bytes, report.attention_gates_in_place, report.planned_events, report.planned_scratch_bytes });
         }
         std.debug.print("LIGHTONOCR3 http_batch_pages=2 parity=true\n", .{});
     }

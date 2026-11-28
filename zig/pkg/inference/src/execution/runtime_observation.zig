@@ -552,6 +552,9 @@ pub const CudaDecoderWorkspace = struct {
     declared_attention_output_bytes: usize = 0,
     declared_recurrent_output_bytes: usize = 0,
     declared_recurrent_joined_projection_bytes: usize = 0,
+    /// Replay reports the bindings and dispatches saved by graph recording.
+    bound_recurrent_joined_projection_bytes: usize = 0,
+    attention_gates_in_place: usize = 0,
     declared_ffn_scratch_bytes: usize = 0,
     declared_ffn_output_bank_bytes: usize = 0,
     declared_projection_staging_bytes: usize = 0,

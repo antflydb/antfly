@@ -3937,6 +3937,8 @@ pub const CudaCompute = struct {
             const ragged_calls = compute.lighton_recurrent.ragged_batch_calls;
             if (scope) |*active_scope| compute.execution_scope = active_scope;
             owner.bound_recurrent_scratch_bytes = 0;
+            owner.bound_recurrent_joined_projection_bytes = 0;
+            owner.attention_gates_in_place = 0;
             owner.next_ffn_output = 0;
             owner.active = true;
             callback(context, self) catch |failure| {
@@ -4048,6 +4050,8 @@ pub const CudaCompute = struct {
                     .recurrent_scratch_bytes = owner.bound_recurrent_scratch_bytes,
                     .declared_attention_output_bytes = if (layout.attention_output) |span| span.bytes else 0,
                     .declared_recurrent_joined_projection_bytes = if (layout.recurrent_projection_joined) |span| span.bytes else 0,
+                    .bound_recurrent_joined_projection_bytes = owner.bound_recurrent_joined_projection_bytes,
+                    .attention_gates_in_place = owner.attention_gates_in_place,
                     .declared_recurrent_output_bytes = if (layout.recurrent_output) |span| span.bytes else 0,
                     .declared_ffn_scratch_bytes = if (layout.ffn_workspace) |span| span.bytes else 0,
                     .declared_ffn_output_bank_bytes = if (layout.ffn_outputs) |span| span.bytes else 0,
@@ -5274,6 +5278,7 @@ pub const CudaCompute = struct {
         try self.lighton_recurrent.init(&self.ctx);
         errdefer self.ctx.synchronize() catch {};
         try self.lighton_recurrent.splitProjections(&self.ctx, .{ tensorFromCt(outputs[0]).buffer.ptr, tensorFromCt(outputs[1]).buffer.ptr, tensorFromCt(outputs[2]).buffer.ptr, tensorFromCt(outputs[3]).buffer.ptr, joined.ptr }, @intCast(count), @intCast(mixed_dim), @intCast(z_dim), @intCast(heads));
+        if (destination) |span| owner.bound_recurrent_joined_projection_bytes = span.len;
         self.lighton_fused_projection_calls += 1;
         return outputs;
     }
@@ -30047,6 +30052,7 @@ pub fn tryCapturedAttentionGate(cb: *const ops.ComputeBackend, attention: CT, ga
     }
     try self.kernels.launchElementwiseF32(&self.ctx, output, output, gate_storage, result.elem_count, .multiply);
     self.stats.launch_elementwise += 1;
+    owner.attention_gates_in_place += 1;
     return true;
 }
 
@@ -48285,6 +48291,7 @@ test "LightOnOCR3 CUDA graph warm input and wide head write their assigned buffe
         defer a.free(prepared_values);
         try std.testing.expectEqualSlices(f32, ordinary_gated_values, prepared_values);
         try std.testing.expectEqual(before_gate, compute.stats.device_alloc_calls);
+        try std.testing.expectEqual(@as(usize, 2), owner.attention_gates_in_place);
     }
 
     {
