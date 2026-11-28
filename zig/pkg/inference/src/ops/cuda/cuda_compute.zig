@@ -3657,12 +3657,13 @@ pub const CudaCompute = struct {
             self.resident_training_cache or self.lazy_host_store != null) return .execution_not_capturable;
         return .enabled;
     }
-    /// The epoch caller owns execution and has retired its decoder graph.
+    /// The epoch caller owns execution. A retained graph must be suspended
+    /// and independent of the foreground workspace.
     pub fn prepareLightOnMatmulFrame(cb: *const ops.ComputeBackend) !void {
         if (cb.kind() != .cuda) return;
         const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
         if (self.capability_profile != .lightonocr3 or self.ctx.debug_graph_capture_active or self.debug_cuda_graph_capture_active) return;
-        if (self.bounded_decode_graph.graph != null) return error.InvalidExecutionPlan;
+        if (self.bounded_decode_graph.graph != null and !self.bounded_decode_graph.canKeepSuspendedDuringForeground()) return error.InvalidExecutionPlan;
         if (self.cublaslt) |*blas| _ = try blas.reserveTensorCorePlanSlots(&self.ctx, 64);
     }
 
@@ -4227,6 +4228,11 @@ pub const CudaCompute = struct {
         defer self.bounded_decode_graph.mutex.unlock();
         const owner = &self.bounded_decode_graph;
         if (!owner.retirementPending() or !owner.references(dependency)) return;
+        if ((reason == .foreground_vision or reason == .mixed_prefill) and owner.canKeepSuspendedDuringForeground()) {
+            try owner.validateCleanup(current);
+            return;
+        }
+
         if (dependency) |binding| {
             if (platform.env.getenvBool("ANTFLY_CUDA_LIGHTON_GRAPH_REBIND") and
                 try self.suspendBoundedGraphBinding(current, binding)) return;
@@ -4550,7 +4556,7 @@ pub const CudaCompute = struct {
         const vendor = self.currentGraphVendorWorkspace() orelse return error.PreparedCachePlanChanged;
         if (!std.meta.eql(vendor, graph_phase.vendor_workspace)) return error.PreparedCachePlanChanged;
         const descriptor = graph_phase.descriptor;
-        if (graph_phase.expected_compute != @intFromPtr(self) or descriptor.epoch != epoch or descriptor.rows != rows or descriptor.hidden != hidden or descriptor.vocab != vocab or descriptor.future_tokens != future_tokens or descriptor.minimum_remaining_tokens != expected.minimum_remaining_tokens or descriptor.recurrent_page_key_start != expected.recurrent_page_key_start or descriptor.attention_page_key_start != expected.attention_page_key_start or descriptor.attention_page_size != expected.attention_page_size or !std.mem.eql(u32, descriptor.attention_tokens, expected.attention_tokens) or !std.meta.eql(descriptor.attention_geometry, expected.attention_geometry) or !std.meta.eql(descriptor.recurrent_heads, expected.recurrent_heads) or !std.meta.eql(descriptor.recurrent_projection_widths, expected.recurrent_projection_widths) or descriptor.attention_layers != expected.attention_layers or descriptor.recurrent_layers != expected.recurrent_layers or descriptor.ffn_intermediate != expected.ffn_intermediate or descriptor.attention_q_gate != expected.attention_q_gate or descriptor.norm_weight_offset != expected.norm_weight_offset or !std.meta.eql(descriptor.head_storage, expected.head_storage) or !std.mem.eql(u64, descriptor.key, key) or !std.mem.eql(u32, descriptor.positions, positions) or !std.mem.eql(u64, descriptor.sequences, expected.sequences)) return error.PreparedCachePlanChanged;
+        if (graph_phase.expected_compute != @intFromPtr(self) or descriptor.epoch != epoch or descriptor.rows != rows or descriptor.hidden != hidden or descriptor.vocab != vocab or descriptor.future_tokens != future_tokens or descriptor.minimum_remaining_tokens != expected.minimum_remaining_tokens or descriptor.recurrent_page_key_start != expected.recurrent_page_key_start or descriptor.attention_page_key_start != expected.attention_page_key_start or descriptor.reserve_rebind_key != expected.reserve_rebind_key or descriptor.attention_page_size != expected.attention_page_size or !std.mem.eql(u32, descriptor.attention_tokens, expected.attention_tokens) or !std.meta.eql(descriptor.attention_geometry, expected.attention_geometry) or !std.meta.eql(descriptor.recurrent_heads, expected.recurrent_heads) or !std.meta.eql(descriptor.recurrent_projection_widths, expected.recurrent_projection_widths) or descriptor.attention_layers != expected.attention_layers or descriptor.recurrent_layers != expected.recurrent_layers or descriptor.ffn_intermediate != expected.ffn_intermediate or descriptor.attention_q_gate != expected.attention_q_gate or descriptor.norm_weight_offset != expected.norm_weight_offset or !std.meta.eql(descriptor.head_storage, expected.head_storage) or !std.mem.eql(u64, descriptor.key, key) or !std.mem.eql(u32, descriptor.positions, positions) or !std.mem.eql(u64, descriptor.sequences, expected.sequences)) return error.PreparedCachePlanChanged;
         const owner = &self.bounded_decode_graph;
         while (!owner.mutex.tryLock()) std.atomic.spinLoopHint();
         var claimed = false;
@@ -59627,6 +59633,7 @@ test "CUDA reader replays one executable after staged follower replacement" {
         .recurrent_layers = 1,
         .recurrent_page_key_start = 1,
         .attention_page_key_start = 11,
+        .reserve_rebind_key = true,
         .attention_page_size = 16,
         .attention_tokens = &.{ 5, 7 },
     };
@@ -59634,7 +59641,10 @@ test "CUDA reader replays one executable after staged follower replacement" {
     owner.metadata = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, layout.metadata_bytes);
     owner.storage_layout = layout;
     owner.host_allocator = a;
-    owner.key = try a.dupe(u64, &key);
+    const Workspace = @import("../../execution/stream_workspace.zig");
+    owner.key_backing = try a.alloc(u64, (layout.host_bytes - @sizeOf(Workspace.Plan)) / @sizeOf(u64));
+    owner.key = owner.key_backing[0..key.len];
+    @memcpy(owner.key, &key);
     owner.epoch_id = descriptor.epoch;
     owner.rows = descriptor.rows;
     owner.hidden = descriptor.hidden;
@@ -59648,6 +59658,11 @@ test "CUDA reader replays one executable after staged follower replacement" {
     var receipt: buffer_mod.DeviceBuffer = .{};
     defer _ = receipt.freeChecked(&compute.ctx) catch unreachable;
     defer compute.clearCapturedGraphWithCleanup(.{ .outside_execution = true }) catch unreachable;
+    const plan = try a.create(Workspace.Plan);
+    owner.plan = plan;
+    plan.* = .{};
+    try plan.declare(&.{}, null);
+    owner.admitted_arena_layout = try plan.layout(0);
 
     try compute.stageBoundedRecurrentPages(descriptor);
     owner.recurrent_page_table_staged = true;
@@ -59687,10 +59702,23 @@ test "CUDA reader replays one executable after staged follower replacement" {
     try std.testing.expect(!try compute.suspendBoundedGraphBinding(.{ .outside_execution = true }, .{ .sequence = 3 }));
     try std.testing.expect(try compute.suspendBoundedGraphBinding(.{ .outside_execution = true }, .{ .sequence = 4 }));
     try std.testing.expect(owner.rebind_required);
+    const backend = compute.computeBackend();
+    try CudaCompute.invalidateLightOnDecodeGraphWithCleanup(&backend, .{ .outside_execution = true }, .foreground_vision);
+    try CudaCompute.invalidateLightOnDecodeGraphWithCleanup(&backend, .{ .outside_execution = true }, .mixed_prefill);
+    try std.testing.expectEqual(exec, owner.graph);
+    try std.testing.expect(owner.canKeepSuspendedDuringForeground());
+    owner.vendor_workspace = try receipt.borrowRange(0, 64);
+    try std.testing.expect(!owner.canKeepSuspendedDuringForeground());
+    owner.vendor_workspace = .{};
+
     _ = try departing.freeChecked(&compute.ctx);
-    var replacement_key = key;
+    var replacement_key: [key.len + 1]u64 = undefined;
+    @memcpy(replacement_key[0..19], key[0..19]);
+    replacement_key[19] = 7;
+    @memcpy(replacement_key[20..], key[19..]);
     replacement_key[8..11].* = .{ replacement.ptr, replacement.ptr + 16, replacement.ptr + 32 };
     replacement_key[15] = 5;
+    replacement_key[17] = 2;
     replacement_key[18] = 6;
     var next = descriptor;
     next.key = &replacement_key;
@@ -59722,6 +59750,7 @@ test "CUDA reader replays one executable after staged follower replacement" {
     try position_receipt.copyToHost(&compute.ctx, std.mem.asBytes(&positions));
     try std.testing.expectEqual(replacement.ptr, pages[1].state);
     try std.testing.expectEqual(@as(u32, 6), table.blocks[1]);
+    try std.testing.expectEqual(@as(u32, 7), table.blocks[2]);
     try std.testing.expectEqual(@as(u32, 12), table.pages[1].tokens);
     try std.testing.expectEqualSlices(u32, next.positions, &positions);
 }

@@ -391,6 +391,7 @@ pub const Descriptor = struct {
     recurrent_projection_widths: ?[4]usize = null,
     recurrent_page_key_start: ?usize = null,
     attention_page_key_start: ?usize = null,
+    reserve_rebind_key: bool = false,
     attention_tokens: []const u32 = &.{},
     attention_page_size: u32 = 0,
     attention_layers: usize,
@@ -403,6 +404,19 @@ pub const Descriptor = struct {
         fused_top1,
     };
 
+    fn keyCapacity(self: Descriptor) !usize {
+        if (!self.reserve_rebind_key) return self.key.len;
+        const start = self.attention_page_key_start orelse return error.InvalidShape;
+        if (self.rows == 0 or self.recurrent_page_key_start == null or start > self.key.len) return error.InvalidShape;
+        const packets = (self.rows - 1) / paged_attention.max_packet_rows + 1;
+        const blocks = try std.math.mul(usize, packets, paged_attention.max_blocks);
+        const row_words = try std.math.mul(usize, self.rows, 3);
+        const kv_words = try std.math.add(usize, try std.math.mul(usize, self.attention_layers, 3), 1);
+        const capacity = try std.math.add(usize, try std.math.add(usize, start, row_words), try std.math.add(usize, blocks, kv_words));
+        if (capacity < self.key.len) return error.InvalidShape;
+        return capacity;
+    }
+
     pub fn layout(self: Descriptor) !StorageLayout {
         if (self.epoch == 0 or self.rows > max_rows or self.positions.len != self.rows * 3) return error.InvalidShape;
         if (self.sequences.len != 0 and self.sequences.len != self.rows) return error.InvalidShape;
@@ -410,7 +424,7 @@ pub const Descriptor = struct {
             .full_bank, .fused_top1 => self.rows,
             .adaptive_bank, .shared_layer_packets => |rows| rows,
         };
-        var storage = try StorageLayout.initWithHeadLimit(self.rows, self.hidden, self.vocab, self.key.len, packet_rows);
+        var storage = try StorageLayout.initWithHeadLimit(self.rows, self.hidden, self.vocab, try self.keyCapacity(), packet_rows);
         if (self.recurrent_page_key_start) |start| {
             _ = try RecurrentPageKey.init(self.key, start, self.rows, self.recurrent_layers);
             const count = try std.math.mul(usize, self.rows, self.recurrent_layers);
@@ -798,7 +812,8 @@ pub const GraphPhase = struct {
             return err;
         };
         if (self.mode == .storage) {
-            cold.key = try allocator.dupe(u64, self.descriptor.key);
+            cold.key = try allocator.alloc(u64, try self.descriptor.keyCapacity());
+            @memcpy(cold.key[0..self.descriptor.key.len], self.descriptor.key);
             cold.plan = try allocator.create(plan_mod.Plan);
             cold.plan.?.* = .{};
         }
@@ -848,6 +863,7 @@ pub const Module = struct {
     captured_roots_identity: usize = 0,
     disabled_epoch: u64 = 0,
     key: []u64 = &.{},
+    key_backing: []u64 = &.{},
     plan: ?*plan_mod.Plan = null,
     phase: Phase = .warm,
     vendor_workspace: buffer.DeviceBuffer = .{},
@@ -937,8 +953,9 @@ pub const Module = struct {
         _ = try self.metadata.freeChecked(ctx);
         if (self.plan) |plan| self.host_allocator.destroy(plan);
         self.plan = null;
-        if (self.key.len != 0) self.host_allocator.free(self.key);
+        if (self.key_backing.len != 0) self.host_allocator.free(self.key_backing) else if (self.key.len != 0) self.host_allocator.free(self.key);
         self.key = &.{};
+        self.key_backing = &.{};
         self.sequence_count = 0;
         try self.arena_quota.releaseAfterSdkDeath(current);
         try self.metadata_quota.releaseAfterSdkDeath(current);
@@ -1048,6 +1065,18 @@ pub const Module = struct {
         return std.mem.indexOfScalar(u64, self.key, address) != null;
     }
 
+    /// Foreground work may replace provider scratch. Keep only a suspended
+    /// executable whose declared plan uses its own metadata and no borrowed
+    /// vendor workspace or learned allocations.
+    pub fn canKeepSuspendedDuringForeground(self: *const Module) bool {
+        if (!self.rebind_required or self.active or self.phase != .replay or self.graph == null or
+            !self.recurrent_page_table_staged or !self.attention_page_tables_staged or
+            self.vendor_workspace.ptr != 0 or self.vendor_workspace.len != 0 or self.arena.ptr != 0) return false;
+        const plan = self.plan orelse return false;
+        const layout = self.admitted_arena_layout orelse return false;
+        return plan.origin == .declared and plan.event_count == 0 and layout.events == 0 and layout.bytes == 0;
+    }
+
     pub fn canSuspendBinding(self: *const Module, dependency: Dependency) bool {
         if (self.active or self.phase != .replay or self.graph == null or !self.recurrent_page_table_staged or
             !self.attention_page_tables_staged or self.sequence_count != self.rows) return false;
@@ -1066,7 +1095,7 @@ pub const Module = struct {
         if (!self.rebind_required or self.active or self.phase != .replay or self.graph == null or
             self.epoch_id != descriptor.epoch or self.rows != descriptor.rows or self.hidden != descriptor.hidden or
             self.vocab != descriptor.vocab or self.attention_layers != descriptor.attention_layers or
-            self.recurrent_layers != descriptor.recurrent_layers or self.key.len != descriptor.key.len or
+            self.recurrent_layers != descriptor.recurrent_layers or (if (self.key_backing.len == 0) descriptor.key.len != self.key.len else descriptor.key.len > self.key_backing.len) or
             self.sequence_count != self.rows or descriptor.sequences.len != self.rows or
             descriptor.attention_page_key_start == null or descriptor.attention_tokens.len != self.rows or
             self.attention_page_size == 0 or self.attention_page_size != descriptor.attention_page_size) return false;
@@ -1075,11 +1104,12 @@ pub const Module = struct {
         const old = RecurrentPageKey.init(self.key, start, self.rows, self.recurrent_layers) catch return false;
         const next = RecurrentPageKey.init(descriptor.key, start, descriptor.rows, descriptor.recurrent_layers) catch return false;
         const kv_words = self.attention_layers * 3 + 1;
-        if (kv_words > self.key.len) return false;
+        if (kv_words > self.key.len or kv_words > descriptor.key.len) return false;
         const kv_start = self.key.len - kv_words;
-        if (kv_start < start + old.words.len or descriptor.attention_page_key_start != start + old.words.len) return false;
+        const next_kv_start = descriptor.key.len - kv_words;
+        if (kv_start < start + old.words.len or next_kv_start < start + next.words.len or descriptor.attention_page_key_start != start + old.words.len) return false;
         if (!std.mem.eql(u64, self.key[0..start], descriptor.key[0..start]) or
-            !std.mem.eql(u64, self.key[kv_start..], descriptor.key[kv_start..]) or
+            !std.mem.eql(u64, self.key[kv_start..], descriptor.key[next_kv_start..]) or
             !old.samePacketWeights(next)) return false;
         const packets = (self.rows - 1) / RecurrentPageKey.gdn.max_packet_rows + 1;
         for (0..packets) |packet| {
@@ -1091,6 +1121,8 @@ pub const Module = struct {
 
     pub fn publishRebind(self: *Module, descriptor: Descriptor) void {
         std.debug.assert(self.admitsRebind(descriptor));
+        const backing = if (self.key_backing.len != 0) self.key_backing else self.key;
+        self.key = backing[0..descriptor.key.len];
         @memcpy(self.key, descriptor.key);
         @memcpy(self.sequences[0..self.sequence_count], descriptor.sequences);
         self.rebind_required = false;
@@ -1143,7 +1175,7 @@ pub const Module = struct {
         const dispatch = try descriptor.dispatchCounts();
         if (!phase.bound or phase.mode != .storage or self.metadata.ptr != 0 or self.head.ptr != 0 or self.arena.ptr != 0 or self.graph != null or self.pending_graph != null or self.plan != null or self.key.len != 0) return error.InvalidPreparedCacheState;
         const cold = phase.cold orelse return error.InvalidPreparedCacheState;
-        if (cold.plan == null or !std.mem.eql(u64, cold.key, descriptor.key)) return error.PreparedCachePlanChanged;
+        if (cold.plan == null or cold.key.len != (try descriptor.keyCapacity()) or !std.mem.eql(u64, cold.key[0..descriptor.key.len], descriptor.key)) return error.PreparedCachePlanChanged;
         const request = descriptor.storageRequestFor(layout);
         var lease = try cold.funding.?.take(request, try request.captured_storage.amounts());
         errdefer lease.releaseAfterSdkDeath();
@@ -1156,7 +1188,8 @@ pub const Module = struct {
         self.head = head;
         self.metadata_quota = lease.publishQuota(); // SAME preallocated cold shell
         self.host_allocator = cold.allocator;
-        self.key = cold.key;
+        self.key_backing = cold.key;
+        self.key = self.key_backing[0..descriptor.key.len];
         self.sequence_count = descriptor.sequences.len;
         @memcpy(self.sequences[0..self.sequence_count], descriptor.sequences);
         cold.key = &.{};

@@ -748,8 +748,8 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
             access.acquireForCleanup();
         }
         fn invalidateCudaDecodeGraph(ctx: *LightOnStreamContext, reason: @import("../ops/cuda/cuda_compute.zig").CudaCompute.GraphRetirement) void {
-            // Vision and other foreground phases may resize shared CUDA
-            // scratch. Retire captured addresses before that phase executes.
+            // The provider retires graphs borrowing shared scratch before
+            // foreground work can resize that scratch.
             if (comptime build_options.enable_cuda) if (ctx.cb) |*cb| if (cb.kind() == .cuda) {
                 @import("../ops/cuda/cuda_compute.zig").CudaCompute.invalidateLightOnDecodeGraphWithCleanup(cb, .{ .boundary = ctx.cleanup_owner.epoch(), .operation = cb.operationToken() }, reason) catch platform.inference_process_supervisor.restartWorker();
             };

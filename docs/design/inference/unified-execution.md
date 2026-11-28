@@ -3514,6 +3514,22 @@ output. Both missed the rebound gate despite ordinary replays at their
 target widths. Their logs showed foreground vision, mixed prefill and
 changed bindings repeatedly retiring the active owner.
 
+The foreground handoff now preserves a suspended graph when both
+page tables are staged, the declared arena is empty and the graph
+borrows no vendor workspace. Admission reserves a bounded host key
+so the replacement can change its number of attention blocks while
+retaining the same captured KV roots. Four focused Spark checks
+passed with zero skips. The physical fixture kept the same executable
+through foreground vision and mixed prefill, rejected a malformed
+replacement, then replayed with a different attention block count.
+
+The released 0.8B runs at target widths 8 and 16 each completed 64
+pages with exact serial output. Both recorded zero rebound replays
+and missed the strict gate. Changed bindings remained the main
+observed retirement reason. These runs establish output parity for
+the exercised workloads. The throughput effect of actual model
+rebinding remains unqualified.
+
 The M4 Max focused cohort at `061f213135` passed all seven checks
 with zero skips. It exercised the shared installed Whisper Small
 checkpoint with the Metal backend required, verified assigned packed
