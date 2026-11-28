@@ -82,6 +82,7 @@ pub const graph_retirement_kind: u8 = 0x50;
 pub const asset_state_kind: u8 = 0x33;
 /// Durable document-owned target for an explicitly requested producer rerun.
 pub const asset_reprocess_intent_kind: u8 = 0x52;
+pub const asset_reprocess_receipt_kind: u8 = 0x55;
 pub const embedding_reprocess_intent_kind: u8 = 0x53;
 pub const graph_asset_state_kind: u8 = 0x34;
 pub const document_unit_record_kind: u8 = 0x35;
@@ -2473,6 +2474,15 @@ pub fn isDocumentUnitArtifactRecordKey(key: []const u8) bool {
 /// namespace unchanged. Projection ownership, coverage counters, temporary
 /// producer attempts, and store/identity metadata must be rebuilt, not copied.
 /// Match complete encodings so a valid prefix never authorizes arbitrary state.
+pub fn isAssetReprocessReceiptKey(key: []const u8) bool {
+    if (!isInternalUserKey(key)) return false;
+    const doc_term = findComponentTerminator(key, 1) orelse return false;
+    const kind_pos = doc_term + 2;
+    if (kind_pos >= key.len or key[kind_pos] != asset_reprocess_receipt_kind) return false;
+    const name_term = findComponentTerminator(key, kind_pos + 1) orelse return false;
+    return name_term + 2 == key.len;
+}
+
 pub fn isRestoreArtifactKey(key: []const u8) bool {
     if (!isInternalUserKey(key)) return false;
     const doc_term = findComponentTerminator(key, 1) orelse return false;
@@ -2480,7 +2490,7 @@ pub fn isRestoreArtifactKey(key: []const u8) bool {
     if (kind_pos >= key.len) return false;
     const name_pos = kind_pos + 1;
     switch (key[kind_pos]) {
-        asset_state_kind, asset_reprocess_intent_kind, embedding_reprocess_intent_kind, document_unit_navigation_summary_kind => {
+        asset_state_kind, asset_reprocess_intent_kind, asset_reprocess_receipt_kind, embedding_reprocess_intent_kind, document_unit_navigation_summary_kind => {
             const name_term = findComponentTerminator(key, name_pos) orelse return false;
             return name_term + 2 == key.len;
         },

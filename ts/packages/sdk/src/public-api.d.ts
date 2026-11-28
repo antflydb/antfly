@@ -2566,9 +2566,9 @@ export interface paths {
          *     reprocessing regenerates vectors even when the source chunks are unchanged.
          *     Embedding requests and document-extraction requests on servers with an
          *     enrichment runtime are committed durably and queued for supervised
-         *     inference. Acceptance does not wait for inference. For extraction, inspect
-         *     the artifact generation, merge status and per-page failures; for embeddings,
-         *     inspect index coverage and repair issues. Embedded databases without an
+         *     inference. Acceptance does not wait for inference. For native extraction,
+         *     inspect the artifact's reprocess intent and its published generation, merge
+         *     status and per-page failures. For embeddings, inspect index coverage and repair issues. Embedded databases without an
          *     enrichment runtime execute document extraction inline.
          */
         post: operations["reprocessDocumentArtifact"];
@@ -9241,10 +9241,101 @@ export interface components {
             last_error_code?: string | null;
             /** @description Human-readable last extraction or materialization error summary, when available. */
             last_error_message?: string | null;
+            reprocess?: components["schemas"]["DocumentArtifactReprocessStatus"];
             /** @description Opaque JSON manifest for the artifact units and provenance. Present only for raw detail responses. Newly produced document-extraction generations include the declared execution policy under execution, including on failed generations; it is not a measured provider budget. Older manifests may omit it. */
             manifest_json?: string;
             /** @description Optional opaque JSON state for incremental processing. Present only for raw detail responses. */
             state_json?: string | null;
+        };
+        /** @description Latest explicit native document-extraction reprocess intent for this artifact. Present on single-artifact inspection when an intent exists. When the first publication is pending, the summary has generation zero and no raw manifest. */
+        DocumentArtifactReprocessStatus: {
+            /**
+             * Format: uint64
+             * @description Target generation recorded by the accepted request.
+             */
+            requested_generation: number;
+            /**
+             * Format: uint64
+             * @description Replay sequence committed with the request in the accepting shard, when available.
+             */
+            accepted_sequence?: number;
+            /**
+             * @description Published has a manifest receipt for the accepted request and can include extraction failures. Pending has no matching publication. Superseded no longer matches the configured producer. Unverified is a legacy intent whose target generation was reached without a publication receipt.
+             * @enum {string}
+             */
+            status: "pending" | "published" | "superseded" | "unverified";
+            worker?: components["schemas"]["DocumentArtifactReprocessWorker"];
+            last_retry?: components["schemas"]["DocumentArtifactReprocessRetry"];
+        };
+        /** @description Most recent durable deferral for this accepted extraction attempt, retained independently of publication status. This is a historical observation and does not imply the attempt is still waiting. */
+        DocumentArtifactReprocessRetry: {
+            /** @enum {string} */
+            reason: "provider_capacity" | "provider_retry_after" | "transient";
+            /**
+             * Format: uint64
+             * @description Unix timestamp in milliseconds before which this attempt is deferred.
+             */
+            retry_at_ms: number;
+            /**
+             * @description Enrichment stage identified by the retry outcome, when available. Enrichment is used when the failure does not identify a narrower stage.
+             * @enum {string}
+             */
+            stage?: "source_fetch" | "pdf_prepare" | "pdf_inspect" | "pdf_render" | "ocr" | "publication" | "enrichment";
+            /** @description Stable error identifier associated with the deferral, when available. */
+            error_code?: string;
+        };
+        /** @description Shard-wide retry debt sampled from the replay worker. */
+        DocumentArtifactRetryBacklog: {
+            /** Format: uint32 */
+            active_tickets: number;
+            /** Format: uint32 */
+            sleeping_tickets: number;
+            /** Format: uint64 */
+            oldest_unresolved_sequence?: number;
+            /**
+             * @description Admission constraint preventing replay from admitting fresh work, when blocked.
+             * @enum {string}
+             */
+            admission_blocked_by?: "document_workset" | "backlog_ticket_limit" | "backlog_byte_limit";
+        };
+        /** @description Sample of the owning shard's enrichment worker, when present. The worker services multiple documents and producers. Sequence values use the shard's enrichment replay sequence space. */
+        DocumentArtifactReprocessWorker: {
+            /**
+             * Format: uint64
+             * @description Replay scan watermark, which can run ahead of the contiguous applied watermark while requests wait.
+             */
+            scanned_sequence: number;
+            /**
+             * Format: uint64
+             * @description Contiguous applied enrichment watermark.
+             */
+            applied_sequence: number;
+            /**
+             * Format: uint64
+             * @description Latest enrichment replay watermark requested of the worker.
+             */
+            target_sequence: number;
+            /** @description Whether retry debt is preventing the worker from admitting new source groups. */
+            retry_queue_full: boolean;
+            backlog?: components["schemas"]["DocumentArtifactRetryBacklog"];
+            /** @description Whether the worker has retry work. */
+            retrying: boolean;
+            /**
+             * Format: uint64
+             * @description Unix timestamp in milliseconds for the worker's next scheduled retry, when available. This is shard-wide.
+             */
+            next_retry_at_ms?: number;
+            /** @description Whether the shard's worker has failed. */
+            failed: boolean;
+            /** @description Latest known worker error such as a publication wait. This is shard-wide. */
+            last_error_code?: string;
+            /**
+             * Format: uint64
+             * @description Unix timestamp of the last observed worker activity, when available. This is shard-wide.
+             */
+            last_progress_at_ms?: number;
+            /** @description Whether a background worker has started. Embedded callers can also drive replay inline. */
+            background_running: boolean;
         };
         /** @description Available derived document artifact manifests for a source document. */
         DocumentArtifactManifestList: {
@@ -9657,6 +9748,11 @@ export interface components {
              * @enum {string}
              */
             reprocess: "triggered";
+            /**
+             * Format: uint64
+             * @description Committed replay sequence for a deferred native extraction request. Scope to the accepting shard and the artifact identified by this route.
+             */
+            accepted_sequence?: number;
         };
         /** @description Bounded request for reprocessing a derived artifact across source rows in key order. */
         DocumentArtifactTableReprocessRequest: {

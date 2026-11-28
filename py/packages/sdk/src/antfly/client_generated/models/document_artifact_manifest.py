@@ -10,6 +10,7 @@ from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
     from ..models.document_artifact_child_range import DocumentArtifactChildRange
+    from ..models.document_artifact_reprocess_status import DocumentArtifactReprocessStatus
 
 
 T = TypeVar("T", bound="DocumentArtifactManifest")
@@ -53,6 +54,9 @@ class DocumentArtifactManifest:
                 generation failed.
             last_error_message (None | str | Unset): Human-readable last extraction or materialization error summary, when
                 available.
+            reprocess (DocumentArtifactReprocessStatus | Unset): Latest explicit native document-extraction reprocess intent
+                for this artifact. Present on single-artifact inspection when an intent exists. When the first publication is
+                pending, the summary has generation zero and no raw manifest.
             manifest_json (str | Unset): Opaque JSON manifest for the artifact units and provenance. Present only for raw
                 detail responses. Newly produced document-extraction generations include the declared execution policy under
                 execution, including on failed generations; it is not a measured provider budget. Older manifests may omit it.
@@ -87,6 +91,7 @@ class DocumentArtifactManifest:
     ocr_failed_pages_truncated: bool | Unset = UNSET
     last_error_code: None | str | Unset = UNSET
     last_error_message: None | str | Unset = UNSET
+    reprocess: DocumentArtifactReprocessStatus | Unset = UNSET
     manifest_json: str | Unset = UNSET
     state_json: None | str | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
@@ -163,6 +168,10 @@ class DocumentArtifactManifest:
         else:
             last_error_message = self.last_error_message
 
+        reprocess: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.reprocess, Unset):
+            reprocess = self.reprocess.to_dict()
+
         manifest_json = self.manifest_json
 
         state_json: None | str | Unset
@@ -213,6 +222,8 @@ class DocumentArtifactManifest:
             field_dict["last_error_code"] = last_error_code
         if last_error_message is not UNSET:
             field_dict["last_error_message"] = last_error_message
+        if reprocess is not UNSET:
+            field_dict["reprocess"] = reprocess
         if manifest_json is not UNSET:
             field_dict["manifest_json"] = manifest_json
         if state_json is not UNSET:
@@ -223,6 +234,7 @@ class DocumentArtifactManifest:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.document_artifact_child_range import DocumentArtifactChildRange
+        from ..models.document_artifact_reprocess_status import DocumentArtifactReprocessStatus
 
         d = dict(src_dict)
         document_id = d.pop("document_id")
@@ -305,6 +317,13 @@ class DocumentArtifactManifest:
 
         last_error_message = _parse_last_error_message(d.pop("last_error_message", UNSET))
 
+        _reprocess = d.pop("reprocess", UNSET)
+        reprocess: DocumentArtifactReprocessStatus | Unset
+        if isinstance(_reprocess, Unset):
+            reprocess = UNSET
+        else:
+            reprocess = DocumentArtifactReprocessStatus.from_dict(_reprocess)
+
         manifest_json = d.pop("manifest_json", UNSET)
 
         def _parse_state_json(data: object) -> None | str | Unset:
@@ -344,6 +363,7 @@ class DocumentArtifactManifest:
             ocr_failed_pages_truncated=ocr_failed_pages_truncated,
             last_error_code=last_error_code,
             last_error_message=last_error_message,
+            reprocess=reprocess,
             manifest_json=manifest_json,
             state_json=state_json,
         )

@@ -40,6 +40,9 @@ test "privacy mutation body budgets are shared by public and internal registrars
     for ([_][]const u8{ "/internal/v1/tables/docs/other", "/internal/v1/tables/docs/extra/privacy/scans", "/tables/docs/privacy/findings" }) |path| try std.testing.expect(privacyMutationBodyLimit(path) == null);
 }
 
+/// Older shard readers reject unknown manifest response fields.
+pub const artifact_reprocess_status_header = "x-antfly-artifact-reprocess-status";
+
 /// Internal keys remain in JSON bodies; only group/table identities enter URLs.
 pub const DocumentReadRequest = struct {
     pub const Operation = enum { lookup, manifest, manifests };

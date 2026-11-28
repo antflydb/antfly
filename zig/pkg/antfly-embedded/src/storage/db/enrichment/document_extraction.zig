@@ -1370,6 +1370,8 @@ fn isUtf8Boundary(text: []const u8, offset: usize) bool {
 }
 
 pub const Result = struct {
+    /// Receipt credited by this manifest publication, if this pass owns it.
+    reprocess_sequence: u64 = 0,
     /// Borrowed policy snapshot, serialized before the request is released.
     execution_json: []const u8 = "",
     content_type: []u8,

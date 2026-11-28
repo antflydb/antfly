@@ -3050,12 +3050,12 @@ pub const AntflyApiHandler = struct {
             .manifest => {
                 var result = self.internalGroupOperations().documentArtifactManifest(ctx.allocator, operationContext(ctx, null), params.group_id, params.table_name, key, input.value.artifact_name) catch |err| return internalGroupErrorResponse(ctx, err);
                 defer result.deinit(ctx.allocator);
-                return ctx.json(result);
+                return internalArtifactManifestResponse(ctx, &result);
             },
             .manifests => {
                 var result = self.internalGroupOperations().documentArtifactManifests(ctx.allocator, operationContext(ctx, null), params.group_id, params.table_name, key) catch |err| return internalGroupErrorResponse(ctx, err);
                 defer result.deinit(ctx.allocator);
-                return ctx.json(result);
+                return ctx.openApiJson(result);
             },
         }
     }
@@ -3423,7 +3423,7 @@ pub const AntflyApiHandler = struct {
             key,
         ) catch |err| return internalGroupErrorResponse(ctx, err);
         defer result.deinit(ctx.allocator);
-        return ctx.json(result);
+        return ctx.openApiJson(result);
     }
 
     fn internalDocumentArtifactManifest(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
@@ -3438,7 +3438,16 @@ pub const AntflyApiHandler = struct {
             params.artifact_name,
         ) catch |err| return internalGroupErrorResponse(ctx, err);
         defer result.deinit(ctx.allocator);
-        return ctx.json(result);
+        return internalArtifactManifestResponse(ctx, &result);
+    }
+
+    fn internalArtifactManifestResponse(ctx: *httpx.Context, manifest: *db_mod.types.DocumentArtifactManifest) !httpx.Response {
+        const version = ctx.header(@import("http_routes.zig").artifact_reprocess_status_header) orelse "";
+        if (!std.mem.eql(u8, version, "1")) {
+            if (manifest.reprocess != null and manifest.manifest_json.len == 0) return textResponse(ctx, 404, "not found");
+            manifest.reprocess = null;
+        }
+        return ctx.openApiJson(manifest.*);
     }
 
     fn internalDocumentArtifactChildRangeBatch(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
@@ -3463,7 +3472,7 @@ pub const AntflyApiHandler = struct {
     fn internalDocumentArtifactReprocess(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         var params = (try internalDocumentArtifactParams(ctx)) orelse return textResponse(ctx, 400, "invalid path parameter");
         defer params.deinit(ctx.allocator);
-        self.internalGroupOperations().reprocessDocumentArtifact(
+        const accepted = self.internalGroupOperations().reprocessDocumentArtifact(
             ctx.allocator,
             operationContext(ctx, null),
             params.group_id,
@@ -3471,7 +3480,7 @@ pub const AntflyApiHandler = struct {
             params.key,
             params.artifact_name,
         ) catch |err| return internalArtifactWriteErrorResponse(ctx, err, "invalid document artifact reprocess request");
-        return ctx.json(.{ .reprocess = "triggered" });
+        return ctx.openApiJson(.{ .reprocess = "triggered", .accepted_sequence = accepted.accepted_sequence });
     }
 
     fn internalTableArtifactReprocess(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
