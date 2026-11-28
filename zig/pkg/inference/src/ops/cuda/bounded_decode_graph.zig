@@ -94,8 +94,8 @@ pub const StorageLayout = struct {
     projection_staging: ?Span = null,
     attention_residual: ?Span = null,
     attention_inputs: ?Span = null,
-    attention_norm: ?Span = null,
-    attention_norm_mirror: ?Span = null,
+    layer_norm: ?Span = null,
+    layer_norm_mirror: ?Span = null,
     final_norm_mirror: ?Span = null,
     fused_head_workspace: ?Span = null,
     recurrent_scratch: ?@import("gated_delta.zig").PacketScratch = null,
@@ -216,8 +216,8 @@ pub const StorageLayout = struct {
             self.ffn_outputs,
             self.attention_residual,
             self.attention_inputs,
-            self.attention_norm,
-            self.attention_norm_mirror,
+            self.layer_norm,
+            self.layer_norm_mirror,
         }) |slot| if (slot) |span| {
             end = @max(end, try std.math.add(usize, span.offset, span.bytes));
         };
@@ -398,7 +398,7 @@ pub const GraphPhase = struct {
         compact_ffn: ?bool,
         projection_staging: bool,
         final_norm_mirror: bool = false,
-        attention_norm: bool = false,
+        layer_norm: bool = false,
         fused_attention_inputs: bool = false,
     };
 
@@ -412,18 +412,18 @@ pub const GraphPhase = struct {
         if (policy.recurrent_scratch) try self.declareRecurrentScratch();
         try self.declareRecurrentOutput();
         if (policy.compact_ffn) |compact| try self.declareFfnScratch(compact);
-        if (policy.attention_norm) {
+        if (policy.layer_norm) {
             const elements = try std.math.mul(usize, self.descriptor.rows, self.descriptor.hidden);
             const norm_bytes = try std.math.mul(usize, elements, @sizeOf(f32));
             const offset = try StorageLayout.aligned(try self.storage_layout.layerLiveBytes());
-            self.storage_layout.attention_norm = try self.storage_layout.declareLayerRegion(offset, norm_bytes);
+            self.storage_layout.layer_norm = try self.storage_layout.declareLayerRegion(offset, norm_bytes);
             if (policy.final_norm_mirror) {
                 const mirror_offset = try StorageLayout.aligned(try self.storage_layout.layerLiveBytes());
-                self.storage_layout.attention_norm_mirror = try self.storage_layout.declareLayerRegion(mirror_offset, try std.math.mul(usize, elements, @sizeOf(u16)));
+                self.storage_layout.layer_norm_mirror = try self.storage_layout.declareLayerRegion(mirror_offset, try std.math.mul(usize, elements, @sizeOf(u16)));
             }
         }
-        if (policy.attention_norm) {
-            const bytes = self.storage_layout.attention_norm.?.bytes;
+        if (policy.layer_norm) {
+            const bytes = self.storage_layout.layer_norm.?.bytes;
             const offset = try StorageLayout.aligned(try self.storage_layout.layerLiveBytes());
             self.storage_layout.attention_residual = try self.storage_layout.declareLayerRegion(offset, bytes);
         }
@@ -977,11 +977,11 @@ pub const Module = struct {
 
     pub const NormStorage = struct { output: buffer.DeviceBuffer, mirror: ?buffer.DeviceBuffer };
 
-    pub fn bindAttentionNorm(self: *const Module, bytes: usize) !?NormStorage {
+    pub fn bindLayerNorm(self: *const Module, bytes: usize) !?NormStorage {
         const layout = self.storage_layout orelse return error.InvalidExecutionPlan;
-        const output = layout.attention_norm orelse return null;
+        const output = layout.layer_norm orelse return null;
         if (output.bytes != bytes) return error.InvalidExecutionPlan;
-        const mirror = if (layout.attention_norm_mirror) |span| blk: {
+        const mirror = if (layout.layer_norm_mirror) |span| blk: {
             if (span.bytes != bytes / 2) return error.InvalidExecutionPlan;
             break :blk try self.bindLayerWorkspace(layout, span, span.bytes);
         } else null;

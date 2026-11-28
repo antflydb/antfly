@@ -12582,8 +12582,8 @@ fn applyNormAt(cb: *const ComputeBackend, allocator: std.mem.Allocator, config: 
             const w = try maybeAdjustNormWeight(cb, allocator, config, base_w, dim);
             defer if (w != base_w) cb.free(w);
             if (comptime build_options.enable_cuda) {
-                if (is_attn and config.hasQwen35VisionArchitectureContract() and cb.kind() == .cuda) {
-                    if (try @import("../ops/cuda/cuda_compute.zig").tryCapturedAttentionNorm(cb, hidden, w, dim, config.norm_eps)) |assigned| return assigned;
+                if (config.hasQwen35VisionArchitectureContract() and cb.kind() == .cuda) {
+                    if (try @import("../ops/cuda/cuda_compute.zig").tryCapturedLayerNorm(cb, hidden, w, dim, config.norm_eps)) |assigned| return assigned;
                 }
             }
             return cb.rmsNorm(hidden, w, dim, config.norm_eps);

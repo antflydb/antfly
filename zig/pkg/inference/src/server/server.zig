@@ -48820,8 +48820,8 @@ test "LightOnOCR3 real checkpoint transcribes the invoice fixture" {
             const serial_bytes = @max(attention_bytes, recurrent_bytes, report.declared_ffn_scratch_bytes);
             const layer_and_outputs_bytes = if (report.declared_ffn_output_bank_bytes != 0) std.mem.alignForward(usize, serial_bytes, alignment) + report.declared_ffn_output_bank_bytes else serial_bytes;
             const norm_bytes = report.rows * geometry.hidden_size * @sizeOf(f32);
-            try std.testing.expectEqual(norm_bytes, report.declared_attention_norm_bytes);
-            const attention_mirror_bytes = report.declared_attention_norm_mirror_bytes;
+            try std.testing.expectEqual(norm_bytes, report.declared_layer_norm_bytes);
+            const attention_mirror_bytes = report.declared_layer_norm_mirror_bytes;
             if (attention_mirror_bytes != 0) try std.testing.expectEqual(norm_bytes / 2, attention_mirror_bytes);
             const layer_and_norm_bytes = std.mem.alignForward(usize, layer_and_outputs_bytes, alignment) + norm_bytes;
             const layer_and_mirror_bytes = if (attention_mirror_bytes != 0) std.mem.alignForward(usize, layer_and_norm_bytes, alignment) + attention_mirror_bytes else layer_and_norm_bytes;

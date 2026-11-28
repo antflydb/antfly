@@ -4004,8 +4004,8 @@ pub const CudaCompute = struct {
                     .declared_projection_staging_bytes = if (layout.projection_staging) |span| span.bytes else 0,
                     .declared_attention_residual_bytes = if (layout.attention_residual) |span| span.bytes else 0,
                     .declared_attention_inputs_bytes = if (layout.attention_inputs) |span| span.bytes else 0,
-                    .declared_attention_norm_bytes = if (layout.attention_norm) |span| span.bytes else 0,
-                    .declared_attention_norm_mirror_bytes = if (layout.attention_norm_mirror) |span| span.bytes else 0,
+                    .declared_layer_norm_bytes = if (layout.layer_norm) |span| span.bytes else 0,
+                    .declared_layer_norm_mirror_bytes = if (layout.layer_norm_mirror) |span| span.bytes else 0,
                     .declared_final_norm_mirror_bytes = if (layout.final_norm_mirror) |span| span.bytes else 0,
                     .declared_final_norm_mirror_offset = if (layout.final_norm_mirror) |span| span.offset - (layout.metadata_bytes - layout.layerWorkspaceBytes()) else 0,
                     .head_bytes = layout.head_bytes,
@@ -4245,7 +4245,7 @@ pub const CudaCompute = struct {
             .recurrent_scratch = !self.lighton_fused_gdn_decode_enabled or self.ctx.info.compute_major < 8,
             .compact_ffn = if (lightOnFfnBlockEnabled(cb) and lightOnDevice(self).portableKernels() and !self.lighton_bf16_decode_outputs) self.lighton_bf16_projection_outputs else null,
             .projection_staging = cudaCublasLtEnabled() and self.cublaslt != null and self.ctx.info.compute_major >= 8,
-            .attention_norm = true,
+            .layer_norm = true,
             .fused_attention_inputs = lightOnProjectionResidualEnabled(cb),
             .final_norm_mirror = cudaRmsNormBf16MirrorEnabled() and cudaCublasLtEnabled() and self.cublaslt != null and self.ctx.info.compute_major >= 8,
         }) catch |err| switch (err) {
@@ -29935,7 +29935,7 @@ pub fn tryCapturedAttentionOutputProjection(cb: *const ops.ComputeBackend, input
     const lhs = tensorFromCt(input);
     const rhs = tensorFromCt(weight);
     const bytes = try lightOnLinearOutputBytes(self, rhs, rows, out_dim);
-    const storage = (try owner.bindAttentionNorm(bytes)) orelse return null;
+    const storage = (try owner.bindLayerNorm(bytes)) orelse return null;
     const destination = storage.output;
     for ([_]buffer_mod.DeviceBuffer{ lhs.buffer, lhs.bf16_mirror, rhs.buffer }) |source| {
         if (kernel_geometry.byteRangesOverlap(destination.ptr, destination.len, source.ptr, source.len)) return null;
@@ -29964,7 +29964,7 @@ pub fn tryCapturedAttentionResidual(cb: *const ops.ComputeBackend, a: CT, b: CT)
     return output.intoTensor();
 }
 
-pub fn tryCapturedAttentionNorm(cb: *const ops.ComputeBackend, input: CT, weight: CT, dim: usize, eps: f32) !?CT {
+pub fn tryCapturedLayerNorm(cb: *const ops.ComputeBackend, input: CT, weight: CT, dim: usize, eps: f32) !?CT {
     if (!acceptsPhysicalImplementation(cb.vtable)) return null;
     const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
     const owner = &self.bounded_decode_graph;
@@ -29972,7 +29972,7 @@ pub fn tryCapturedAttentionNorm(cb: *const ops.ComputeBackend, input: CT, weight
     const source = tensorFromCt(input);
     const gamma = tensorFromCt(weight);
     const bytes = try checkedMul(source.elem_count, @sizeOf(f32));
-    const storage = (try owner.bindAttentionNorm(bytes)) orelse return null;
+    const storage = (try owner.bindLayerNorm(bytes)) orelse return null;
     const regions = [_]buffer_mod.DeviceBuffer{ source.buffer, gamma.buffer, storage.output, storage.mirror orelse .{} };
     try buffer_mod.validateRegions(4, regions, .{ source.buffer.len, gamma.buffer.len, bytes, regions[3].len }, .{ @alignOf(f32), 1, @alignOf(f32), @alignOf(u16) }, 2);
     return try rmsNormWithDestination(cb.ptr, input, weight, dim, eps, storage.output, storage.mirror);
@@ -48016,19 +48016,19 @@ test "LightOnOCR3 CUDA graph warm input and wide head write their assigned buffe
         try std.testing.expectEqualSlices(f32, ordinary_values, assigned_values);
 
         owner.storage_layout.?.metadata_bytes = metadata.len;
-        owner.storage_layout.?.attention_norm = .{ .offset = norm_offset, .bytes = norm_bytes };
-        defer owner.storage_layout.?.attention_norm = null;
+        owner.storage_layout.?.layer_norm = .{ .offset = norm_offset, .bytes = norm_bytes };
+        defer owner.storage_layout.?.layer_norm = null;
         if (test_mirror) {
-            owner.storage_layout.?.attention_norm_mirror = .{ .offset = mirror_offset, .bytes = mirror_bytes };
+            owner.storage_layout.?.layer_norm_mirror = .{ .offset = mirror_offset, .bytes = mirror_bytes };
         }
-        defer owner.storage_layout.?.attention_norm_mirror = null;
+        defer owner.storage_layout.?.layer_norm_mirror = null;
         const layer_allocations = compute.stats.device_alloc_calls;
-        const attention_norm = (try tryCapturedAttentionNorm(&cb, input, gamma, 2, 1e-6)) orelse return error.TestUnexpectedResult;
+        const attention_norm = (try tryCapturedLayerNorm(&cb, input, gamma, 2, 1e-6)) orelse return error.TestUnexpectedResult;
         defer cb.free(attention_norm);
         try std.testing.expectEqual(layer_allocations, compute.stats.device_alloc_calls);
         try std.testing.expectEqual(metadata.ptr + norm_offset, tensorFromCt(attention_norm).buffer.ptr);
         try std.testing.expect(!tensorFromCt(attention_norm).owns_buffer);
-        try std.testing.expectError(error.InvalidShape, tryCapturedAttentionNorm(&cb, attention_norm, gamma, 2, 1e-6));
+        try std.testing.expectError(error.InvalidShape, tryCapturedLayerNorm(&cb, attention_norm, gamma, 2, 1e-6));
         const attention_values = try cb.toFloat32(attention_norm, a);
         defer a.free(attention_values);
         try std.testing.expectEqualSlices(f32, ordinary_values, attention_values);
