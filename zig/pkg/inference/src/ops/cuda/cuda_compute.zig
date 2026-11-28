@@ -23107,6 +23107,24 @@ fn roundBf16F32Op(ctx: *anyopaque, input: CT) anyerror!?CT {
     return output.intoTensor();
 }
 
+fn roundOwnedBf16F32Op(ctx: *anyopaque, input: CT) anyerror!bool {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const tensor = tensorFromCt(input);
+    if (!isRetainableCacheOutput(tensor) or !tensor.owns_buffer or
+        tensor.immutable_graph_input or tensor.physical_storage_base or tensor.physical_lease != null or
+        tensor.retained_quota.hasLease() or tensor.training_upload_generation != null or
+        tensor.strict_resident_training or tensor.uploaded_index_bounds != null) return false;
+    if (tensor.resident_owner) |owner| if (owner != self) return false;
+    if (tensor.buffer.borrowed) {
+        const scope = self.execution_scope orelse return false;
+        if (!scope.owns(tensor.buffer.ptr)) return false;
+    }
+    _ = try sourceScalarTensor(input, tensor.elem_count);
+    try self.kernels.launchRoundBf16F32(&self.ctx, tensor.buffer, tensor.buffer, tensor.elem_count);
+    self.stats.launch_elementwise += 1;
+    return true;
+}
+
 fn convertDTypeOp(ctx: *anyopaque, tensor_ct: CT, target: ops.GraphDType) anyerror!?CT {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     const tensor = tensorFromCt(tensor_ct);
@@ -38621,6 +38639,7 @@ const vtable: ops.ComputeBackend.VTable = .{
     .beginRequest = &beginRequest,
     .convertDType = &convertDTypeOp,
     .roundBf16F32 = &roundBf16F32Op,
+    .roundOwnedBf16F32 = &roundOwnedBf16F32Op,
     .sourceScalarStorage = &sourceScalarStorageOp,
     .bf16SourceOperation = &bf16SourceOperationOp,
     .provisionKvDeviceWriteHook = &provisionKvDeviceWriteHook,
@@ -62777,6 +62796,17 @@ test "CUDA BF16 storage rounding preserves borrowed input and exact finite cast 
         try std.testing.expectEqual(rounded, @as(u32, @bitCast(value)));
         try std.testing.expectEqual(bits, @as(u32, @bitCast(original)));
     }
+    const allocations = compute.stats.device_alloc_calls;
+    {
+        retainResidentTensor(tensorFromCt(source));
+        defer cb.free(source);
+        try std.testing.expect(!try cb.tryRoundOwnedBf16F32(source));
+    }
+    try std.testing.expect(try cb.tryRoundOwnedBf16F32(source));
+    try std.testing.expectEqual(allocations, compute.stats.device_alloc_calls);
+    const in_place = try cb.toFloat32(source, a);
+    defer a.free(in_place);
+    for (actual, in_place) |want, got| try std.testing.expectEqual(@as(u32, @bitCast(want)), @as(u32, @bitCast(got)));
 }
 
 test "source reduction capacity is cold queried and never fabricated from default context metadata" {

@@ -2406,6 +2406,15 @@ pub const ComputeBackend = struct {
         return op(self.ptr, tensor);
     }
 
+    /// Rounds an exclusively owned result in place. A decline preserves it.
+    pub fn tryRoundOwnedBf16F32(self: *const ComputeBackend, tensor: CT) !bool {
+        const op = self.vtable.roundOwnedBf16F32 orelse return false;
+        if (self.vtable.operation_services) |services| {
+            if (!services.accepts(self.vtable)) return false;
+        }
+        return op(self.ptr, tensor);
+    }
+
     pub fn tryConvertDType(self: *const ComputeBackend, tensor: CT, target: GraphDType) !?CT {
         const op = self.vtable.convertDType orelse return null;
         return op(self.ptr, tensor, target);
@@ -2943,6 +2952,7 @@ pub const ComputeBackend = struct {
         cumulativeSum: ?*const fn (ctx: *anyopaque, tensor: CT, axis: u8, exclusive: bool, reverse: bool) anyerror!?CT = null,
         convertDType: ?*const fn (ctx: *anyopaque, tensor: CT, target: GraphDType) anyerror!?CT = null,
         roundBf16F32: ?*const fn (ctx: *anyopaque, tensor: CT) anyerror!?CT = null,
+        roundOwnedBf16F32: ?*const fn (ctx: *anyopaque, tensor: CT) anyerror!bool = null,
         sourceScalarStorage: ?*const fn (ctx: *anyopaque, program: SourceScalarProgram) SourceScalarStorage = null,
         bf16SourceOperation: ?*const fn (ctx: *anyopaque, request: *const Bf16SourceOperation) anyerror!?CT = null,
         recordLossGradient: ?*const fn (ctx: *anyopaque, request: *const record_loss_math.Request) anyerror!void = null,

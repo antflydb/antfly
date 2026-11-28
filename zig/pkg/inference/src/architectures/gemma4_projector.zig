@@ -1564,13 +1564,14 @@ fn audioConfigForBackend(cb: *const ComputeBackend, declared: AudioConfig) !Audi
     return actual;
 }
 
-/// Consumes one owned eager result. A BF16 source node publishes a distinct
-/// owning result; an unavailable selected contract fails without F32 relabeling.
+/// Consumes an owned result and publishes the next source rounding boundary.
 fn audioSourceRoundOwned(cb: *const ComputeBackend, cfg: AudioConfig, input: CT) !CT {
     if (cfg.source_scalar_storage != .bf16) return input;
-    defer cb.free(input);
+    errdefer cb.free(input);
+    if (try cb.tryRoundOwnedBf16F32(input)) return input;
     const result = (try cb.tryRoundBf16F32(input)) orelse return error.SourceArithmeticUnavailable;
     if (result == input) return error.InvalidSourceArithmeticOwnership;
+    cb.free(input);
     return result;
 }
 
