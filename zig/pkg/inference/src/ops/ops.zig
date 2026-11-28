@@ -2809,13 +2809,18 @@ pub const ComputeBackend = struct {
     };
 
     /// Admission, cancellation and publication for composite audio execution.
+    pub const GroupedAudioGeometry = struct {
+        recipe: *const @import("../execution/audio_schedule.zig").AudioRecipe,
+        segments: []const usize,
+        rows: usize,
+    };
+
     pub const AudioExecutionRegion = struct {
-        fitsGroupedWorkspace: ?*const fn (ctx: *anyopaque, recipe: @import("../execution/audio_schedule.zig").AudioRecipe, segments: []const usize, rows: usize) anyerror!bool = null,
         setControl: ?*const fn (ctx: *anyopaque, control: ?InferenceExecutionControl) ?InferenceExecutionControl = null,
         storage: ?*const fn (ctx: *anyopaque, begin: bool) anyerror!bool = null,
         /// run submits work synchronously. Input handles are borrowed for the
         /// callback and its returned output must own an independent handle.
-        execute: ?*const fn (ctx: *anyopaque, key: u64, inputs: []const CT, context: *anyopaque, run: *const fn (*anyopaque, []const CT) anyerror!CT, cleanup: @import("../execution/cleanup_context.zig").Context, defer_arena: bool) anyerror!?CT = null,
+        execute: ?*const fn (ctx: *anyopaque, key: u64, inputs: []const CT, context: *anyopaque, run: *const fn (*anyopaque, []const CT) anyerror!CT, cleanup: @import("../execution/cleanup_context.zig").Context, defer_arena: bool, geometry: ?GroupedAudioGeometry) anyerror!?CT = null,
     };
 
     pub const TokenSelectionRegion = struct {
@@ -5902,21 +5907,16 @@ pub const ComputeBackend = struct {
         return output;
     }
 
-    pub fn audioExecutionFitsGroupedWorkspace(self: *const ComputeBackend, recipe: @import("../execution/audio_schedule.zig").AudioRecipe, segments: []const usize, rows: usize) !bool {
-        const preflight = self.vtable.regions.audio_execution.fitsGroupedWorkspace orelse return true;
-        return preflight(self.ptr, recipe, segments, rows);
-    }
-
     pub fn supportsAudioExecution(self: *const ComputeBackend) bool {
         return self.vtable.regions.audio_execution.execute != null;
     }
 
     pub fn audioExecution(self: *const ComputeBackend, key: u64, inputs: []const CT, context: *anyopaque, run: *const fn (*anyopaque, []const CT) anyerror!CT) !?CT {
-        return self.audioExecutionWithArenaFunding(key, inputs, context, run, false);
+        return self.audioExecutionWithArenaFunding(key, inputs, context, run, false, null);
     }
 
     /// The callback borrows read-only inputs and returns an independent output.
-    pub fn audioExecutionWithArenaFunding(self: *const ComputeBackend, key: u64, inputs: []const CT, context: *anyopaque, run: *const fn (*anyopaque, []const CT) anyerror!CT, defer_arena: bool) !?CT {
+    pub fn audioExecutionWithArenaFunding(self: *const ComputeBackend, key: u64, inputs: []const CT, context: *anyopaque, run: *const fn (*anyopaque, []const CT) anyerror!CT, defer_arena: bool, geometry: ?GroupedAudioGeometry) !?CT {
         const op = self.vtable.regions.audio_execution.execute orelse return null;
         const previous = if (self.vtable.regions.audio_execution.setControl) |set| set(self.ptr, self.execution_control) else null;
         defer if (self.vtable.regions.audio_execution.setControl) |set| {
@@ -5924,7 +5924,7 @@ pub const ComputeBackend = struct {
         };
         try self.checkExecutionControl();
         const cleanup = if (self.call_context) |invocation| invocation.cleanup else @import("../execution/cleanup_context.zig").Context{};
-        const result = try self.observeBackendEntry(.audio_execution, op, .{ self.ptr, key, inputs, context, run, cleanup, defer_arena });
+        const result = try self.observeBackendEntry(.audio_execution, op, .{ self.ptr, key, inputs, context, run, cleanup, defer_arena, geometry });
         errdefer if (result) |ct| self.free(ct);
         try self.checkExecutionControl();
         return result;
@@ -8003,7 +8003,7 @@ test "audio execution forwards caller cleanup authority" {
     const Invocation = @import("../execution/invocation_context.zig").Context;
     const Epoch = @import("../execution/retirement_sink.zig").Epoch;
     const Fixture = struct {
-        fn execute(raw: *anyopaque, _: u64, _: []const CT, context: *anyopaque, run: *const fn (*anyopaque, []const CT) anyerror!CT, cleanup: Cleanup, _: bool) anyerror!?CT {
+        fn execute(raw: *anyopaque, _: u64, _: []const CT, context: *anyopaque, run: *const fn (*anyopaque, []const CT) anyerror!CT, cleanup: Cleanup, _: bool, _: ?ComputeBackend.GroupedAudioGeometry) anyerror!?CT {
             const observed: *Cleanup = @ptrCast(@alignCast(raw));
             observed.* = cleanup;
             return try run(context, &.{});

@@ -24377,7 +24377,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
     }
 
-    fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *anyopaque, run: *const fn (*anyopaque, []const CT) anyerror!CT, cleanup: @import("../execution/cleanup_context.zig").Context, defer_arena: bool) anyerror!?CT {
+    fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *anyopaque, run: *const fn (*anyopaque, []const CT) anyerror!CT, cleanup: @import("../execution/cleanup_context.zig").Context, defer_arena: bool, _: ?ops.ComputeBackend.GroupedAudioGeometry) anyerror!?CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         const observation = @import("../execution/runtime_observation.zig");
         const selection = audioExecutionSelection(self, key, inputs) orelse {
