@@ -2860,6 +2860,17 @@ allocations in the assigned calls. The released reader again replayed two
 rows with the 44-byte pinned receipt and 2,004,992-byte shared layer
 workspace. The paired serving comparison runs separately.
 
+The Spark two-page LightOnOCR HTTP comparison used `a1e8a50b22` as
+the baseline and `68933620f2` as the candidate. All 144 measured requests
+matched exactly across AA, ABBA and BB. Every phase logged two-row graph
+replay on each request, including warmups. One other GPU context held
+184 MiB before and after the run. Paired median/p95 changed from
+472.01/481.77 ms to 466.74/497.06 ms. The two baseline-only arms reached
+472.97 and 478.79 ms at p95, and the two candidate-only arms reached
+495.87 and 498.25 ms. The median improved 1.1% and the p95 was 3.2% higher.
+The tail requires a repeat on the current revision before performance
+qualification can close.
+
 ### Isolated Metal E4B HTTP comparison at `58b3917a89`
 
 The local M4 Max used the same pinned binaries as the mixed serving
