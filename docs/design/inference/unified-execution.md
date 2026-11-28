@@ -3136,6 +3136,12 @@ changing samples, and both precisions used 6,144 fewer arena bytes at
 each width. The recipe, allocation cleanup and Metal segmented execution
 checks passed locally.
 
+The F32 and source BF16 routes now share the encoder block order and
+stage retirement. F32 retains its existing packed projection and
+precision-specific operations. The same twelve released-model cases
+passed on Spark with exact eager parity and the same arena capacities as
+the preceding check. Four local Native and Metal audio checks passed.
+
 ### Isolated Metal E4B HTTP comparison at `58b3917a89`
 
 The local M4 Max used the same pinned binaries as the mixed serving

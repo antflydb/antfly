@@ -5213,7 +5213,7 @@ fn runAudioLayers(cb: *const ComputeBackend, a: std.mem.Allocator, store: *Proje
         const next = if (shared_block)
             try grouped_audio_block.run(&GroupedAudioBlock{ .cb = cb, .allocator = a, .store = store, .cfg = cfg, .inputs = inputs, .layer = layer }, state)
         else
-            try audioLayer(cb, a, store, cfg, state, inputs, layer);
+            try grouped_audio_block.run(&AudioLayer{ .cb = cb, .allocator = a, .store = store, .cfg = cfg, .inputs = inputs, .layer = layer }, state);
         if (owned) cb.free(state);
         state = next;
         owned = true;
@@ -5301,70 +5301,71 @@ fn audioExecutionInputs(hidden: CT, inputs: *const AudioLayerInputs) [audio_sche
     @memcpy(values[audio_schedule.ExecutionInputs.scales..audio_schedule.ExecutionInputs.relative], inputs.scales);
     return values;
 }
-fn audioLayer(
+const AudioLayer = struct {
+    pub const Value = CT;
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
     store: *ProjectorWeights,
     cfg: AudioConfig,
-    input: CT,
     inputs: *const AudioLayerInputs,
     layer: usize,
-) !CT {
-    const rows = inputs.valid_mask.len;
-    var buf: [128]u8 = undefined;
-    const ff2 = feed_forward: {
-        const lconv = convolution: {
-            const res_attn = attention: {
-                const ff1 = try audioFeedForward(cb, allocator, store, cfg, input, rows, layer, false);
-                defer cb.free(ff1);
-                if (@import("builtin").is_test and layer == 0) try embeddingGemma2StageTensor(cb, allocator, "audio_0_feed_forward1", ff1);
-                audioProfileMark(.ffn);
 
-                const attn = self_attention: {
-                    const attn_pre = try projectorVectorWeightCt(cb, allocator, store, try fmt(&buf, "a.blk.{d}.attn_pre_norm.weight", .{layer}), cfg.audio_hidden);
-                    const normed = normalization: {
-                        const bounded = try audioSourceGradientBounded(cb, cfg, ff1);
-                        defer if (bounded != ff1) cb.free(bounded);
-                        break :normalization try audioSourceRms(cb, cfg, bounded, attn_pre, rows, cfg.audio_hidden, .contiguous, rows);
-                    };
-                    defer cb.free(normed);
-                    audioProfileMark(.norms);
-                    break :self_attention try audioSelfAttention(cb, allocator, store, cfg, normed, inputs, layer);
-                };
-                defer cb.free(attn);
-                if (@import("builtin").is_test and layer == 0) try embeddingGemma2StageTensor(cb, allocator, "audio_0_self_attn", attn);
-                audioProfileMark(.attn_out);
-                const attn_post = try projectorVectorWeightCt(cb, allocator, store, try fmt(&buf, "a.blk.{d}.attn_post_norm.weight", .{layer}), cfg.audio_hidden);
-                if (cfg.source_scalar_storage == .full_f32 and store.gguf == null) {
-                    if (try cb.rmsNormResidual(attn, attn_post, ff1, cfg.audio_hidden, cfg.layer_norm_eps, 1, 1)) |fused| break :attention fused;
-                }
-                const attn_normed = normalization: {
-                    const bounded = try audioSourceGradientBounded(cb, cfg, attn);
-                    defer if (bounded != attn) cb.free(bounded);
-                    break :normalization try audioSourceRms(cb, cfg, bounded, attn_post, rows, cfg.audio_hidden, .contiguous, rows);
-                };
-                defer cb.free(attn_normed);
-                break :attention try audioSourceRoundOwned(cb, cfg, try cb.add(ff1, attn_normed));
-            };
-            defer cb.free(res_attn);
-            audioProfileMark(.norms);
-            break :convolution try audioLightConv(cb, allocator, store, cfg, res_attn, rows, layer, inputs.segments, inputs.segment_starts);
-        };
-        defer cb.free(lconv);
-        if (@import("builtin").is_test and layer == 0) try embeddingGemma2StageTensor(cb, allocator, "audio_0_lconv1d", lconv);
+    pub fn release(self: *const AudioLayer, value: CT) void {
+        self.cb.free(value);
+    }
+
+    pub fn feedForward(self: *const AudioLayer, input: CT, second: bool) !CT {
+        const result = try audioFeedForward(self.cb, self.allocator, self.store, self.cfg, input, self.inputs.valid_mask.len, self.layer, second);
+        errdefer self.cb.free(result);
+        if (@import("builtin").is_test and self.layer == 0) {
+            try embeddingGemma2StageTensor(self.cb, self.allocator, if (second) "audio_0_feed_forward2" else "audio_0_feed_forward1", result);
+        }
+        audioProfileMark(.ffn);
+        return result;
+    }
+
+    fn boundedRms(self: *const AudioLayer, input: CT, weight: CT) !CT {
+        const bounded = try audioSourceGradientBounded(self.cb, self.cfg, input);
+        defer if (bounded != input) self.cb.free(bounded);
+        const rows = self.inputs.valid_mask.len;
+        return audioSourceRms(self.cb, self.cfg, bounded, weight, rows, self.cfg.audio_hidden, .contiguous, rows);
+    }
+
+    pub fn normalize(self: *const AudioLayer, kind: grouped_audio_block.Norm, input: CT) !CT {
+        var buffer: [128]u8 = undefined;
+        const weight = try projectorVectorWeightCt(self.cb, self.allocator, self.store, try groupedNormName(&buffer, self.layer, kind, false), self.cfg.audio_hidden);
+        const result = try self.boundedRms(input, weight);
+        audioProfileMark(.norms);
+        return result;
+    }
+
+    pub fn attend(self: *const AudioLayer, input: CT) !CT {
+        return audioSelfAttention(self.cb, self.allocator, self.store, self.cfg, input, self.inputs, self.layer);
+    }
+
+    pub fn attentionResidual(self: *const AudioLayer, input: CT, attended: CT) !CT {
+        if (@import("builtin").is_test and self.layer == 0) try embeddingGemma2StageTensor(self.cb, self.allocator, "audio_0_self_attn", attended);
+        audioProfileMark(.attn_out);
+        var buffer: [128]u8 = undefined;
+        const name = try groupedNormName(&buffer, self.layer, .attention_post, false);
+        const weight = try projectorVectorWeightCt(self.cb, self.allocator, self.store, name, self.cfg.audio_hidden);
+        if (self.cfg.source_scalar_storage == .full_f32 and self.store.gguf == null) {
+            if (try self.cb.rmsNormResidual(attended, weight, input, self.cfg.audio_hidden, self.cfg.layer_norm_eps, 1, 1)) |fused| return fused;
+        }
+        const normed = try self.boundedRms(attended, weight);
+        defer self.cb.free(normed);
+        return audioSourceRoundOwned(self.cb, self.cfg, try self.cb.add(input, normed));
+    }
+
+    pub fn convolve(self: *const AudioLayer, input: CT) !CT {
+        audioProfileMark(.norms);
+        const result = try audioLightConv(self.cb, self.allocator, self.store, self.cfg, input, self.inputs.valid_mask.len, self.layer, self.inputs.segments, self.inputs.segment_starts);
+        errdefer self.cb.free(result);
+        if (@import("builtin").is_test and self.layer == 0) try embeddingGemma2StageTensor(self.cb, self.allocator, "audio_0_lconv1d", result);
         audioProfileMark(.lconv);
-        break :feed_forward try audioFeedForward(cb, allocator, store, cfg, lconv, rows, layer, true);
-    };
-    defer cb.free(ff2);
-    if (@import("builtin").is_test and layer == 0) try embeddingGemma2StageTensor(cb, allocator, "audio_0_feed_forward2", ff2);
-    audioProfileMark(.ffn);
-    const out_norm = try projectorVectorWeightCt(cb, allocator, store, try fmt(&buf, "a.blk.{d}.ln2.weight", .{layer}), cfg.audio_hidden);
-    const ff2_bounded = try audioSourceGradientBounded(cb, cfg, ff2);
-    defer if (ff2_bounded != ff2) cb.free(ff2_bounded);
-    const out = try audioSourceRms(cb, cfg, ff2_bounded, out_norm, rows, cfg.audio_hidden, .contiguous, rows);
-    audioProfileMark(.norms);
-    return out;
-}
+        return result;
+    }
+};
 
 fn audioFeedForward(
     cb: *const ComputeBackend,

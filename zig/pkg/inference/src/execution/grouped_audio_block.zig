@@ -13,8 +13,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Shared operation order and value lifetimes for a grouped source-precision
-//! audio encoder block. Planning and execution use the same block body.
+//! Shared audio encoder block order and value lifetimes. Precision-specific
+//! stages retain their own projection and normalization implementations.
 
 pub const Norm = enum { ffn_pre, ffn_post, attention_pre, attention_post, convolution_pre, convolution_post, output };
 pub const Projection = enum { ffn_up, ffn_down, query, key, value, attention_out, convolution_in, convolution_out };
@@ -103,27 +103,30 @@ fn convolve(ctx: anytype, input: @TypeOf(ctx.*).Value) !@TypeOf(ctx.*).Value {
 }
 
 pub fn run(ctx: anytype, input: @TypeOf(ctx.*).Value) !@TypeOf(ctx.*).Value {
+    const Context = @TypeOf(ctx.*);
+    const custom = @hasDecl(Context, "feedForward");
     const ff2 = feed_forward: {
         const convolution = conv: {
             const residual = attention: {
-                const ff1 = try feedForward(ctx, input, false);
+                const ff1 = if (custom) try ctx.feedForward(input, false) else try feedForward(ctx, input, false);
                 defer ctx.release(ff1);
                 const attended = project: {
-                    const normed = try boundedNorm(ctx, ff1, .attention_pre, false);
+                    const normed = if (custom) try ctx.normalize(.attention_pre, ff1) else try boundedNorm(ctx, ff1, .attention_pre, false);
                     defer ctx.release(normed);
-                    break :project try attend(ctx, normed);
+                    break :project if (custom) try ctx.attend(normed) else try attend(ctx, normed);
                 };
                 defer ctx.release(attended);
+                if (custom) break :attention try ctx.attentionResidual(ff1, attended);
                 const normed = try boundedNorm(ctx, attended, .attention_post, false);
                 defer ctx.release(normed);
                 break :attention try ctx.add(ff1, normed);
             };
             defer ctx.release(residual);
-            break :conv try convolve(ctx, residual);
+            break :conv if (custom) try ctx.convolve(residual) else try convolve(ctx, residual);
         };
         defer ctx.release(convolution);
-        break :feed_forward try feedForward(ctx, convolution, true);
+        break :feed_forward if (custom) try ctx.feedForward(convolution, true) else try feedForward(ctx, convolution, true);
     };
     defer ctx.release(ff2);
-    return boundedNorm(ctx, ff2, .output, false);
+    return if (custom) ctx.normalize(.output, ff2) else boundedNorm(ctx, ff2, .output, false);
 }
