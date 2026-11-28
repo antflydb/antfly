@@ -8917,6 +8917,23 @@ test "capi native text merge drain waits for a required tip refresh" {
     _ = entry.persistent.inline_in_flight.fetchSub(1, .acq_rel);
     in_flight = false;
     entry.merge_retry_after_ns.store(0, .release);
+    // A snapshot capture holds the replay lease: the drain gives up at its
+    // deadline rather than waiting the capture out.
+    {
+        var capture = db.core.snapshot_replay_admission.acquireCapture();
+        defer capture.release();
+        const blocked: @import("../storage/db/derived/derived_executor.zig").VisibilityWait = .{ .deadline_ns = clock.nowRealtimeNs() + 50 * std.time.ns_per_ms, .clock = clock };
+        try std.testing.expectError(error.EnrichmentWaitTimeout, db.drainScheduledTextMergesWithin(blocked));
+        try std.testing.expect(entry.tipRefreshRequired());
+    }
+    // Without an Io the lock is retried, not waited on: a held apply lock
+    // still ends at the deadline.
+    {
+        db.core.lockApply();
+        defer db.core.unlockApply();
+        const held: @import("../storage/db/derived/derived_executor.zig").VisibilityWait = .{ .deadline_ns = clock.nowRealtimeNs() + 50 * std.time.ns_per_ms, .clock = clock };
+        try std.testing.expectError(error.EnrichmentWaitTimeout, db.lockApplyForPortableRuntimeWithin(null, held));
+    }
     // A spent budget starts no pass, even with the refresh now able to run.
     const spent: @import("../storage/db/derived/derived_executor.zig").VisibilityWait = .{ .deadline_ns = clock.nowRealtimeNs(), .clock = clock };
     try std.testing.expectError(error.EnrichmentWaitTimeout, db.drainScheduledTextMergesWithin(spent));
@@ -9579,6 +9596,83 @@ test "capi native two genuinely separate writer processes do not lose each other
 // processes overwrite their own keys at `full_index`. Every acknowledged
 // overwrite must have removed its old token, and every live token must be
 // found, from a fresh handle, before anything drains.
+// A detached writer adopts a peer's unfolded tail when its transaction
+// opens. A batch large enough to cross the large-transaction fallback then
+// writes its delete and overwrite of the peer's keys straight into the tree;
+// the peer's older overlay versions must not shadow them or be folded back
+// over them, before or after a reopen.
+test "capi native separate writer processes supersede a peer's unfolded tail with a large batch" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .windows) return error.SkipZigTest;
+    const peer_path_env = "ANTFLY_TEST_LARGE_BATCH_PEER_PATH";
+    if (std.c.getenv(peer_path_env)) |child_path| {
+        const child = try open(std.mem.span(child_path), .{ .profile = .native, .busy_timeout_ms = 10_000 }, false);
+        const child_owner = child.lite_connection.?.owner;
+        xprocStopMaintenance(child_owner);
+        const child_id = try api.publishHandle(child);
+        var out: h.capi.Buffer = .{};
+        defer api.antfly_buffer_free_zero(&out);
+        try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_batch_json(child_id, .fromSlice(
+            "{\"inserts\":{\"victim\":{\"text\":\"peer\"},\"overwritten\":{\"text\":\"peer\"}},\"sync_level\":\"write\"}",
+        ), &out));
+        xprocReleaseWithoutFold(child_owner);
+        // Closing could fold the very tail the parent must adopt.
+        std.c._exit(0);
+    }
+    const a = std.testing.allocator;
+    var tmp = try api.TestDirectory.init("xproc-large-batch-supersede");
+    defer tmp.cleanup();
+    try std.Io.Dir.cwd().createDirPath(h.handleLockIo(), tmp.path());
+    const path = try std.fmt.allocPrint(a, "{s}/database.aflite", .{tmp.path()});
+    defer a.free(path);
+    const Check = struct {
+        fn found(handle: anytype, key: []const u8) !?[]u8 {
+            var out: h.capi.Buffer = .{};
+            defer api.antfly_buffer_free_zero(&out);
+            if (api.antfly_db_lookup_json(handle, .fromSlice(key), &out) != .ok) return null;
+            return try std.testing.allocator.dupe(u8, out.ptr.?[0..out.len]);
+        }
+        fn expectSuperseded(handle: anytype) !void {
+            try std.testing.expect((try found(handle, "victim")) == null);
+            const overwritten = (try found(handle, "overwritten")).?;
+            defer std.testing.allocator.free(overwritten);
+            try std.testing.expect(std.mem.indexOf(u8, overwritten, "parent") != null);
+            const bulk = (try found(handle, "bulk-0599")).?;
+            std.testing.allocator.free(bulk);
+        }
+    };
+    {
+        const wrapper = try open(path, .{ .profile = .native, .busy_timeout_ms = 10_000 }, true);
+        const owner = wrapper.lite_connection.?.owner;
+        xprocStopMaintenance(owner);
+        const id = try api.publishHandle(wrapper);
+        defer api.antfly_db_close(id);
+        {
+            var out: h.capi.Buffer = .{};
+            defer api.antfly_buffer_free_zero(&out);
+            try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_batch_json(id, .fromSlice("{\"inserts\":{\"seed\":{\"text\":\"seed\"}},\"sync_level\":\"write\"}"), &out));
+        }
+        xprocReleaseWithoutFold(owner);
+        var environment = std.process.Environ.Map.init(a);
+        defer environment.deinit();
+        try environment.put(peer_path_env, path);
+        try xprocRunTest("capi native separate writer processes supersede a peer's unfolded tail with a large batch", &environment);
+
+        var request: std.ArrayList(u8) = .empty;
+        defer request.deinit(a);
+        try request.appendSlice(a, "{\"inserts\":{\"overwritten\":{\"text\":\"parent\"}");
+        for (0..600) |i| try request.print(a, ",\"bulk-{d:0>4}\":{{\"text\":\"bulk document {d} padded to cross the large transaction fallback\"}}", .{ i, i });
+        try request.appendSlice(a, "},\"deletes\":[\"victim\"],\"sync_level\":\"write\"}");
+        var out: h.capi.Buffer = .{};
+        defer api.antfly_buffer_free_zero(&out);
+        try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_batch_json(id, .fromSlice(request.items), &out));
+        try Check.expectSuperseded(id);
+    }
+    const reopened = try open(path, .{ .profile = .native, .busy_timeout_ms = 10_000 }, false);
+    const reopened_id = try api.publishHandle(reopened);
+    defer api.antfly_db_close(reopened_id);
+    try Check.expectSuperseded(reopened_id);
+}
+
 test "capi native separate writer processes keep full-text deletes at full_index" {
     if (h.builtin.single_threaded or h.builtin.os.tag == .windows) return error.SkipZigTest;
     const a = std.testing.allocator;
@@ -9789,6 +9883,18 @@ test "capi native separate writer processes refresh full-text in place" {
 
     const in_place_before = owner.test_in_place_refresh_count.load(.acquire);
     const runtime_before = owner.current.?;
+    // The refresh reads and builds the child's delta before taking the
+    // index's apply guard.
+    const PreparedOffGuard = struct {
+        var count = std.atomic.Value(usize).init(0);
+        var guard_free = std.atomic.Value(bool).init(true);
+        fn during(entry: *@import("../storage/db/catalog/index_manager.zig").IndexManager.TextIndex) void {
+            _ = count.fetchAdd(1, .monotonic);
+            if (entry.apply_mutex.tryLock()) entry.apply_mutex.unlock() else guard_free.store(false, .monotonic);
+        }
+    };
+    @import("../storage/db/catalog/index_manager.zig").IndexManager.test_after_peer_delta_prepared = PreparedOffGuard.during;
+    defer @import("../storage/db/catalog/index_manager.zig").IndexManager.test_after_peer_delta_prepared = null;
     xprocReleaseWithoutFold(owner);
     var environment = std.process.Environ.Map.init(a);
     defer environment.deinit();
@@ -9802,6 +9908,8 @@ test "capi native separate writer processes refresh full-text in place" {
     try std.testing.expect(!try Search.found(id, "parentfirst", "\"doc-0\""));
     try std.testing.expect(owner.test_in_place_refresh_count.load(.acquire) > in_place_before);
     try std.testing.expect(owner.current.? == runtime_before);
+    try std.testing.expect(PreparedOffGuard.count.load(.monotonic) > 0);
+    try std.testing.expect(PreparedOffGuard.guard_free.load(.monotonic));
     // This runtime still writes, and its write supersedes the child's. No
     // version the child overwrote comes back.
     try Search.write(id, "doc-0", "parentagain");

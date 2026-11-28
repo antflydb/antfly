@@ -17805,18 +17805,36 @@ pub const IndexManager = struct {
             return .not_loaded;
         };
         defer self.alloc.free(name);
-        var guard = try self.lockManagedIndexApply(.{ .name = name, .kind = .full_text });
-        defer guard.unlock();
+        // The delta is read and built with only the catalog held, as the
+        // index's appliers hold it; the apply guard is taken to validate and
+        // install, and a delta made stale meanwhile is built again.
+        self.catalog_mutex.lockShared();
+        defer self.catalog_mutex.unlockShared();
         const entry = self.textIndexEntry(name) orelse return .reopen;
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
         const delta = try readScopeDelta(arena.allocator(), file, scope, keys);
-        entry.persistent.refreshPeerDelta(delta) catch |err| switch (err) {
-            error.UnsupportedRefresh => return .reopen,
-            else => return err,
-        };
-        return .refreshed;
+        for (0..4) |_| {
+            var prepared = (entry.persistent.preparePeerDelta(delta) catch |err| switch (err) {
+                error.UnsupportedRefresh => return .reopen,
+                else => return err,
+            }) orelse return .refreshed;
+            defer prepared.deinit(entry.persistent.alloc);
+            if (builtin.is_test) if (test_after_peer_delta_prepared) |hook| hook(entry);
+            self.lockAtomicWithBackoff(entry.apply_mutex);
+            defer entry.apply_mutex.unlock();
+            const installed = entry.persistent.installPeerDelta(&prepared) catch |err| switch (err) {
+                error.UnsupportedRefresh => return .reopen,
+                else => return err,
+            };
+            if (installed) return .refreshed;
+        }
+        return .reopen;
     }
+
+    /// Runs between a connection refresh's preparation and its install,
+    /// with no lock of the index held.
+    pub var test_after_peer_delta_prepared: ?*const fn (entry: *TextIndex) void = null;
 
     /// Caller holds the catalog shared; this takes the index's own mutex.
     fn refreshSparseIndexFromTipCatalogLocked(self: *IndexManager, name: []const u8, scope: []const u8, keys: []const native_catalog_backend.Mutation, file: *RefreshFile) !ScopeRefresh {
@@ -22560,7 +22578,22 @@ pub const IndexManager = struct {
         return stats;
     }
 
+    /// A deadline a caller's synchronous merge work runs within: checked
+    /// before each refresh and each merge attempt, a refused one included.
+    pub const WorkBudget = struct {
+        context: *const anyopaque,
+        check: *const fn (context: *const anyopaque) anyerror!void,
+
+        fn checkWithin(budget: ?WorkBudget) !void {
+            if (budget) |b| try b.check(b.context);
+        }
+    };
+
     pub fn runTextMergeScheduler(self: *IndexManager, max_steps: usize) !usize {
+        return self.runTextMergeSchedulerWithin(max_steps, null);
+    }
+
+    pub fn runTextMergeSchedulerWithin(self: *IndexManager, max_steps: usize, budget: ?WorkBudget) !usize {
         var completed: usize = 0;
         // Indexes whose publication was refused this pass. A refusal
         // (`EnrichmentWaitCanceled`) can be scoped to one index whose inputs
@@ -22574,6 +22607,7 @@ pub const IndexManager = struct {
             refused.deinit(self.alloc);
         }
         while (completed < max_steps) {
+            try WorkBudget.checkWithin(budget);
             var task = (try self.beginTextMergeTask()) orelse break;
             defer task.deinit(self.alloc);
             errdefer self.cancelTextMergeTask(&task);
@@ -27972,6 +28006,34 @@ pub const IndexManager = struct {
         const now_ns = platform_time.monotonicNs();
         // The requests this refresh answers: those made before it reads the tip.
         const covers = entry.tip_refresh_requested.load(.acquire);
+        // From the changed records when their history is complete; the
+        // tip is read whole only when it is not.
+        if (entry.persistent.prepareRefreshFromChanges()) |maybe_changes| changes: {
+            var changes = maybe_changes orelse break :changes;
+            defer changes.deinit(entry.persistent.alloc);
+            if (builtin.is_test) if (test_after_tip_refresh_prepared) |hook| hook(entry);
+            if (!entry.apply_mutex.tryLock()) {
+                entry.merge_retry_after_ns.store(now_ns +| text_merge_refresh_deferred_retry_ns, .release);
+                return .deferred;
+            }
+            defer entry.apply_mutex.unlock();
+            entry.merge_delta_mutex.lockUncancelable(entry.io);
+            defer entry.merge_delta_mutex.unlock(entry.io);
+            switch (entry.persistent.installRefreshFromChanges(&changes) catch |err| return recordTipRefreshFailure(entry, index_name, err, now_ns, covers)) {
+                .installed => {
+                    if (builtin.is_test) _ = text_change_refreshes.fetchAdd(1, .monotonic);
+                    entry.merge_refresh_failures.store(0, .release);
+                    entry.merge_retry_after_ns.store(0, .release);
+                    entry.coverTipRefresh(covers);
+                    return .current;
+                },
+                .stale => {
+                    entry.merge_retry_after_ns.store(now_ns +| text_merge_refresh_deferred_retry_ns, .release);
+                    return .deferred;
+                },
+                .needs_tip => {},
+            }
+        } else |err| return recordTipRefreshFailure(entry, index_name, err, now_ns, covers);
         var prepared = entry.persistent.prepareRefreshFromTip() catch |err| return recordTipRefreshFailure(entry, index_name, err, now_ns, covers);
         defer prepared.deinit(entry.persistent.alloc);
         if (builtin.is_test) if (test_after_tip_refresh_prepared) |hook| hook(entry);
@@ -27995,6 +28057,9 @@ pub const IndexManager = struct {
         entry.coverTipRefresh(covers);
         return .current;
     }
+
+    /// Refreshes taken from changed records rather than the whole tip.
+    pub var text_change_refreshes: std.atomic.Value(u64) = .init(0);
 
     /// Runs between a refresh's preparation and its install.
     pub var test_after_tip_refresh_prepared: ?*const fn (entry: *TextIndex) void = null;
@@ -28021,11 +28086,16 @@ pub const IndexManager = struct {
     /// and planned, so the reload stalls neither other indexes nor this
     /// one's appliers. Callers run it before they plan merges.
     pub fn refreshTextIndexesBehindTip(self: *IndexManager) void {
+        self.refreshTextIndexesBehindTipWithin(null) catch {};
+    }
+
+    pub fn refreshTextIndexesBehindTipWithin(self: *IndexManager, budget: ?WorkBudget) !void {
         const now_ns = platform_time.monotonicNs();
         self.catalog_mutex.lockShared();
         defer self.catalog_mutex.unlockShared();
         for (self.text_indexes.items) |*entry| {
             if (!entry.tipRefreshRequired()) continue;
+            try WorkBudget.checkWithin(budget);
             if (entry.merge_retry_after_ns.load(.acquire) > now_ns) continue;
             switch (refreshTextIndexForReplan(entry, entry.config.name)) {
                 .current, .unsupported => TextMergeScheduler.schedule(entry),
@@ -51029,14 +51099,23 @@ const StaleTextMergeFixture = struct {
     store: docstore_mod.DocStore,
     manager: IndexManager,
     peer: persistent_mod.PersistentIndex,
+    own_feed: persistent_mod.InlinePublicationTestSink.Feed,
+    peer_feed: persistent_mod.InlinePublicationTestSink.Feed,
 
     /// One native-catalog text index with four single-document segments,
     /// plus a second index on the same catalog standing in for a peer
     /// process. The merge policy merges two segments at a time.
     fn init(self: *StaleTextMergeFixture, alloc: Allocator, tmp: *std.testing.TmpDir) !void {
+        try self.initWith(alloc, tmp, false);
+    }
+
+    /// With `feed`, the catalog keeps a change history, as Lite's redo log.
+    fn initWith(self: *StaleTextMergeFixture, alloc: Allocator, tmp: *std.testing.TmpDir, feed: bool) !void {
         self.alloc = alloc;
         self.sink = .{ .allocator = alloc };
         errdefer self.sink.deinit(alloc);
+        self.own_feed = .{ .sink = &self.sink, .origin = 1 };
+        self.peer_feed = .{ .sink = &self.sink, .origin = 2 };
         var path_buf: [std.fs.max_path_bytes]u8 = undefined;
         const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
         self.path_z = try alloc.dupeSentinel(u8, path, 0);
@@ -51045,7 +51124,7 @@ const StaleTextMergeFixture = struct {
         errdefer self.store.close();
         self.manager = try IndexManager.initWithOptions(alloc, path, .{
             .text_main_backend = .native_catalog,
-            .text_main_native_catalog_sink = self.sink.resolvingSink(),
+            .text_main_native_catalog_sink = if (feed) self.own_feed.catalogSink() else self.sink.resolvingSink(),
         });
         errdefer self.manager.deinit();
         self.manager.updateRange(.{ .start = "", .end = "" });
@@ -51067,7 +51146,7 @@ const StaleTextMergeFixture = struct {
         self.peer = try persistent_mod.PersistentIndex.open(alloc, .{
             .path = peer_path,
             .main_backend = .native_catalog,
-            .main_native_catalog_sink = self.sink.resolvingSink(),
+            .main_native_catalog_sink = if (feed) self.peer_feed.catalogSink() else self.sink.resolvingSink(),
         });
         errdefer self.peer.close();
         try self.peer.refreshFromTip();
@@ -51146,6 +51225,80 @@ test "text merge refused at a peer-advanced tip replans from the peer's segments
         for (next_inputs) |id| for (stale_inputs) |stale| try std.testing.expect(id != stale);
         fixture.manager.cancelTextMergeTask(&next);
     }
+}
+
+// With the catalog's change history complete, the refresh reads only the
+// records the peer's merge changed: no full load of the catalog scope, and
+// the same active set as a refresh from the tip.
+// A synchronous drain's budget is checked before every attempt: once it is
+// spent, neither a refresh nor a merge starts, a refused merge (which
+// completes nothing) included.
+test "text merge work starts no attempt once its budget is spent" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    setBenchmarkTextMergePolicyOverride(.{ .max_segments_per_tier = 2, .max_segment_size = 5 * 1024 * 1024 * 1024, .floor_segment_size = 0 });
+    defer setBenchmarkTextMergePolicyOverride(null);
+    var fixture: StaleTextMergeFixture = undefined;
+    try fixture.init(alloc, &tmp);
+    defer fixture.deinit();
+    const Spent = struct {
+        fn check(_: *const anyopaque) anyerror!void {
+            return error.EnrichmentWaitTimeout;
+        }
+    };
+    const spent: IndexManager.WorkBudget = .{ .context = &fixture, .check = Spent.check };
+    const entry = fixture.textEntry();
+    const segments = entry.persistent.snapshot().segments.len;
+
+    try std.testing.expectError(error.EnrichmentWaitTimeout, fixture.manager.runTextMergeSchedulerWithin(1, spent));
+    try std.testing.expectEqual(segments, entry.persistent.snapshot().segments.len);
+    try std.testing.expect(entry.compaction_pending.load(.acquire));
+
+    entry.requestTipRefresh();
+    try std.testing.expectError(error.EnrichmentWaitTimeout, fixture.manager.refreshTextIndexesBehindTipWithin(spent));
+    try std.testing.expect(entry.tipRefreshRequired());
+    // Within budget the same work runs.
+    try fixture.manager.refreshTextIndexesBehindTipWithin(null);
+    try std.testing.expect(!entry.tipRefreshRequired());
+}
+
+test "text merge refused at a peer-advanced tip refreshes from the changed records" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    setBenchmarkTextMergePolicyOverride(.{ .max_segments_per_tier = 2, .max_segment_size = 5 * 1024 * 1024 * 1024, .floor_segment_size = 0 });
+    defer setBenchmarkTextMergePolicyOverride(null);
+    var fixture: StaleTextMergeFixture = undefined;
+    try fixture.initWith(alloc, &tmp, true);
+    defer fixture.deinit();
+
+    var task = (try fixture.manager.beginTextMergeTask()) orelse return error.TestExpectedMergeTask;
+    defer task.deinit(alloc);
+    try fixture.peerRetiresInputs(&task);
+    var result = try IndexManager.executeTextMergeTask(alloc, &task);
+    defer result.deinit(alloc);
+    try std.testing.expect(!try fixture.manager.finishTextMergeTask(&task, &result));
+    const entry = fixture.textEntry();
+    try std.testing.expect(entry.tipRefreshRequired());
+
+    const loads = fixture.sink.full_loads;
+    const by_change = IndexManager.text_change_refreshes.load(.monotonic);
+    fixture.manager.refreshTextIndexesBehindTip();
+    try std.testing.expect(!entry.tipRefreshRequired());
+    try fixture.expectPeerActiveSet();
+    try std.testing.expectEqual(loads, fixture.sink.full_loads);
+    try std.testing.expectEqual(by_change + 1, IndexManager.text_change_refreshes.load(.monotonic));
+
+    // Once the history past the sync point is gone, the refresh reads the tip.
+    try fixture.sink.foreignPut("meta", "unrelated", "x");
+    fixture.sink.reclaimed_through = fixture.sink.sequence;
+    entry.requestTipRefresh();
+    fixture.manager.refreshTextIndexesBehindTip();
+    try std.testing.expect(!entry.tipRefreshRequired());
+    try fixture.expectPeerActiveSet();
+    try std.testing.expect(fixture.sink.full_loads > loads);
+    try std.testing.expectEqual(by_change + 1, IndexManager.text_change_refreshes.load(.monotonic));
 }
 
 // While this process's own inline writes are between commit and install the

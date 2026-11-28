@@ -67,6 +67,12 @@ pub const Mutation = struct {
     is_delete: bool = false,
 };
 
+/// `Sink.changesSince`'s result: every changed record's state at `through`.
+pub const Changes = struct {
+    through: u64,
+    mutations: []Mutation,
+};
+
 /// An outstanding, not-yet-waited-on commit of a `.ride_along` `Sink.submit`
 /// (see `Sink.submitDeferred`). Opaque: `Backend` never needs to know what
 /// concrete thing `ptr` is (a `lite/docstore.zig` `Store.Ticket`'s container,
@@ -131,6 +137,14 @@ pub const Sink = struct {
     /// Like loadAllAlloc, with empty values allocated by the same allocator.
     loadKeysAlloc: ?*const fn (ptr: *anyopaque, allocator: Allocator, scope: []const u8) anyerror![]Entry = null,
     deleteScope: ?*const fn (ptr: *anyopaque, scope: []const u8) anyerror!void = null,
+    /// Optional, with `changesSince`: the file's committed sequence now. A
+    /// load issued after this call reads at least through it.
+    committedSequence: ?*const fn (ptr: *anyopaque) u64 = null,
+    /// Optional: the records of `scope` other writers changed after
+    /// committed sequence `since`, with their values, enumerated and read
+    /// at one cut, and that cut's sequence. Null when the history from
+    /// `since` is no longer complete (a full load is needed).
+    changesSince: ?*const fn (ptr: *anyopaque, allocator: Allocator, scope: []const u8, since: u64) anyerror!?Changes = null,
     /// Optional (`null` for a `Sink` with no deferred path, e.g. the test
     /// fakes below): like `submit`, but for `durable = false` only, and
     /// never blocks waiting for the underlying group commit to apply --
@@ -393,6 +407,12 @@ pub const Backend = struct {
     /// Advances each time the mirror's state is replaced, under `mutex`:
     /// work prepared against one state can tell whether it is still current.
     state_epoch: std.atomic.Value(u64) = .init(0),
+    /// The committed sequence through which the mirror holds every other
+    /// writer's records (its own are applied as it commits): set by a full
+    /// load and advanced by a change refresh.
+    synced_through: std.atomic.Value(u64) = .init(0),
+    /// The sink keeps a change history, so `synced_through` means something.
+    synced_known: bool = false,
     sink: Sink,
     scope: []const u8,
     open_options: backend_types.OpenOptions,
@@ -435,6 +455,8 @@ pub const Backend = struct {
         const scope = try allocator.dupe(u8, options.scope);
         errdefer allocator.free(scope);
 
+        // Before the load: everything committed by then is in it.
+        const synced = sinkCommittedSequence(options.sink);
         var tree = try loadTree(allocator, options.sink, scope);
         errdefer tree.release(allocator);
 
@@ -446,7 +468,54 @@ pub const Backend = struct {
             .sink = options.sink,
             .open_options = options.backend,
             .state = rc,
+            .synced_through = .init(synced orelse 0),
+            .synced_known = synced != null,
         };
+    }
+
+    fn sinkCommittedSequence(sink: Sink) ?u64 {
+        const committed = sink.committedSequence orelse return null;
+        if (sink.changesSince == null) return null;
+        return committed(sink.ptr);
+    }
+
+    /// Other writers' records of this scope committed since the mirror was
+    /// last synced, with their current values: a refresh sized by the
+    /// change. Null when the sink keeps no such history or it is no longer
+    /// complete, so only a full load can refresh.
+    pub const SyncedChanges = struct {
+        arena: std.heap.ArenaAllocator,
+        mutations: []Mutation,
+        /// The committed sequence the changes run through.
+        through: u64,
+        /// The mirror's epoch before the values were read.
+        mirror_epoch: u64,
+
+        pub fn deinit(self: *SyncedChanges) void {
+            self.arena.deinit();
+            self.* = undefined;
+        }
+    };
+
+    pub fn changesSinceSync(self: *Backend, allocator: Allocator) !?SyncedChanges {
+        const changes_since = self.sink.changesSince orelse return null;
+        if (!self.synced_known) return null;
+        const since = self.synced_through.load(.acquire);
+        // Before the read: anything published into the mirror after it
+        // makes these changes stale.
+        const mirror_epoch = self.state_epoch.load(.acquire);
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        errdefer arena.deinit();
+        const changes = (try changes_since(self.sink.ptr, arena.allocator(), self.scope, since)) orelse {
+            arena.deinit();
+            return null;
+        };
+        return .{ .arena = arena, .mutations = changes.mutations, .through = changes.through, .mirror_epoch = mirror_epoch };
+    }
+
+    /// The mirror now holds other writers' records through `through`.
+    pub fn noteSyncedThrough(self: *Backend, through: u64) void {
+        _ = self.synced_through.fetchMax(through, .acq_rel);
     }
 
     /// Fork the durable mirror for ordered preparation. The immutable tree
@@ -542,6 +611,7 @@ pub const Backend = struct {
     /// transactions keep the state they retained. Clears an invalidated
     /// mirror: it is current again.
     pub fn reloadMirror(self: *Backend) !void {
+        const synced = sinkCommittedSequence(self.sink);
         var tree = try loadTree(self.allocator, self.sink, self.scope);
         errdefer tree.release(self.allocator);
         const rc = try self.allocator.create(RcState);
@@ -552,6 +622,7 @@ pub const Backend = struct {
         _ = self.state_epoch.fetchAdd(1, .acq_rel);
         releaseState(self.allocator, old);
         self.mutex.unlock();
+        if (synced) |through| self.synced_through.store(through, .release);
         self.mirror_invalid.store(false, .release);
     }
 
@@ -590,6 +661,7 @@ pub const Backend = struct {
         _ = self.state_epoch.fetchAdd(1, .acq_rel);
         releaseState(self.allocator, old);
         self.mutex.unlock();
+        self.synced_through.store(view.synced_through.load(.acquire), .release);
         self.mirror_invalid.store(false, .release);
         return true;
     }
@@ -1111,6 +1183,20 @@ pub const Backend = struct {
         pub fn get(self: *const PreparedMirror, namespace: backend_types.Namespace, key: []const u8) ![]const u8 {
             const state = self.replacement orelse self.backend.state;
             return state.state.get(namespace, key);
+        }
+
+        /// `publish`, if the mirror is still at `expected_epoch`: the
+        /// replacement was built from that state.
+        pub fn publishIfEpoch(self: *PreparedMirror, expected_epoch: u64) bool {
+            const replacement = self.replacement orelse return self.backend.state_epoch.load(.acquire) == expected_epoch;
+            lockBackend(self.backend);
+            defer self.backend.mutex.unlock();
+            if (self.backend.state_epoch.load(.acquire) != expected_epoch) return false;
+            const old = self.backend.state;
+            self.backend.state = replacement;
+            _ = self.backend.state_epoch.fetchAdd(1, .acq_rel);
+            self.replacement = old;
+            return true;
         }
 
         pub fn publish(self: *PreparedMirror) void {

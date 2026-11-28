@@ -91,10 +91,25 @@ const algebraic_overwrite_key_cycle: usize = 8;
 var counted_vtable: std.Io.VTable = undefined;
 var counted_vtable_ready = std.atomic.Value(bool).init(false);
 
+/// These harnesses gate on counts (syncs, commits and bytes per write), not
+/// on how long a barrier takes, so a barrier is counted and not performed:
+/// the commit path is unchanged, only the syscall is skipped. Set
+/// `ANTFLY_LITE_WA_REAL_SYNC` to perform them, for wall-clock figures.
+pub fn realSyncs() bool {
+    return std.c.getenv("ANTFLY_LITE_WA_REAL_SYNC") != null;
+}
+
+/// Harnesses that only print a report, asserting nothing of their own,
+/// run only on request (`zig build lite-write-amplification` sets
+/// `ANTFLY_LITE_WA_REPORTS`). Gates run in every suite.
+pub fn reportsRequested() bool {
+    return std.c.getenv("ANTFLY_LITE_WA_REPORTS") != null;
+}
+
 const CountingShim = struct {
     fn fileSync(userdata: ?*anyopaque, file: std.Io.File) std.Io.File.SyncError!void {
         _ = userdata;
-        try std.testing.io.vtable.fileSync(std.testing.io.userdata, file);
+        if (realSyncs()) try std.testing.io.vtable.fileSync(std.testing.io.userdata, file);
         wal_trace.recordSync();
     }
     fn fileWritePositional(
@@ -1819,6 +1834,25 @@ test "lite write amplification report" {
     printStageTable("algebraic-visible, overwrite", algebraic_overwrite);
     printStageTable("algebraic-visible, overwrite, 8 writers", algebraic_overwrite_concurrent);
 
+    // Regression gate: ceilings start at the measured baseline plus a small
+    // slack factor. TODO(write-amplification): tighten these once the
+    // publication-shape work in docs/design/lite-performance/README.md
+    // lands; today they only catch a large regression, not restore the
+    // SQLite-matched floor. Slack is over the measured main@6c0b004e95
+    // baseline (see
+    // docs/design/lite-performance/write-amplification-baseline.json):
+    // primary-only 3.000, indexed 66.844 calling-thread syncs/update. The
+    // 8-writer modes must not make amplification worse than the matching
+    // single-writer mode; graph's ceiling is over the `.native_catalog`
+    // baseline.
+    const slack = 1.25;
+    try expectAtMost(primary.perUpdate(.calling_thread), 3.0 * slack, "primary-only calling-thread syncs/update");
+    try expectAtMost(indexed.perUpdate(.calling_thread), 67.0 * slack, "indexed calling-thread syncs/update");
+    try expectAtMost(primary_concurrent.perUpdate(.calling_thread), 3.0 * slack, "primary-only 8-writer calling-thread syncs/update");
+    try expectAtMost(concurrent.perUpdate(.calling_thread), 67.0 * slack, "indexed 8-writer calling-thread syncs/update");
+    try expectAtMost(graph.perUpdate(.calling_thread), 6.0 * slack, "graph calling-thread syncs/update");
+    try expectAtMost(graph_concurrent.perUpdate(.calling_thread), 6.0 * slack, "graph 8-writer calling-thread syncs/update");
+
     // Journal suppression + ride-along HLL maintenance TARGET (lite-single-
     // commit-write-path.md §3.2a/§3.3b): a workload that dirties and
     // rebuilds the HLL sketch on most writes still reaches 1.0 durable
@@ -1914,6 +1948,7 @@ test "lite write amplification report" {
 // the shipped default (`.lsm`) this test is expected to pass cleanly, same
 // as the "indexed" and "dense-vector-visible" modes in the main report.
 test "lite write amplification diagnostic: dense vector mode alone" {
+    if (!reportsRequested()) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     const dense = try measureSingleWriterVector(alloc, "lite-write-amp-diag-dense-alone", false, default_updates);
     printStageTable("diagnostic: dense-vector-visible alone", dense);
@@ -1926,6 +1961,7 @@ test "lite write amplification diagnostic: dense vector mode alone" {
 // have run in-process first, or reproduces with dense alone (the test
 // above) just as readily.
 test "lite write amplification diagnostic: full text then dense vector mode" {
+    if (!reportsRequested()) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     const indexed = try measureSingleWriter(alloc, "lite-write-amp-diag-indexed-first", true, default_updates);
     printStageTable("diagnostic: full-text-visible (indexed)", indexed);
@@ -1940,6 +1976,7 @@ test "lite write amplification diagnostic: full text then dense vector mode" {
 // corruption needs the full report's exact mode sequence/concurrency to
 // reproduce, or reproduces already in the two simpler diagnostics above.
 test "lite write amplification diagnostic: full mode lineup plus dense concurrent" {
+    if (!reportsRequested()) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     const updates = default_updates;
     const primary = try measureSingleWriter(alloc, "lite-write-amp-diag2-primary", false, updates);
@@ -1961,6 +1998,7 @@ test "lite write amplification diagnostic: full mode lineup plus dense concurren
 // first edge write fails) to whether dense's activation is even involved:
 // this test never touches a dense (or sparse) index at all.
 test "lite write amplification diagnostic: primary then indexed then graph only" {
+    if (!reportsRequested()) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     const updates = default_updates;
     const primary = try measureSingleWriter(alloc, "lite-write-amp-diag3-primary", false, updates);
@@ -1971,88 +2009,6 @@ test "lite write amplification diagnostic: primary then indexed then graph only"
     printStageTable("diagnostic3: graph", graph);
 }
 
-// Regression gate: ceilings start at the measured baseline plus a small
-// slack factor. TODO(write-amplification): tighten these once the
-// publication-shape work in docs/design/lite-performance/README.md lands;
-// today they only catch a large regression, not restore the SQLite-matched
-// floor.
-test "lite write amplification ceilings" {
-    const alloc = std.testing.allocator;
-    const updates = default_updates;
-
-    const primary = try measureSingleWriter(alloc, "lite-write-amp-ceil-primary", false, updates);
-    const indexed = try measureSingleWriter(alloc, "lite-write-amp-ceil-indexed", true, updates);
-
-    // Slack factor over the measured main@6c0b004e95 baseline (see
-    // docs/design/lite-performance/write-amplification-baseline.json):
-    // primary-only 3.000, indexed 66.844 calling-thread syncs/update.
-    const slack = 1.25;
-    try expectAtMost(primary.perUpdate(.calling_thread), 3.0 * slack, "primary-only calling-thread syncs/update");
-    try expectAtMost(indexed.perUpdate(.calling_thread), 67.0 * slack, "indexed calling-thread syncs/update");
-
-    // Extend the same ceilings to the 8-writer modes: the writer slot, the
-    // DB apply lock and the per-call cross-process path lease are all held
-    // across the fsync (see docs/design/lite-performance/
-    // lite-single-commit-write-path.md's "throughput falls as writers are
-    // added" note), so the existing group-commit queue cannot yet bundle
-    // concurrent foreground writers' commits -- measured mean_primary_group_
-    // size is 1.0 today, confirmed by this same harness's report test.
-    // Concurrency must not make amplification *worse* than the matching
-    // single-writer mode, even though it cannot yet make it better; this
-    // gate exists so a future regression in the concurrent path specifically
-    // (as opposed to the primary/indexed path in general) is still caught.
-    const primary_concurrent = try measureConcurrent(alloc, "lite-write-amp-ceil-primary-concurrent", false, default_writers, updates / default_writers);
-    const indexed_concurrent = try measureConcurrent(alloc, "lite-write-amp-ceil-indexed-concurrent", true, default_writers, updates / default_writers);
-    try expectAtMost(primary_concurrent.perUpdate(.calling_thread), 3.0 * slack, "primary-only 8-writer calling-thread syncs/update");
-    try expectAtMost(indexed_concurrent.perUpdate(.calling_thread), 67.0 * slack, "indexed 8-writer calling-thread syncs/update");
-
-    // Graph ceiling over the measured `.native_catalog` baseline (see
-    // docs/design/lite-performance/write-amplification-graph-after.json):
-    // graph-visible 6.000, 8-writer 6.000 calling-thread syncs/update --
-    // down from `.lsm`'s 37.125/39.578 (write-amplification-graph-
-    // before.json), but not yet at text's inline-publication 3.1: this
-    // harness's graph mode has no primary document write at all (pure
-    // `graph_writes`), yet still shows `background_ops.source_turn` and
-    // `.derived_worker_turn` incrementing once per update, meaning each
-    // edge write is still going through the async journal-append +
-    // catch-up pipeline for its *own* synchronous ack instead of an inline
-    // same-commit publish. `graph_forward_commit` reads 0 syncs (the
-    // ride-along collapsed into `graph_reverse_commit`'s single durable
-    // commit, 2 syncs for 1 commit per update -- the native commit
-    // protocol's data+slot sync pair), so the remaining ~4 syncs/update
-    // (the `other` bucket) are that catch-up path, not forward/reverse
-    // adjacency. Closing that gap is the inline prepare/install publication
-    // API (design doc §3.3's graph extension; see `GraphIndex.
-    // prepareInlineEdgePublication`/`installInlineEdgePublication` below),
-    // mirrored on text's already-landed `prepareInlineTextPublication`/
-    // `installInlineTextPublication` -- intentionally not wired into the
-    // ack path yet (API + tests only; see that section's doc comment).
-    const graph = try measureSingleWriterGraph(alloc, "lite-write-amp-ceil-graph", updates);
-    const graph_concurrent = try measureConcurrentGraph(alloc, "lite-write-amp-ceil-graph-concurrent", default_writers, updates / default_writers);
-    try expectAtMost(graph.perUpdate(.calling_thread), 6.0 * slack, "graph calling-thread syncs/update");
-    try expectAtMost(graph_concurrent.perUpdate(.calling_thread), 6.0 * slack, "graph 8-writer calling-thread syncs/update");
-}
-
-// ---------------------------------------------------------------------------
-// "Other write-path surfaces" harness modes: TTL'd document writes and an
-// enrichment-backed index driven by a deterministic non-inference producer
-// (lite-single-commit-write-path.md §3.2a/§3.4). Deliberately separate from
-// the report/ceilings tests above (own JSON markers, no ceiling gate yet):
-// these exist to show the TTL-schedule write and the enrichment status/
-// progress writes this change touched cost no *extra* durable commit beyond
-// an ordinary write, not to gate the unrelated primary/indexed/graph modes.
-//
-// No new harness mode exists yet for "a table with a replication/CDC source
-// configured so outbox rows are written": every durable-outbox write path
-// (`mutation_commit.zig`'s replication_async_batch_mirror/
-// replication_async_effect_mirror) is configured through internal `DB`
-// fields with no public capi entry point, unlike schema/index/enrichment
-// configuration -- this harness only opens through the public embedding
-// seam (`capi.openLiteHandleWithRuntime`), by design (see this file's top
-// comment), so it cannot reach that configuration without adding new capi
-// surface. The TTL/outbox ride-along conversions are instead covered
-// directly by `storage/lite/crash_consistency_test.zig`'s "TTL/outbox
-// ride-along bookkeeping..." test.
 const ttl_doc_count: usize = 24;
 
 fn measureSingleWriterTtl(alloc: std.mem.Allocator, comptime name: []const u8, updates: usize) !ModeReport {
@@ -2122,6 +2078,7 @@ fn measureSingleWriterEnrichment(alloc: std.mem.Allocator, comptime name: []cons
 }
 
 test "lite write amplification: TTL-scheduled document writes" {
+    if (!reportsRequested()) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     const ttl = try measureSingleWriterTtl(alloc, "lite-write-amp-ttl", default_updates);
     printStageTable("TTL-scheduled (sync_level write)", ttl);
@@ -2131,6 +2088,7 @@ test "lite write amplification: TTL-scheduled document writes" {
 }
 
 test "lite write amplification: enrichment-backed index with a deterministic copy producer" {
+    if (!reportsRequested()) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     const enrichment = try measureSingleWriterEnrichment(alloc, "lite-write-amp-enrichment", default_updates);
     printStageTable("enrichment-backed (deterministic copy producer, drained via runUntilIdle)", enrichment);

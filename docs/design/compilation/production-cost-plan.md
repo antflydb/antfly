@@ -82,8 +82,11 @@ A post-link stripped diagnostic image is not necessarily a `-Dstrip=true` build.
 For focused ownership checks that do not need a debugger, combine
 `-Doptimize=debug -Dstrip=true`: runtime safety remains enabled, while compiler
 debug-information emission and symbolized traces are omitted.
-`ANTFLY_TEST_DEEP_ALLOC_TRACES=1` expands allocation traces to 32 frames in an
-unstripped diagnostic test run; normal tests retain the standard trace depth. Keep ordinary
+Tests record no allocation stack traces by default; leaks and invalid frees are
+still detected and fail the test, and the report names the rerun option.
+`ANTFLY_TEST_ALLOC_TRACES=1` records the standard trace depth, and
+`ANTFLY_TEST_DEEP_ALLOC_TRACES=1` expands traces to 32 frames in an
+unstripped diagnostic test run. Keep ordinary
 Debug builds for debugger and trace qualification. A live compiler sample during
 the November 6 main integration was in LLVM DWARF finalization, with a sampled
 9.6 GiB peak footprint. That build was later invalidated by cache eviction;
