@@ -4596,6 +4596,8 @@ const AudioLayerInputs = struct {
     allocator: std.mem.Allocator,
     valid_mask: []const bool,
     segments: []const usize = &.{},
+    relative_keys: []const CT = &.{},
+    relative_key_start: usize = 0,
     rel_in: CT,
     valid_ct: CT,
     segment_starts: ?CT = null,
@@ -4965,13 +4967,16 @@ fn tryAudioExecutionRange(cb: *const ComputeBackend, a: std.mem.Allocator, store
         if (rows != inputs.valid_mask.len or !std.mem.eql(usize, spans, inputs.segments)) break :recipe &local_recipe;
         break :recipe candidate;
     } else &local_recipe;
+    var relative_keys: [audio_schedule.ExecutionInputs.scale_count]CT = undefined;
+    var relative_count: usize = 0;
+    defer for (relative_keys[0..relative_count]) |ct| cb.free(ct);
     if (recipe.workspace != null) {
-        // A declared block may bind its relative keys but cannot lazily
-        // project them inside its tensor lifetime schedule.
+        // A declared block must borrow its admitted weights throughout
+        // dispatch. A missing key can still decline before entering it.
         for (start..end) |layer| {
             try cb.checkExecutionControl();
-            const key_tensor = (try audioRelativeKey(cb, a, store, cfg, inputs.rel_in, layer, true)) orelse return null;
-            cb.free(key_tensor);
+            relative_keys[relative_count] = (try audioRelativeKey(cb, a, store, cfg, inputs.rel_in, layer, true)) orelse return null;
+            relative_count += 1;
         }
     }
     const Run = struct {
@@ -4980,11 +4985,14 @@ fn tryAudioExecutionRange(cb: *const ComputeBackend, a: std.mem.Allocator, store
         store: *ProjectorWeights,
         cfg: AudioConfig,
         inputs: *AudioLayerInputs,
+        relative_keys: []const CT,
         start: usize,
         end: usize,
         fn call(raw: *anyopaque, values: []const CT) !CT {
             const self: *@This() = @ptrCast(@alignCast(raw));
             var layer_inputs = self.inputs.*;
+            layer_inputs.relative_keys = self.relative_keys;
+            layer_inputs.relative_key_start = self.start;
             layer_inputs.rel_in = values[audio_schedule.ExecutionInputs.relative];
             layer_inputs.valid_ct = values[audio_schedule.ExecutionInputs.valid];
             layer_inputs.segment_starts = if (self.inputs.segment_starts != null) values[audio_schedule.ExecutionInputs.segment_start] else null;
@@ -4995,7 +5003,7 @@ fn tryAudioExecutionRange(cb: *const ComputeBackend, a: std.mem.Allocator, store
             return runAudioLayers(self.cb, self.a, self.store, self.cfg, values[audio_schedule.ExecutionInputs.hidden], &layer_inputs, self.start, self.end);
         }
     };
-    var run = Run{ .cb = cb, .a = a, .store = store, .cfg = cfg, .inputs = inputs, .start = start, .end = end };
+    var run = Run{ .cb = cb, .a = a, .store = store, .cfg = cfg, .inputs = inputs, .relative_keys = relative_keys[0..relative_count], .start = start, .end = end };
     const values = audioExecutionInputs(hidden, inputs);
     return cb.audioExecutionWithArenaFunding(key, values[0..audio_schedule.ExecutionInputs.activeCount(cb.kind() != .cuda or inputs.segment_valid != null)], &run, Run.call, defer_arena, .{ .recipe = recipe, .segments = inputs.segments, .rows = inputs.valid_mask.len });
 }
@@ -5322,8 +5330,12 @@ fn audioSelfAttention(
     const valid_mask = inputs.valid_mask;
     const rows = valid_mask.len;
     var buf: [128]u8 = undefined;
-    const rel = (try audioRelativeKey(cb, allocator, store, cfg, inputs.rel_in, layer, false)).?;
-    defer cb.free(rel);
+    const prepared = inputs.relative_keys.len != 0;
+    const rel = if (prepared)
+        inputs.relative_keys[layer - inputs.relative_key_start]
+    else
+        (try audioRelativeKey(cb, allocator, store, cfg, inputs.rel_in, layer, false)).?;
+    defer if (!prepared) cb.free(rel);
     const choice = if (cfg.source_scalar_storage == .bf16) null else try packedAudioQkv(cb, allocator, store, input, rows, cfg.audio_hidden, layer);
     const packed_rows: ?ops.LinearTripleResult = if (choice) |value| switch (value) {
         .separate => |triple| triple,
