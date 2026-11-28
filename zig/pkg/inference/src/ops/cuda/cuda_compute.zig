@@ -21792,7 +21792,7 @@ fn runAudioWithWorkspace(
     return output;
 }
 
-fn cachedGroupedAudioWorkspace(ctx: *anyopaque, recipe: CudaCompute.CacheFunding.AudioRecipe) anyerror!?ops.ComputeBackend.AudioWorkspaceDeclaration {
+fn groupedAudioWorkspaceChoice(ctx: *anyopaque, recipe: CudaCompute.CacheFunding.AudioRecipe) anyerror!ops.ComputeBackend.AudioWorkspaceChoice {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     const schedule = @import("../../execution/audio_schedule.zig");
     var segments: [schedule.GroupedRows.max_clips]usize = undefined;
@@ -21804,7 +21804,6 @@ fn cachedGroupedAudioWorkspace(ctx: *anyopaque, recipe: CudaCompute.CacheFunding
     const inputs = metadata[0..recipe.cudaExecutionInputCount()];
     const key = recipe.key(partition, 0, recipe.blocks);
     for (&self.audio_plans.entries) |*entry| {
-        if (entry.disabled) continue;
         const snapshot = entry.declaration orelse continue;
         if (snapshot.source_key != key) continue;
         // Borrow only the immutable signature, even if Stage admission yields
@@ -21812,9 +21811,13 @@ fn cachedGroupedAudioWorkspace(ctx: *anyopaque, recipe: CudaCompute.CacheFunding
         // weight and constant generations before any plan is reused.
         const declaration: schedule.WorkspaceDeclaration = .{ .events = &.{}, .published_slot = 0, .fingerprint = snapshot.fingerprint };
         const base = try self.audioCacheBase(declaration.cacheKey(key), inputs, null);
-        if (base.key == entry.key and entry.executableFor(base) != null) return declaration;
+        if (base.key != entry.key) continue;
+        // The rejected recording was drained. A later invocation can fund
+        // the observed key without retrying a failed declared schedule.
+        if (entry.disabled) return .observe;
+        if (entry.executableFor(base) != null) return .{ .declared = declaration };
     }
-    return null;
+    return .compile;
 }
 
 fn groupedAudioWorkspaceBytes(ctx: *anyopaque, physical: @import("../../execution/grouped_audio_block.zig").Physical) anyerror!?usize {
@@ -39410,7 +39413,7 @@ const vtable: ops.ComputeBackend.VTable = .{
             .imagePatches = &preprocessEmbeddingGemma2ImagePatchesOp,
         },
         .audio_execution = .{
-            .cachedWorkspace = &cachedGroupedAudioWorkspace,
+            .workspaceChoice = &groupedAudioWorkspaceChoice,
             .workspaceBytes = &groupedAudioWorkspaceBytes,
             .execute = &audioExecutionOp,
             .storage = &sourceAudioStorageOp,
@@ -61508,6 +61511,37 @@ test "CUDA audio learning cache state uses actual warm no-plan eligibility and o
     compute.audio_plans.entries[0].owner = null;
     compute.audio_plans.entries[0].disabled = true;
     try std.testing.expect(!(try compute.cacheRequestState(request)).miss);
+}
+
+test "CUDA rejected audio declaration selects observed admission for its exact generation" {
+    const schedule = @import("../../execution/audio_schedule.zig");
+    var compute = metadataOnlyTestCompute();
+    var recipe = std.mem.zeroes(schedule.AudioRecipe);
+    recipe.count = 2;
+    recipe.frames = .{ 12, 16, 0, 0 };
+    recipe.blocks = 12;
+    recipe.hidden = 32;
+    recipe.heads = 4;
+    recipe.context_left = 13;
+
+    var segments: [2]usize = undefined;
+    const rows = try recipe.rowsAndSegments(&segments);
+    var shapes: [schedule.ExecutionInputs.count][2]i64 = undefined;
+    const metadata = try schedule.ExecutionInputs.describe(&shapes, rows, recipe.hidden, recipe.context_left, recipe.heads);
+    const source_key = recipe.key(&segments, 0, recipe.blocks);
+    const workspace = schedule.WorkspaceDeclaration.init(&.{.{ .allocate = rows * recipe.hidden * @sizeOf(f32) }}, 0);
+    const base = try compute.audioCacheBase(workspace.cacheKey(source_key), metadata[0..recipe.cudaExecutionInputCount()], null);
+    try std.testing.expect((try groupedAudioWorkspaceChoice(&compute, recipe)) == .compile);
+    compute.audio_plans.entries[0] = .{
+        .key = base.key,
+        .stamp = 1,
+        .disabled = true,
+        .declaration = .{ .source_key = source_key, .fingerprint = workspace.fingerprint },
+    };
+    try std.testing.expect((try groupedAudioWorkspaceChoice(&compute, recipe)) == .observe);
+    try std.testing.expectEqual(@as(u64, 0), compute.audio_plans.clock);
+    compute.embedding_gemma2_execution.weight_generation += 1;
+    try std.testing.expect((try groupedAudioWorkspaceChoice(&compute, recipe)) == .compile);
 }
 
 test "CUDA grouped F32 audio declaration requires a resident dense projection span" {

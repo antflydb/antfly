@@ -5086,9 +5086,11 @@ const GroupedAudioDeclaration = struct {
         const query = cb.vtable.regions.audio_execution.workspaceBytes orelse return null;
         if (try query(cb.ptr, .{ .admit = .{ .source_bf16 = recipe.source_bf16 } }) == null) return null;
         if (!recipe.source_bf16 and try query(cb.ptr, .{ .f32_plan = recipe }) == null) return null;
-        if (cb.vtable.regions.audio_execution.cachedWorkspace) |lookup| {
-            if (try lookup(cb.ptr, recipe)) |cached| return cached;
-        }
+        if (cb.vtable.regions.audio_execution.workspaceChoice) |lookup| switch (try lookup(cb.ptr, recipe)) {
+            .compile => {},
+            .observe => return null,
+            .declared => |cached| return cached,
+        };
         var spans: [audio_schedule.GroupedRows.max_clips]usize = undefined;
         const segments = spans[0..recipe.count];
         const rows = try recipe.rowsAndSegments(segments);
