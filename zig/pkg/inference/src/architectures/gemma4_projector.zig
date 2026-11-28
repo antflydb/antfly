@@ -2413,18 +2413,22 @@ fn encodeAudioFeatureCohortResidentWithinStorage(cb: *const ComputeBackend, allo
         else
             try cb.linearNoBias(normed, projection_w, subsampled.seq_len, cfg.output_hidden, cfg.text_hidden);
     };
-    defer cb.free(projected);
+    var projected_owned = true;
+    defer if (projected_owned) cb.free(projected);
     audioProfileMark(.tail);
+    const publish_projection = valid_count == subsampled.seq_len and
+        try isStandaloneAudioProjection(cb, projected, valid_count, cfg.text_hidden);
+
     // A contiguous copy owns its destination independently of the frame.
     // Encode it before submitting the last Metal frame to share its fence.
-    const contiguous_first = if (valid_count != 0 and (cb.kind() == .metal or cb.kind() == .cuda) and
+    const contiguous_first = if (!publish_projection and valid_count != 0 and (cb.kind() == .metal or cb.kind() == .cuda) and
         cb.supportsCopyRows2D() and try cb.tensorDType(projected) == .f32)
         contiguousValidAudioRows(subsampled.valid_mask, valid_count)
     else
         null;
     // Stage only the index map for a ragged mask. The projected rows stay
     // resident and the owned result crosses the frame boundary.
-    const valid_rows = if (contiguous_first == null and valid_count != 0) try allocator.alloc(u32, valid_count) else null;
+    const valid_rows = if (!publish_projection and contiguous_first == null and valid_count != 0) try allocator.alloc(u32, valid_count) else null;
     defer if (valid_rows) |rows| allocator.free(rows);
     if (valid_rows) |rows| {
         var dst: usize = 0;
@@ -2454,6 +2458,12 @@ fn encodeAudioFeatureCohortResidentWithinStorage(cb: *const ComputeBackend, allo
     }
 
     if (@import("builtin").is_test) try embeddingGemma2StageTensor(cb, allocator, "audio_projected", projected);
+    if (publish_projection) {
+        projected_owned = false;
+        audioProfileMark(.readback);
+        if (profile_enabled) profile.finish(subsampled.seq_len);
+        return .{ .embeddings = projected, .tokens = valid_count };
+    }
     const resident: ?CT = frame_snapshot orelse if (contiguous_first) |first|
         try cb.snapshotRows2D(allocator, projected, first, valid_count, cfg.text_hidden)
     else if (cb.vtable.takeRows != null)
@@ -2471,6 +2481,46 @@ fn encodeAudioFeatureCohortResidentWithinStorage(cb: *const ComputeBackend, allo
     defer allocator.free(packed_values);
     for (valid_rows.?, 0..) |row, index| @memcpy(packed_values[index * cfg.text_hidden ..][0..cfg.text_hidden], values[row * cfg.text_hidden ..][0..cfg.text_hidden]);
     return .{ .embeddings = try deviceResidentFromFloat32(cb, packed_values, &.{ @intCast(valid_count), @intCast(cfg.text_hidden) }), .tokens = valid_count };
+}
+
+fn isStandaloneAudioProjection(cb: *const ComputeBackend, projected: CT, rows: usize, width: usize) !bool {
+    const kernels = cb.vtable.kernels orelse return false;
+    if (!kernels.accepts(cb.vtable)) return false;
+    const measure = kernels.standaloneOutputBytes orelse return false;
+    const bytes = measure(cb.ptr, projected) orelse return false;
+    const required = try std.math.mul(usize, try std.math.mul(usize, rows, width), @sizeOf(f32));
+    if (required == 0 or bytes < required or try cb.tensorDType(projected) != .f32) return false;
+    return (try cb.tensorShapeMatches(projected, &.{ @intCast(rows), @intCast(width) })) orelse false;
+}
+
+fn checkStandaloneAudioProjection(cb: ComputeBackend, _: ComputeBackend) !void {
+    const a = std.testing.allocator;
+    const root = try deviceResidentFromFloat32(&cb, &.{ 1, 2, 3, 4, 5, 6 }, &.{ 3, 2 });
+    defer cb.free(root);
+    try std.testing.expect(try isStandaloneAudioProjection(&cb, root, 3, 2));
+    try std.testing.expect(!try isStandaloneAudioProjection(&cb, root, 2, 3));
+    {
+        const view = try cb.sliceRows2D(a, root, 1, 2, 2);
+        defer cb.free(view);
+        try std.testing.expect(!try isStandaloneAudioProjection(&cb, view, 2, 2));
+        try std.testing.expect(!try isStandaloneAudioProjection(&cb, root, 3, 2));
+    }
+    try std.testing.expect(try isStandaloneAudioProjection(&cb, root, 3, 2));
+}
+
+test "Native standalone audio projection rejects borrowed rows" {
+    const fixture = @import("../ops/media_residency_test.zig");
+    try fixture.onNative(fixture.noWeights, checkStandaloneAudioProjection);
+}
+
+test "Metal standalone audio projection rejects borrowed rows" {
+    const fixture = @import("../ops/media_residency_test.zig");
+    try fixture.onMetal(fixture.noWeights, checkStandaloneAudioProjection);
+}
+
+test "CUDA standalone audio projection rejects borrowed rows" {
+    const fixture = @import("../ops/media_residency_test.zig");
+    try fixture.onCuda(fixture.noWeights, checkStandaloneAudioProjection);
 }
 
 fn encodeUnifiedDirectAudio(cb: *const ComputeBackend, a: std.mem.Allocator, store: *ProjectorWeights, cfg: AudioConfig, input: AudioInput) !EncodedAudio {
