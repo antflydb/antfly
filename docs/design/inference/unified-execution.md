@@ -1515,7 +1515,7 @@ deletion and qualification gates.
 | Requirement | State | Evidence and remaining gate |
 | --- | --- | --- |
 | Shared liveness and authoritative storage | Partial | Assigned execution and admitted storage share dependency analysis. Metal image and video use the admitted vision region. CUDA decoder attention, recurrent projections, norm adjustment and dense FFN share admitted layer storage. At `e32afca66d`, the released cache-disabled 0.8B reader replayed with no learned bytes and the 4B graph recorded zero allocations at 98 rows. Released BF16 grouped audio derives its lifetimes before dispatch. Other decoder and audio representations and specialized Metal scopes remain open. Opaque vendor workspace retains separate accounting. |
-| Stable addresses and CUDA capture | Partial | Released T5-small captured and replayed at prefixes 1, 8, 32 and 64. Released BF16 grouped audio captured and replayed within its 36,788,736-byte arena, including cancellation before staging and successful later replay. The released two-page LightOnOCR reader skipped its learning burst with declared warmup. At `e32afca66d`, 4B replayed a declared zero-byte plan at 60 rows and an observed zero-byte plan at 98 rows. Wider replay repeatability, resource pressure and ordinary/capture throughput remain open. |
+| Stable addresses and CUDA capture | Partial | Released T5-small captured and replayed at prefixes 1, 8, 32 and 64. Released BF16 grouped audio captured and replayed within its 36,788,736-byte arena, including cancellation before staging and successful later replay. The released two-page LightOnOCR reader skipped its learning burst with declared warmup. At `e32afca66d`, 4B replayed a declared zero-byte plan at 60 rows and an observed zero-byte plan at 98 rows. At `4985997ee6`, both timed 256-page 4B runs replayed declared zero-byte plans at 98 rows with exact serial parity and zero retirement-capacity retries. Paired ordinary/capture throughput and other signatures remain open. |
 | Runtime-owned state and physical policy | Partial | `decoder_storage.zig` owns Gemma 4 replay capacity and `decoder_prefill.zig` owns chunk selection, eager binding and scheduled cancellation. The shared frame owner controls media view retirement. Metal HTTP acquires and pins the existing per-layer input table before decoder state advances. Residual task-bound state and cache policy need provider-specific verification and migration. |
 | Resident placement | Partial | Released T5-small retired encoder activations before fused suffix execution and kept all 24 cache slots independently owned at prefixes 1, 8, 32 and 64 on CPU, Metal and CUDA. Spark recorded 393,216 device-to-device gather bytes and zero gather downloads. Imported ONNX handoff tests exercise exact output custody and host fallback on all three providers. Metal verifies a scalar token readback and a one-row fallback. At `bd0e05a4e3`, Spark passed the device gather and consumed a retained audio output view without a device copy. Other eligible stateful and opaque producer/consumer pairs still need qualification. |
 | Task orchestration | Partial | Media tasks call shared frame and projection retirement owners. Scheduled generation routes publish independent outputs through runtime callbacks. Some hardware-specific paths still choose or own physical transitions in model and task code. |
@@ -3173,6 +3173,21 @@ a declared zero-byte plan at 3 rows, missing its wide replay
 requirement. The enlarged retirement pool preserved progress in
 this pair. Sustained wide replay and declared replay above 64 rows
 remain open.
+
+At `4985997ee6`, all 46 focused Spark checks passed without skips, as
+did separate runs of the cache-disabled and unfused HTTP fixtures. The
+warmup now verifies packet dispatch and in-place attention gating
+independently. Attention may dispatch multiple packets per layer and
+token, while gating runs once on the assembled output.
+
+The unprofiled and profiled workloads each completed 256 released
+LightOnOCR-3-4B pages with exact serial parity and zero retirement-capacity
+retries. Both passed the timed declared replay gate at 65 rows or wider.
+The unprofiled run replayed two declared 98-row graphs at 6.26 pages/s
+overall. The profiled run replayed one at 6.36 pages/s overall. All three
+98-row receipts reported zero learned events and bytes. This qualifies
+declared wide replay in both configurations on Spark. The measurements
+do not establish a throughput gain against a paired frozen baseline.
 
 ### Released Inkling Metal checkpoint at `7f0ff56ff8`
 
