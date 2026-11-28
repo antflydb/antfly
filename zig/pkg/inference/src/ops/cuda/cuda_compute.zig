@@ -4071,6 +4071,7 @@ pub const CudaCompute = struct {
                     .declared_attention_residual_bytes = if (layout.attention_residual) |span| span.bytes else 0,
                     .declared_attention_inputs_bytes = if (layout.attention_inputs) |span| span.bytes else 0,
                     .declared_attention_projection_bytes = layout.attention_projection_bytes,
+                    .declared_norm_weight_bytes = if (layout.norm_weight_workspace) |span| span.bytes else 0,
                     .declared_layer_norm_bytes = if (layout.layer_norm) |span| span.bytes else 0,
                     .declared_layer_norm_mirror_bytes = if (layout.layer_norm_mirror) |span| span.bytes else 0,
                     .declared_final_norm_mirror_bytes = if (layout.final_norm_mirror) |span| span.bytes else 0,
@@ -4313,6 +4314,7 @@ pub const CudaCompute = struct {
             .compact_ffn = if (lightOnFfnBlockEnabled(cb) and lightOnDevice(self).portableKernels() and !self.lighton_bf16_decode_outputs) self.lighton_bf16_projection_outputs else null,
             .projection_staging = cudaCublasLtEnabled() and self.cublaslt != null and self.ctx.info.compute_major >= 8,
             .layer_norm = true,
+            .adjust_norm_weights = descriptor.norm_weight_offset != 0 and !self.lighton_norm_weight_cache_enabled,
             .fused_attention_inputs = lightOnProjectionResidualEnabled(cb),
             .fused_recurrent_projections = if (descriptor.recurrent_projection_widths) |widths|
                 lightOnProjectionFusionEnabled(cb) and self.lazy_host_store == null and lightOnDevice(self).portableKernels() and
@@ -4405,7 +4407,7 @@ pub const CudaCompute = struct {
         const vendor = self.currentGraphVendorWorkspace() orelse return error.PreparedCachePlanChanged;
         if (!std.meta.eql(vendor, graph_phase.vendor_workspace)) return error.PreparedCachePlanChanged;
         const descriptor = graph_phase.descriptor;
-        if (graph_phase.expected_compute != @intFromPtr(self) or descriptor.epoch != epoch or descriptor.rows != rows or descriptor.hidden != hidden or descriptor.vocab != vocab or descriptor.future_tokens != future_tokens or !std.meta.eql(descriptor.attention_geometry, expected.attention_geometry) or !std.meta.eql(descriptor.recurrent_heads, expected.recurrent_heads) or !std.meta.eql(descriptor.recurrent_projection_widths, expected.recurrent_projection_widths) or descriptor.attention_layers != expected.attention_layers or descriptor.recurrent_layers != expected.recurrent_layers or descriptor.ffn_intermediate != expected.ffn_intermediate or descriptor.attention_q_gate != expected.attention_q_gate or !std.meta.eql(descriptor.head_storage, expected.head_storage) or !std.mem.eql(u64, descriptor.key, key) or !std.mem.eql(u32, descriptor.positions, positions) or !std.mem.eql(u64, descriptor.sequences, expected.sequences)) return error.PreparedCachePlanChanged;
+        if (graph_phase.expected_compute != @intFromPtr(self) or descriptor.epoch != epoch or descriptor.rows != rows or descriptor.hidden != hidden or descriptor.vocab != vocab or descriptor.future_tokens != future_tokens or !std.meta.eql(descriptor.attention_geometry, expected.attention_geometry) or !std.meta.eql(descriptor.recurrent_heads, expected.recurrent_heads) or !std.meta.eql(descriptor.recurrent_projection_widths, expected.recurrent_projection_widths) or descriptor.attention_layers != expected.attention_layers or descriptor.recurrent_layers != expected.recurrent_layers or descriptor.ffn_intermediate != expected.ffn_intermediate or descriptor.attention_q_gate != expected.attention_q_gate or descriptor.norm_weight_offset != expected.norm_weight_offset or !std.meta.eql(descriptor.head_storage, expected.head_storage) or !std.mem.eql(u64, descriptor.key, key) or !std.mem.eql(u32, descriptor.positions, positions) or !std.mem.eql(u64, descriptor.sequences, expected.sequences)) return error.PreparedCachePlanChanged;
         const owner = &self.bounded_decode_graph;
         while (!owner.mutex.tryLock()) std.atomic.spinLoopHint();
         var claimed = false;
@@ -30012,8 +30014,20 @@ fn rmsNorm(ctx: *anyopaque, input: CT, weight: CT, dim: usize, eps: f32) anyerro
     return rmsNormWithDestination(ctx, input, weight, dim, eps, null, null);
 }
 
-/// The graph's original input has been consumed when the decoder reaches its
-/// final norm. Reuse that same slab until the head has consumed the result.
+pub fn tryCapturedAdjustedNormWeight(cb: *const ops.ComputeBackend, weight: CT, dim: usize, offset: f32, kind: @import("bounded_decode_graph.zig").Module.NormWeight) !?CT {
+    if (!acceptsPhysicalImplementation(cb.vtable)) return null;
+    const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
+    const owner = &self.bounded_decode_graph;
+    if (!owner.active or self.capability_profile != .lightonocr3 or offset == 0) return null;
+    const source = tensorFromCt(weight);
+    if (source.dtype != .f32 or source.quant_type != null or source.shape.len != 1 or source.elem_count != dim) return null;
+    const bytes = try checkedMul(dim, @sizeOf(f32));
+    const destination = (try owner.bindNormWeight(kind, bytes)) orelse return null;
+    if (kernel_geometry.byteRangesOverlap(source.buffer.ptr, source.buffer.len, destination.ptr, bytes)) return error.InvalidAssignedAlias;
+    return try addScalarWithDestination(cb.ptr, weight, offset, destination);
+}
+
+/// The graph input is dead at final norm. Reuse its slab through the head.
 pub fn tryCapturedFinalNorm(cb: *const ops.ComputeBackend, input: CT, weight: CT, dim: usize, eps: f32) !?CT {
     if (!acceptsPhysicalImplementation(cb.vtable)) return null;
     const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
@@ -30932,11 +30946,17 @@ fn clampScalar(ctx: *anyopaque, input: CT, lower: ?f32, upper: ?f32) anyerror!?C
 }
 
 fn addScalar(ctx: *anyopaque, input: CT, value: f32) anyerror!?CT {
+    return addScalarWithDestination(ctx, input, value, null);
+}
+
+fn addScalarWithDestination(ctx: *anyopaque, input: CT, value: f32, destination: ?buffer_mod.DeviceBuffer) anyerror!?CT {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     const input_tensor = tensorFromCt(input);
     try ensureF32(input_tensor);
 
-    var output = try OwnedF32Output.alloc(self, input_tensor.shape, input_tensor.elem_count);
+    const count = input_tensor.elem_count;
+    const bytes = try checkedMul(count, @sizeOf(f32));
+    var output = try OwnedF32Output.fromOwnedShapeDestination(self, try dupeShape(self.allocator, input_tensor.shape), count, bytes, destination);
     defer output.deinit();
     try self.kernels.launchAddScalarF32(&self.ctx, output.buffer, input_tensor.buffer, input_tensor.elem_count, value);
     self.stats.add_scalar_calls += 1;
@@ -48186,6 +48206,30 @@ test "LightOnOCR3 CUDA graph warm input and wide head write their assigned buffe
         compute.capability_profile = .lightonocr3;
         const gamma = try cb.fromFloat32Shape(&.{ 1, 2 }, &.{2});
         defer cb.free(gamma);
+        {
+            const parameter_bytes = 2 * @sizeOf(f32);
+            owner.storage_layout.?.metadata_bytes = metadata.len;
+            owner.storage_layout.?.norm_weight_workspace = .{ .offset = split_offset, .bytes = 2 * parameter_bytes };
+            owner.storage_layout.?.norm_weight_head_bytes = parameter_bytes;
+            defer {
+                owner.storage_layout.?.metadata_bytes = layout.metadata_bytes;
+                owner.storage_layout.?.norm_weight_workspace = null;
+                owner.storage_layout.?.norm_weight_head_bytes = 0;
+            }
+            const before = compute.stats.device_alloc_calls;
+            const query_weight = (try tryCapturedAdjustedNormWeight(&cb, gamma, 2, 1, .query)).?;
+            defer cb.free(query_weight);
+            const key_weight = (try tryCapturedAdjustedNormWeight(&cb, gamma, 2, -1, .key)).?;
+            defer cb.free(key_weight);
+            try std.testing.expectEqual(before, compute.stats.device_alloc_calls);
+            try std.testing.expectEqual(metadata.ptr + split_offset, tensorFromCt(query_weight).buffer.ptr);
+            try std.testing.expectEqual(metadata.ptr + split_offset + parameter_bytes, tensorFromCt(key_weight).buffer.ptr);
+            for ([_]CT{ query_weight, key_weight, gamma }, [_][]const f32{ &.{ 2, 3 }, &.{ 0, 1 }, &.{ 1, 2 } }) |result, expected| {
+                const actual = try cb.toFloat32(result, a);
+                defer a.free(actual);
+                try std.testing.expectEqualSlices(f32, expected, actual);
+            }
+        }
         const ordinary_norm = try cb.rmsNorm(input, gamma, 2, 1e-6);
         defer cb.free(ordinary_norm);
         const test_mirror = cudaRmsNormBf16MirrorEnabled() and cudaCublasLtEnabled() and compute.ctx.info.compute_major >= 8 and compute.cublaslt != null;

@@ -48847,8 +48847,10 @@ test "LightOnOCR3 real checkpoint transcribes the invoice fixture" {
             try std.testing.expect(report.bound_recurrent_joined_projection_bytes <= report.declared_recurrent_joined_projection_bytes);
             if (platform.env.getenvBool("ANTFLY_CUDA_ENABLE_LIGHTON_FUSED_PROJECTIONS"))
                 try std.testing.expectEqual(recurrent_projection_bytes, report.bound_recurrent_joined_projection_bytes);
-            const serial_bytes = @max(attention_bytes, recurrent_bytes, report.declared_ffn_scratch_bytes, report.declared_recurrent_joined_projection_bytes);
+            const serial_bytes = @max(attention_bytes, recurrent_bytes, report.declared_ffn_scratch_bytes, report.declared_recurrent_joined_projection_bytes, report.declared_norm_weight_bytes);
             const layer_and_outputs_bytes = if (report.declared_ffn_output_bank_bytes != 0) std.mem.alignForward(usize, serial_bytes, alignment) + report.declared_ffn_output_bank_bytes else serial_bytes;
+            if (report.declared_norm_weight_bytes != 0)
+                try std.testing.expectEqual(@as(usize, @max(geometry.hidden_size, 2 * geometry.headDim())) * @sizeOf(f32), report.declared_norm_weight_bytes);
             const norm_bytes = report.rows * geometry.hidden_size * @sizeOf(f32);
             try std.testing.expectEqual(norm_bytes, report.declared_layer_norm_bytes);
             try std.testing.expectEqual(2 * norm_bytes, report.declared_ffn_output_bank_bytes);
@@ -48882,7 +48884,7 @@ test "LightOnOCR3 real checkpoint transcribes the invoice fixture" {
             const mirror_offset = report.declared_final_norm_mirror_offset;
             if (mirror_bytes != 0) {
                 try std.testing.expectEqual(@as(usize, 0), mirror_offset % alignment);
-                try std.testing.expect(mirror_offset >= @max(report.shared_head_scratch_bytes, report.fused_head_scratch_bytes));
+                try std.testing.expect(mirror_offset >= @max(report.shared_head_scratch_bytes, report.fused_head_scratch_bytes, report.declared_norm_weight_bytes));
                 if (report.declared_projection_staging_bytes != 0) {
                     const staging_start = layer_and_staging_bytes - report.declared_projection_staging_bytes;
                     try std.testing.expect(mirror_offset + mirror_bytes <= staging_start or mirror_offset >= layer_and_staging_bytes);

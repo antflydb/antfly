@@ -8114,9 +8114,9 @@ fn tryLightOnAttentionInputs(
         else => return err,
     };
     defer cb.free(k_base);
-    const qw = try maybeAdjustNormWeight(cb, allocator, config, q_base, head_dim);
+    const qw = try adjustDecoderNormWeight(cb, allocator, config, q_base, head_dim, .query);
     defer if (qw != q_base) cb.free(qw);
-    const kw = try maybeAdjustNormWeight(cb, allocator, config, k_base, head_dim);
+    const kw = try adjustDecoderNormWeight(cb, allocator, config, k_base, head_dim, .key);
     defer if (kw != k_base) cb.free(kw);
     return cuda.lightOnAttentionInputs(cb, query_gate, key, qw, kw, positions, rows, heads, kv_heads);
 }
@@ -8161,7 +8161,7 @@ fn maybeApplyQKHeadNormWithCleanup(
         else => return err,
     };
     defer freeTensorWithCleanup(cb, base_weight, cleanup);
-    const adjusted_weight = try maybeAdjustNormWeight(cb, allocator, config, base_weight, head_dim);
+    const adjusted_weight = try adjustDecoderNormWeight(cb, allocator, config, base_weight, head_dim, if (std.mem.eql(u8, proj, "q")) .query else .key);
     defer if (adjusted_weight != base_weight) freeTensorWithCleanup(cb, adjusted_weight, cleanup);
 
     const num_heads_for_norm = total_dim / head_dim;
@@ -8218,7 +8218,7 @@ pub fn maybeApplyQKHeadNormRope(
         else => return err,
     };
     defer cb.free(base_weight);
-    const adjusted_weight = try maybeAdjustNormWeight(cb, allocator, config, base_weight, head_dim);
+    const adjusted_weight = try adjustDecoderNormWeight(cb, allocator, config, base_weight, head_dim, if (std.mem.eql(u8, proj, "q")) .query else .key);
     defer if (adjusted_weight != base_weight) cb.free(adjusted_weight);
 
     return try cb.rmsNormHeadsRope(
@@ -8318,6 +8318,15 @@ pub fn lookupScaledTokenEmbeddingsTensor(
     if (try cb.embeddingLookupTensorScaled(embed_w, input_token, total, hidden_size, scale)) |scaled| return scaled;
     const embedded = (try cb.embeddingLookupTensor(embed_w, input_token, total, hidden_size)) orelse return null;
     return try maybeScaleTokenEmbeddings(cb, allocator, config, embedded, total, hidden_size);
+}
+
+fn adjustDecoderNormWeight(cb: *const ComputeBackend, allocator: std.mem.Allocator, config: Config, weight: CT, dim: usize, kind: @import("../ops/cuda/bounded_decode_graph.zig").Module.NormWeight) !CT {
+    if (comptime build_options.enable_cuda) {
+        if (config.hasQwen35VisionArchitectureContract() and !std.math.approxEqAbs(f32, config.norm_weight_offset, 0, 1e-6)) {
+            if (try @import("../ops/cuda/cuda_compute.zig").tryCapturedAdjustedNormWeight(cb, weight, dim, config.norm_weight_offset, kind)) |assigned| return assigned;
+        }
+    }
+    return maybeAdjustNormWeight(cb, allocator, config, weight, dim);
 }
 
 pub fn maybeAdjustNormWeight(
@@ -12605,7 +12614,7 @@ fn applyNormAt(cb: *const ComputeBackend, allocator: std.mem.Allocator, config: 
             const name = std.fmt.bufPrint(buf, "model.layers.{d}.{s}", .{ layer, suffix }) catch return error.NameTooLong;
             const base_w = try getModelWeight(cb, config, name);
             defer cb.free(base_w);
-            const w = try maybeAdjustNormWeight(cb, allocator, config, base_w, dim);
+            const w = try adjustDecoderNormWeight(cb, allocator, config, base_w, dim, .hidden);
             defer if (w != base_w) cb.free(w);
             if (comptime build_options.enable_cuda) {
                 if (config.hasQwen35VisionArchitectureContract() and cb.kind() == .cuda) {
@@ -12713,7 +12722,7 @@ fn applyFinalNormInternal(
         .llama, .mistral, .qwen2, .qwen3, .qwen3_vl, .qwen3_5, .gemma, .bitnet => {
             const base_w = try getModelWeight(cb, config, "model.norm.weight");
             defer freeTensorWithCleanup(cb, base_w, cleanup);
-            const w = try maybeAdjustNormWeight(cb, allocator, config, base_w, dim);
+            const w = try adjustDecoderNormWeight(cb, allocator, config, base_w, dim, .hidden);
             defer if (w != base_w) freeTensorWithCleanup(cb, w, cleanup);
             if (comptime build_options.enable_cuda) {
                 if (reuse_graph_input and cb.kind() == .cuda) {

@@ -98,6 +98,8 @@ pub const StorageLayout = struct {
     input_projections: ?Span = null,
     attention_projection_bytes: [3]usize = @splat(0),
     recurrent_projection_bytes: [4]usize = @splat(0),
+    norm_weight_workspace: ?Span = null,
+    norm_weight_head_bytes: usize = 0,
     layer_norm: ?Span = null,
     layer_norm_mirror: ?Span = null,
     final_norm_mirror: ?Span = null,
@@ -230,6 +232,7 @@ pub const StorageLayout = struct {
             self.attention_residual,
             self.attention_inputs,
             self.input_projections,
+            self.norm_weight_workspace,
             self.layer_norm,
             self.layer_norm_mirror,
         }) |slot| if (slot) |span| {
@@ -302,6 +305,7 @@ pub const Descriptor = struct {
     head_storage: HeadStorage = .full_bank,
     attention_geometry: ?DecodeScratch.Geometry = null,
     attention_q_gate: bool = false,
+    norm_weight_offset: f32 = 0,
     recurrent_heads: ?struct { key: usize, value: usize } = null,
     recurrent_projection_widths: ?[4]usize = null,
     attention_layers: usize,
@@ -417,6 +421,7 @@ pub const GraphPhase = struct {
         layer_norm: bool = false,
         fused_attention_inputs: bool = false,
         fused_recurrent_projections: bool = false,
+        adjust_norm_weights: bool = false,
     };
 
     /// Resolve layer lifetimes in submission order from the descriptor. A
@@ -444,6 +449,17 @@ pub const GraphPhase = struct {
                 if (!policy.layer_norm) return error.InvalidShape;
                 self.storage_layout.recurrent_projection_joined = try self.storage_layout.declareLayerWorkspace(recurrent_projection_total);
             }
+        }
+        if (policy.adjust_norm_weights) {
+            // Hidden norm and Q/K norm preparation run before the other
+            // serial scratch. The Q and K vectors may be live together.
+            const hidden_bytes = try std.math.mul(usize, self.descriptor.hidden, @sizeOf(f32));
+            const head_bytes = if (self.descriptor.attention_geometry) |geometry|
+                try std.math.mul(usize, geometry.dim, @sizeOf(f32))
+            else
+                0;
+            self.storage_layout.norm_weight_head_bytes = head_bytes;
+            self.storage_layout.norm_weight_workspace = try self.storage_layout.declareLayerWorkspace(@max(hidden_bytes, try std.math.mul(usize, head_bytes, 2)));
         }
         if (policy.compact_ffn) |compact| try self.declareFfnScratch(compact);
         if (policy.layer_norm and self.storage_layout.ffn_outputs == null) {
@@ -504,7 +520,8 @@ pub const GraphPhase = struct {
         );
         // Layer outputs are dead when the final norm runs. Only the terminal
         // head bank and any projection staging remain concurrent with its mirror.
-        var offset = try StorageLayout.aligned(head_bytes);
+        const norm_weight_bytes = if (layout.norm_weight_workspace) |span| span.bytes else 0;
+        var offset = try StorageLayout.aligned(@max(head_bytes, norm_weight_bytes));
         if (layout.projection_staging) |span| {
             const staging_start = span.offset - prefix;
             const staging_end = try std.math.add(usize, staging_start, span.bytes);
@@ -1109,6 +1126,17 @@ pub const Module = struct {
         return .{ .output = try self.bindLayerWorkspace(layout, output, bytes), .mirror = mirror };
     }
 
+    pub const NormWeight = enum { hidden, query, key };
+
+    pub fn bindNormWeight(self: *const Module, kind: NormWeight, bytes: usize) !?buffer.DeviceBuffer {
+        const layout = self.storage_layout orelse return error.InvalidExecutionPlan;
+        const span = layout.norm_weight_workspace orelse return null;
+        const expected = if (kind == .hidden) try std.math.mul(usize, self.hidden, @sizeOf(f32)) else layout.norm_weight_head_bytes;
+        if (bytes == 0 or bytes != expected) return error.InvalidExecutionPlan;
+        const backing = try self.bindLayerWorkspace(layout, span, span.bytes);
+        return try backing.borrowRange(if (kind == .key) expected else 0, bytes);
+    }
+
     pub fn bindFinalNormMirror(self: *const Module, bytes: usize) !?buffer.DeviceBuffer {
         const layout = self.storage_layout orelse return error.InvalidExecutionPlan;
         const span = layout.final_norm_mirror orelse return null;
@@ -1314,12 +1342,14 @@ test "bounded CUDA decoder shares declared attention and recurrent workspace" {
         var projection_policy = mirror_policy;
         projection_policy.layer_norm = true;
         projection_policy.fused_recurrent_projections = true;
+        projection_policy.adjust_norm_weights = true;
         try phase.prepareWorkspace(projection_policy);
         const projection_layout = phase.storage_layout;
         try std.testing.expectEqual(gated, projection_layout.supportsDeclaredWarmup(true));
         try std.testing.expect(!projection_layout.supportsDeclaredWarmup(false));
         const projection_owner: Module = .{
             .storage_layout = projection_layout,
+            .hidden = projected.hidden,
             .metadata = .{ .ptr = 0x20000, .len = projection_layout.metadata_bytes },
         };
         const q_bytes = attention_output.len * @as(usize, if (gated) 2 else 1);
@@ -1331,6 +1361,14 @@ test "bounded CUDA decoder shares declared attention and recurrent workspace" {
         try std.testing.expectEqual(k_dst.ptr + k_dst.len, v_dst.ptr);
         try std.testing.expect(v_dst.ptr + v_dst.len <= projection_owner.metadata.ptr + projection_layout.projection_staging.?.offset);
         try std.testing.expectError(error.InvalidExecutionPlan, projection_owner.bindAttentionProjection(.query, q_bytes - @sizeOf(f32)));
+        const head_norm_bytes = 256 * @sizeOf(f32);
+        const hidden_norm = (try projection_owner.bindNormWeight(.hidden, projected.hidden * @sizeOf(f32))).?;
+        const query_norm = (try projection_owner.bindNormWeight(.query, head_norm_bytes)).?;
+        const key_norm = (try projection_owner.bindNormWeight(.key, head_norm_bytes)).?;
+        try std.testing.expectEqual(hidden_norm.ptr, query_norm.ptr);
+        try std.testing.expectEqual(query_norm.ptr + query_norm.len, key_norm.ptr);
+        try std.testing.expect(projection_owner.metadata.ptr + projection_layout.final_norm_mirror.?.offset >= hidden_norm.ptr + hidden_norm.len);
+        try std.testing.expectError(error.InvalidExecutionPlan, projection_owner.bindNormWeight(.key, head_norm_bytes - 4));
         const joined_bytes = rows * (recurrent_widths[0] + recurrent_widths[1] + recurrent_widths[2] + recurrent_widths[3]) * @sizeOf(f32);
         const joined = (try projection_owner.bindJoinedRecurrentProjection(joined_bytes)).?;
         try std.testing.expectEqual(projection_owner.metadata.ptr + projection_layout.attention_workspace.?.offset, joined.ptr);
