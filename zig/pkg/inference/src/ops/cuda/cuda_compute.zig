@@ -63510,6 +63510,21 @@ test "CUDA cold audio declaration dispatches before any learning invocation" {
     const bounded_values = try cb.toFloat32(bounded, std.testing.allocator);
     defer std.testing.allocator.free(bounded_values);
     try std.testing.expectEqualSlices(f32, &.{ 0.5, 0.25, 0.25, 0.5 }, bounded_values);
+
+    const changed_inputs = try cb.fromFloat32Shape(&.{ 0, 0.375, 1, 0.25 }, &.{ 2, 2 });
+    defer cb.free(changed_inputs);
+    const replay_before = compute.audio_graph_replays;
+    for (0..3) |_| {
+        const replayed = (try audioExecutionOp(&compute, cold_key, &.{ changed_inputs, identity }, @constCast(&cb), Run.call, .{
+            .workspace = workspace,
+        })) orelse return error.TestUnexpectedResult;
+        defer cb.free(replayed);
+        const actual = try cb.toFloat32(replayed, std.testing.allocator);
+        defer std.testing.allocator.free(actual);
+        try std.testing.expectEqualSlices(f32, &.{ 0.25, 0.375, 0.5, 0.25 }, actual);
+    }
+    try std.testing.expect(compute.audio_graph_replays > replay_before);
+    try std.testing.expect(!entry.warmed);
 }
 
 test "source GEMM row descriptors reject missing physical input before opaque CUDA access" {
