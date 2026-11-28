@@ -2883,6 +2883,15 @@ exact parity and two-row replay with 44 pinned readback bytes and a
 2,004,992-byte shared workspace. The paired latency run uses that
 tested revision.
 
+The merged `a081307661` tree passed nine focused checks on the local
+M4 Max with hardware access and zero skips. Eight exercised the Metal
+provider, including live SDK backing after owner close, audio-bank
+admission and rollback, fresh arena outputs with held earlier results,
+disjoint clamp scratch under fallback and pressure, and external-frame
+custody. The ninth verified nested decoder timing totals. The initial
+sandboxed run skipped the eight Metal cases and supplied no hardware
+evidence.
+
 ### Isolated Metal E4B HTTP comparison at `58b3917a89`
 
 The local M4 Max used the same pinned binaries as the mixed serving
