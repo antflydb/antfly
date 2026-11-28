@@ -3311,8 +3311,16 @@ The profiled run recorded 75 mixed prefill/decode steps in the paired
 baseline arms and 85 in the candidate arms. Their summed host forward
 and drain spans were 44.80 and 46.62 seconds, respectively. These spans
 include waits. The comparison changes both independent prompt cleanup
-and the replay-horizon check. It leaves attribution between those two
-changes open.
+and the replay-horizon check.
+
+The isolated prompt-cleanup comparison used the same baseline
+`3584e01d9f` and the intermediate `3d0ba0620a` runtime. All eight
+unprofiled arms completed 256 pages and 512 packed chunks with exact
+serial parity and zero retirement-capacity retries. Paired throughput
+was 6.31 versus 6.29 pages/s, a 0.4% drop. Both paired sides replayed
+above 64 rows in both arms. In all four arms per side, each runtime
+missed wide replay once. This comparison did not reproduce the
+combined changes' 2.6% slowdown. Direct attribution remains open.
 
 At `0cd7a9e823`, all 55 focused Spark checks passed without skips.
 The physical graph fixture preserved the replay after an unrelated
