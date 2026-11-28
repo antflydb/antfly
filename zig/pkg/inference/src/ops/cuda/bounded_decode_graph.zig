@@ -420,14 +420,22 @@ pub const GraphPhase = struct {
         try self.declareAttentionOutput();
         if (policy.recurrent_scratch) try self.declareRecurrentScratch();
         try self.declareRecurrentOutput();
-        // The joined GEMM result dies at the projection split, before either
-        // attention core or the FFN enters the serial scratch bank.
-        if (policy.fused_recurrent_projections and self.descriptor.recurrent_layers != 0) {
-            const widths = self.descriptor.recurrent_projection_widths orelse return error.InvalidShape;
-            var width: usize = 0;
-            for (widths) |part| width = try std.math.add(usize, width, part);
-            const elements = try std.math.mul(usize, self.descriptor.rows, width);
-            self.storage_layout.recurrent_projection_joined = try self.storage_layout.declareLayerWorkspace(try std.math.mul(usize, elements, @sizeOf(f32)));
+        var recurrent_projection_total: usize = 0;
+        if (self.descriptor.recurrent_layers != 0) {
+            if (self.descriptor.recurrent_projection_widths) |widths| {
+                const row_bytes = try std.math.mul(usize, self.descriptor.rows, @sizeOf(f32));
+                for (widths, &self.storage_layout.recurrent_projection_bytes) |width, *bytes| {
+                    if (width == 0) return error.InvalidShape;
+                    bytes.* = try std.math.mul(usize, row_bytes, width);
+                    recurrent_projection_total = try std.math.add(usize, recurrent_projection_total, bytes.*);
+                }
+            }
+            // The joined GEMM result dies at the split, before the
+            // recurrent core or the FFN enters the serial scratch bank.
+            if (policy.fused_recurrent_projections) {
+                if (!policy.layer_norm) return error.InvalidShape;
+                self.storage_layout.recurrent_projection_joined = try self.storage_layout.declareLayerWorkspace(recurrent_projection_total);
+            }
         }
         if (policy.compact_ffn) |compact| try self.declareFfnScratch(compact);
         if (policy.layer_norm and self.storage_layout.ffn_outputs == null) {
@@ -468,16 +476,7 @@ pub const GraphPhase = struct {
             projection_bytes = try std.math.add(usize, query_bytes, try std.math.mul(usize, inputs.key_bytes, 2));
             self.storage_layout.attention_projection_bytes = .{ query_bytes, inputs.key_bytes, inputs.key_bytes };
         }
-        if (policy.layer_norm and self.descriptor.recurrent_layers != 0) {
-            if (self.descriptor.recurrent_projection_widths) |widths| {
-                var recurrent_bytes: usize = 0;
-                for (widths, &self.storage_layout.recurrent_projection_bytes) |width, *bytes| {
-                    bytes.* = try std.math.mul(usize, try std.math.mul(usize, self.descriptor.rows, width), @sizeOf(f32));
-                    recurrent_bytes = try std.math.add(usize, recurrent_bytes, bytes.*);
-                }
-                projection_bytes = @max(projection_bytes, recurrent_bytes);
-            }
-        }
+        if (policy.layer_norm) projection_bytes = @max(projection_bytes, recurrent_projection_total);
         if (projection_bytes != 0) {
             const offset = try StorageLayout.aligned(try self.storage_layout.layerLiveBytes());
             self.storage_layout.input_projections = try self.storage_layout.declareLayerRegion(offset, projection_bytes);
@@ -1025,16 +1024,7 @@ pub const Module = struct {
 
     pub fn bindAttentionProjection(self: *const Module, kind: AttentionProjection, bytes: usize) !?buffer.DeviceBuffer {
         const layout = self.storage_layout orelse return error.InvalidExecutionPlan;
-        const span = layout.input_projections orelse return null;
-        const index = @backingInt(kind);
-        if (layout.attention_projection_bytes[index] != bytes) return error.InvalidExecutionPlan;
-        const offset: usize = switch (kind) {
-            .query => 0,
-            .key => layout.attention_projection_bytes[0],
-            .value => try std.math.add(usize, layout.attention_projection_bytes[0], layout.attention_projection_bytes[1]),
-        };
-        const projection_bank = try self.bindLayerWorkspace(layout, span, span.bytes);
-        return try projection_bank.borrowRange(offset, bytes);
+        return self.bindInputProjection(layout, &layout.attention_projection_bytes, @backingInt(kind), bytes);
     }
 
     pub fn bindJoinedRecurrentProjection(self: *const Module, bytes: usize) !?buffer.DeviceBuffer {
@@ -1048,9 +1038,11 @@ pub const Module = struct {
 
     pub fn bindRecurrentProjection(self: *const Module, kind: RecurrentProjection, bytes: usize) !?buffer.DeviceBuffer {
         const layout = self.storage_layout orelse return error.InvalidExecutionPlan;
+        return self.bindInputProjection(layout, &layout.recurrent_projection_bytes, @backingInt(kind), bytes);
+    }
+
+    fn bindInputProjection(self: *const Module, layout: StorageLayout, sizes: []const usize, index: usize, bytes: usize) !?buffer.DeviceBuffer {
         const span = layout.input_projections orelse return null;
-        const sizes = layout.recurrent_projection_bytes;
-        const index = @backingInt(kind);
         if (sizes[index] == 0) return null;
         if (sizes[index] != bytes) return error.InvalidExecutionPlan;
         var offset: usize = 0;
@@ -1343,6 +1335,16 @@ test "bounded CUDA decoder shares declared attention and recurrent workspace" {
             try std.testing.expect((try projection_owner.bindSplitQueryGate(q_bytes)) == null);
         }
     }
+
+    var invalid = descriptor;
+    invalid.recurrent_projection_widths = .{ 8192, 4096, 0, 32 };
+    try phase.initInto(invalid);
+    var invalid_policy = mirror_policy;
+    invalid_policy.layer_norm = true;
+    invalid_policy.fused_recurrent_projections = true;
+    try std.testing.expectError(error.InvalidShape, phase.prepareWorkspace(invalid_policy));
+    try phase.initInto(descriptor);
+    try std.testing.expectError(error.InvalidShape, phase.prepareWorkspace(invalid_policy));
 
     var fused = descriptor;
     fused.hidden = 1024;
