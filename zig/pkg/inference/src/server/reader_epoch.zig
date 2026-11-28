@@ -654,7 +654,7 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
         /// it under the same lane as its producer, before the page/epoch dies.
         pub fn retireProjected(ctx: *LightOnStreamContext, projected: *qwen3vl_projector.ProjectedImages) void {
             if (projected.device_embeddings != null) {
-                ctx.lockStepForCleanup(.projected_image_cleanup);
+                ctx.lockStepForCleanup();
                 defer ctx.unlockStep();
                 projected.deinitWithCleanup(.{ .boundary = ctx.cleanup_owner.epoch(), .operation = if (ctx.cb) |*backend| backend.operationToken() else null });
             } else projected.deinit();
@@ -754,10 +754,12 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
                 @import("../ops/cuda/cuda_compute.zig").CudaCompute.invalidateLightOnDecodeGraphWithCleanup(cb, .{ .boundary = ctx.cleanup_owner.epoch(), .operation = cb.operationToken() }, reason) catch platform.inference_process_supervisor.restartWorker();
             };
         }
-        pub fn lockStepForCleanup(ctx: *LightOnStreamContext, reason: @import("../ops/cuda/cuda_compute.zig").CudaCompute.GraphRetirement) void {
+        pub fn lockStepForCleanup(ctx: *LightOnStreamContext) void {
+            // Projected prompt rows are consumed during prefill. Decode graphs
+            // embed their own tokens and retain their cache roots explicitly.
+            // Page retirement invalidates its recurrent and KV dependencies
+            // at the corresponding provider release.
             ctx.pageAccess(.{}, true).acquireForCleanup();
-            // Managed page retirement invalidates its actual recurrent and KV bindings.
-            if (reason != .page_state_cleanup) ctx.invalidateCudaDecodeGraph(reason);
         }
         pub fn releasePageBudget(ctx: *LightOnStreamContext, reserved: runtime.tier.memory.AdmissionAmounts) void {
             ctx.pageAccess(.{}, true).acquireForCleanup();

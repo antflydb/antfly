@@ -10445,7 +10445,7 @@ pub const Node = struct {
         state.kv_storage = &ctx.storage;
         state.kv_lock = &ctx.kv_mutex;
         defer {
-            ctx.lockStepForCleanup(.page_state_cleanup);
+            ctx.lockStepForCleanup();
             if (state.qwen35_linear_cache) |cache| {
                 ctx.recurrent_cache_pages += 1;
                 for (cache.layers) |layer| ctx.host_recurrent_bytes_total +|= (layer.conv.len + layer.recurrent.len) * @sizeOf(f32);
@@ -57994,7 +57994,7 @@ test "LightOn public CUDA Reader Executor H1024 captures and replays exact two-p
                 probe.ctx = null;
                 if (ctx) |actual| {
                     if (state_count != 0) {
-                        actual.lockStepForCleanup(.page_state_cleanup);
+                        actual.lockStepForCleanup();
                         for (0..state_count) |row| if (state_live[row]) {
                             state[row].deinitWithCleanup(.{ .boundary = actual.cleanup_owner.epoch(), .operation = if (actual.cb) |*cb| cb.operationToken() else null }) catch platform.inference_process_supervisor.restartWorker();
                             state_live[row] = false;
@@ -58101,7 +58101,7 @@ test "LightOn public CUDA Reader Executor H1024 captures and replays exact two-p
                 }
                 var embeddings: ?ops.CT = null;
                 defer if (embeddings) |value| {
-                    actual.lockStepForCleanup(.projected_image_cleanup);
+                    actual.lockStepForCleanup();
                     cb.freeWithCleanup(value, .{ .boundary = actual.cleanup_owner.epoch(), .operation = cb.operationToken() });
                     actual.unlockStep();
                 };
@@ -58271,7 +58271,7 @@ test "LightOn public CUDA Reader Executor H1024 captures and replays exact two-p
             for (0..state_count) |row| try std.testing.expectEqual(@as(usize, prefix_tokens + tokens_per_page - 1), state[row].total_tokens);
             probe.phase = .cleanup;
             probe.row = null;
-            actual.lockStepForCleanup(.page_state_cleanup);
+            actual.lockStepForCleanup();
             for (0..state_count) |row| {
                 state[row].deinitWithCleanup(.{ .boundary = actual.cleanup_owner.epoch(), .operation = cb.operationToken() }) catch platform.inference_process_supervisor.restartWorker();
                 state_live[row] = false;
