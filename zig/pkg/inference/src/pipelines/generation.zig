@@ -5122,19 +5122,21 @@ pub const NativeGenerationPipeline = struct {
         allow_resident_greedy: bool,
     ) !PrefillOutput {
         if (prepared.plan.tokenCount() != seq_len or !decode_state.isPaged()) return error.InvalidPreparedPrompt;
-        // A chunk-sized epoch workspace cannot admit the direct full-prefix
-        // fallback. Reject unsupported routing before cache or GPU mutation.
-        if (self.prepared_qwen_prefill_chunk_rows != 0 and
-            (self.qwen_prefill_batch == null or prepared.deepstack_layer_count != 0)) return error.InvalidPreparedPrompt;
+        const route = try decoder_prefill.PositionedRoute.select(
+            self.prepared_qwen_prefill_chunk_rows,
+            self.qwen_prefill_batch != null,
+            prepared.deepstack_layer_count,
+        );
         var numerical = self.prefillRuntime(decode_state, directPrefillExecutionMutex(true, false, false, self.execution_lock));
         try numerical.resetRecurrentPrompt();
-        if (self.qwen_prefill_batch) |hook| if (prepared.deepstack_layer_count == 0) {
+        if (route == .scheduled) {
+            const hook = self.qwen_prefill_batch.?;
             var publication = StepPublication{ .scheduler = self.scheduler orelse return error.InvalidBatchDecodeState, .lease = self.scheduler_lease orelse return error.InvalidBatchDecodeState, .vocab_size = self.gpt_config.vocab_size };
             const wants_greedy = numerical.positionedWantsGreedy(decoderRouteRequest(config), allow_resident_greedy, self.prefillNeedsHostLogits(config));
             var request = try self.positionedRequest(prepared, decode_state, seq_len, wants_greedy, publication.interface());
             defer self.mergeStepExecutor(&request.executor);
             return hook.run_fn(hook.ptr, &request);
-        };
+        }
         const direct_prefill_turn_acquired = try self.beginPreparedPrefillTurn(seq_len);
         defer if (direct_prefill_turn_acquired) self.scheduler.?.finishTurn(self.scheduler_lease.?, .prefill);
         const work_trace = enableGenerationStageDebug();

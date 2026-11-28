@@ -1592,6 +1592,19 @@ pub const ScheduledStep = struct {
     };
 };
 
+/// A scheduled prefix can use its chunk-sized epoch workspace. A direct
+/// prefix requires storage for the complete prompt, including deep-stack work.
+pub const PositionedRoute = enum {
+    direct,
+    scheduled,
+
+    pub fn select(chunk_rows: usize, scheduler_available: bool, deepstack_layers: usize) !PositionedRoute {
+        if (scheduler_available and deepstack_layers == 0) return .scheduled;
+        if (chunk_rows != 0) return error.InvalidPreparedPrompt;
+        return .direct;
+    }
+};
+
 /// One borrowed positioned-prefix request. Queue work and its prefix remain
 /// stack-owned until the existing wait protocol publishes ready or drains it.
 /// Physical execution never borrows a task pipeline or tokenizer.
