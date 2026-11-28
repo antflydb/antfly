@@ -7220,6 +7220,12 @@ fn decoderBlockImpl(
             q_projected_owned = false;
             break :transfer_q .{ q_projected, null };
         } else split_q: {
+            if (comptime build_options.enable_cuda) {
+                if (cb.kind() == .cuda and config.hasQwen35VisionArchitectureContract()) {
+                    if (try @import("../ops/cuda/cuda_compute.zig").tryCapturedSplitQueryGate(cb, q_projected, total, num_heads, head_dim)) |assigned|
+                        break :split_q .{ assigned[0], assigned[1] };
+                }
+            }
             const split = try cb.splitPerHeadGate(q_projected, total, num_heads, head_dim);
             break :split_q .{ split.query, split.gate };
         };

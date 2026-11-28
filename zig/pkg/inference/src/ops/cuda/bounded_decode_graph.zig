@@ -435,9 +435,12 @@ pub const GraphPhase = struct {
             const offset = try StorageLayout.aligned(try self.storage_layout.layerLiveBytes());
             self.storage_layout.attention_residual = try self.storage_layout.declareLayerRegion(offset, bytes);
         }
-        if (policy.fused_attention_inputs and self.descriptor.attention_layers != 0) {
+        if (self.descriptor.attention_layers != 0 and
+            (policy.fused_attention_inputs or (policy.layer_norm and self.descriptor.attention_q_gate)))
+        {
             const geometry = self.descriptor.attention_geometry orelse return error.InvalidShape;
-            if (AttentionInputs.supports(geometry.heads, geometry.kv_heads, geometry.dim)) {
+            const fused = policy.fused_attention_inputs and AttentionInputs.supports(geometry.heads, geometry.kv_heads, geometry.dim);
+            if (fused or self.descriptor.attention_q_gate) {
                 const inputs = try AttentionInputs.init(self.descriptor.rows, geometry.heads, geometry.kv_heads, geometry.dim);
                 const offset = try StorageLayout.aligned(try self.storage_layout.layerLiveBytes());
                 self.storage_layout.attention_inputs = try self.storage_layout.declareLayerRegion(offset, inputs.bytes);
@@ -1003,6 +1006,18 @@ pub const Module = struct {
         return try projection_bank.borrowRange(offset, bytes);
     }
 
+    pub fn bindSplitQueryGate(self: *const Module, bytes: usize) !?[2]buffer.DeviceBuffer {
+        const layout = self.storage_layout orelse return error.InvalidExecutionPlan;
+        const span = layout.attention_inputs orelse return null;
+        if (layout.attention_projection_bytes[0] != try std.math.mul(usize, bytes, 2)) return error.InvalidExecutionPlan;
+        const key_bytes = layout.attention_projection_bytes[1];
+        const backing = try self.bindLayerWorkspace(layout, span, span.bytes);
+        return .{
+            try backing.borrowRange(0, bytes),
+            try backing.borrowRange(try std.math.add(usize, bytes, key_bytes), bytes),
+        };
+    }
+
     pub fn bindAttentionInputs(self: *const Module, inputs: AttentionInputs) !?[3]buffer.DeviceBuffer {
         const layout = self.storage_layout orelse return error.InvalidExecutionPlan;
         const span = layout.attention_inputs orelse return null;
@@ -1247,6 +1262,14 @@ test "bounded CUDA decoder shares declared attention and recurrent workspace" {
         try std.testing.expectEqual(k_dst.ptr + k_dst.len, v_dst.ptr);
         try std.testing.expect(v_dst.ptr + v_dst.len <= projection_owner.metadata.ptr + projection_layout.projection_staging.?.offset);
         try std.testing.expectError(error.InvalidExecutionPlan, projection_owner.bindAttentionProjection(.query, q_bytes - @sizeOf(f32)));
+        if (gated) {
+            const split = (try projection_owner.bindSplitQueryGate(q_bytes / 2)).?;
+            try std.testing.expectEqual(q_bytes / 2, split[0].len);
+            try std.testing.expectEqual(q_bytes / 2, split[1].len);
+            try std.testing.expect(split[1].ptr + split[1].len <= q_dst.ptr);
+        } else {
+            try std.testing.expect((try projection_owner.bindSplitQueryGate(q_bytes)) == null);
+        }
     }
 
     var fused = descriptor;

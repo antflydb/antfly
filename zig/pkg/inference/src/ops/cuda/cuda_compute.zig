@@ -29950,6 +29950,32 @@ pub fn tryCapturedFinalNorm(cb: *const ops.ComputeBackend, input: CT, weight: CT
     return try rmsNormWithDestination(cb.ptr, input, weight, dim, eps, destination, mirror);
 }
 
+pub fn tryCapturedSplitQueryGate(cb: *const ops.ComputeBackend, input: CT, rows: usize, heads: usize, dim: usize) !?[2]CT {
+    if (!acceptsPhysicalImplementation(cb.vtable)) return null;
+    const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
+    const owner = &self.bounded_decode_graph;
+    if (!owner.active or self.capability_profile != .lightonocr3 or rows != owner.rows) return null;
+    const width = try checkedMul(heads, dim);
+    const count = try checkedMul(rows, width);
+    const bytes = try checkedMul(count, @sizeOf(f32));
+    const destinations = (try owner.bindSplitQueryGate(bytes)) orelse return null;
+    const source = tensorFromCt(input);
+    try ensureF32(source);
+    try ensureCount(source, try checkedMul(count, 2));
+    try buffer_mod.validateRegions(3, .{ source.buffer, destinations[0], destinations[1] }, .{ try checkedMul(bytes, 2), bytes, bytes }, @splat(@alignOf(f32)), 1);
+    var query = try OwnedF32Output.fromOwnedShapeDestination(self, try allocShape2(self.allocator, rows, width), count, bytes, destinations[0]);
+    defer query.deinit();
+    var gate = try OwnedF32Output.fromOwnedShapeDestination(self, try allocShape2(self.allocator, rows, width), count, bytes, destinations[1]);
+    defer gate.deinit();
+    const head_rows = try checkedMul(rows, heads);
+    const source_width = try checkedMul(dim, 2);
+    try self.kernels.launchSliceLastDimF32(&self.ctx, query.buffer, source.buffer, head_rows, source_width, 0, dim);
+    self.stats.launch_other += 1;
+    try self.kernels.launchSliceLastDimF32(&self.ctx, gate.buffer, source.buffer, head_rows, source_width, dim, dim);
+    self.stats.launch_other += 1;
+    return .{ query.intoTensor(), gate.intoTensor() };
+}
+
 pub fn tryCapturedQkvProjection(cb: *const ops.ComputeBackend, input: CT, weight: CT, rows: usize, in_dim: usize, out_dim: usize, kind: @import("bounded_decode_graph.zig").Module.AttentionProjection) !?CT {
     if (!acceptsPhysicalImplementation(cb.vtable)) return null;
     const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
