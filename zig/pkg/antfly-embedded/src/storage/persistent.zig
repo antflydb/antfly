@@ -5460,6 +5460,8 @@ pub const PersistentIndex = struct {
             old: Map = .empty,
             /// Capacity the next table needs; 0 while none is wanted.
             wanted: usize = 0,
+            /// Bumped by every swap: see `SegmentVersions.table`.
+            generation: u32 = 0,
 
             fn get(self: *const RouteMap, version: u64) ?Location {
                 return self.live.get(version) orelse self.old.get(version);
@@ -5491,12 +5493,16 @@ pub const PersistentIndex = struct {
             by_version: std.AutoHashMapUnmanaged(u64, u32) = .empty,
             node: std.DoublyLinkedList.Node = .{},
             queue: Queue = .pending,
+            /// The route table generation its entries belong to. A routed
+            /// segment from an older generation is rerouting, and a pending
+            /// one restarts, so a swap retags nothing.
+            table: u32 = 0,
             /// Column entries its queue has walked: rerouting walks down
             /// from a routed segment's end, so a whole table's segments
             /// start rerouting in O(1).
             cursor: usize = 0,
 
-            const Queue = enum { pending, routed, rerouting, retiring };
+            const Queue = enum { pending, routed, retiring };
 
             /// Decodes the column; `indexed` also builds the lookup a
             /// pending segment answers through. Needs no lock.
@@ -5554,6 +5560,7 @@ pub const PersistentIndex = struct {
             if (slot.found_existing) return error.InvalidSegment;
             slot.value_ptr.* = index;
             index.queue = .pending;
+            index.table = self.route.generation;
             index.cursor = 0;
             self.pending.append(&index.node);
             self.pending_versions += index.column.len;
@@ -5567,8 +5574,7 @@ pub const PersistentIndex = struct {
                     self.pending.remove(&index.node);
                     self.pending_versions -= index.column.len - index.cursor;
                 },
-                .routed => self.routed.remove(&index.node),
-                .rerouting => self.rerouting.remove(&index.node),
+                .routed => if (index.table == self.route.generation) self.routed.remove(&index.node) else self.rerouting.remove(&index.node),
                 .retiring => unreachable,
             }
             index.by_version.clearAndFree(alloc);
@@ -5623,7 +5629,7 @@ pub const PersistentIndex = struct {
                 }
                 if (index.cursor != 0) break;
                 self.rerouting.remove(&index.node);
-                index.queue = .routed;
+                index.table = self.route.generation;
                 index.cursor = index.column.len;
                 self.routed.append(&index.node);
                 if (left != 0) left -= 1;
@@ -5642,6 +5648,12 @@ pub const PersistentIndex = struct {
             var left = budget;
             while (left != 0) {
                 const index = SegmentVersions.of(self.pending.first orelse break);
+                // Its routed part was in a replaced table: restart.
+                if (index.table != self.route.generation) {
+                    self.pending_versions += index.cursor;
+                    index.cursor = 0;
+                    index.table = self.route.generation;
+                }
                 const room: usize = self.route.live.available;
                 const end = @min(index.column.len, index.cursor + @min(left, room));
                 left -= end - index.cursor;
@@ -5669,9 +5681,10 @@ pub const PersistentIndex = struct {
             self.route.wanted = 2 * (self.route.live.count() + self.pending_versions) + step_budget;
         }
 
-        /// Swaps in `table`, allocated outside the lock: routed segments
-        /// reroute into it in bounded steps, and pending ones restart, since
-        /// their routed part sits in the table being replaced.
+        /// Swaps in `table`, allocated outside the lock, in O(1): routed
+        /// segments reroute into it in bounded steps, and pending ones
+        /// restart when next routed, since their routed part sits in the
+        /// table being replaced. The generation marks both.
         fn swapTableLocked(self: *VersionLocations, table: *RouteMap.Map) void {
             std.debug.assert(self.route.old.capacity() == 0 and self.rerouting.first == null);
             self.route.old = self.route.live;
@@ -5681,14 +5694,7 @@ pub const PersistentIndex = struct {
             self.route.wanted = 0;
             self.rerouting = self.routed;
             self.routed = .{};
-            var it = self.rerouting.first;
-            while (it) |node| : (it = node.next) SegmentVersions.of(node).queue = .rerouting;
-            it = self.pending.first;
-            while (it) |node| : (it = node.next) {
-                const index = SegmentVersions.of(node);
-                self.pending_versions += index.cursor;
-                index.cursor = 0;
-            }
+            self.route.generation +%= 1;
         }
 
         /// Routes and unroutes everything queued, one bounded step per lock
@@ -10890,6 +10896,33 @@ test "persistent index version routes move in bounded steps" {
     try std.testing.expectEqual(@as(u32, 0), locations.route.old.capacity());
     try std.testing.expectEqual(@as(u32, count), locations.route.live.count());
     try std.testing.expectEqual(@as(u32, 0), locations.route.get(1000).?.local_id);
+
+    // A swap retags no segment: a partly routed pending one restarts, and a
+    // rerouting one detached mid-way leaves the old generation's list.
+    {
+        try attachVersionLocationsTestSegment(alloc, &locations, 21, 600_000, 10);
+        try attachVersionLocationsTestSegment(alloc, &locations, 20, 500_000, count);
+        while (locations.segments.get(21).?.queue == .pending) locations.advanceLocked(alloc);
+        const partial = locations.segments.get(20).?;
+        try std.testing.expect(partial.queue == .pending and partial.cursor != 0);
+        var second: VersionLocations.RouteMap.Map = .empty;
+        defer second.deinit(alloc);
+        try second.ensureTotalCapacity(alloc, 8 * count);
+        const generation = locations.route.generation;
+        locations.swapTableLocked(&second);
+        try std.testing.expectEqual(generation +% 1, locations.route.generation);
+        try std.testing.expect(partial.cursor != 0 and partial.table == generation);
+        try std.testing.expectEqual(@as(u64, 21), VersionLocations.SegmentVersions.of(locations.rerouting.last.?).seg_id);
+        locations.detachLocked(alloc, 21);
+        try std.testing.expect(locations.rerouting.last == null or VersionLocations.SegmentVersions.of(locations.rerouting.last.?).seg_id != 21);
+        locations.settle(alloc);
+        try std.testing.expectEqual(locations.route.generation, partial.table);
+        try std.testing.expectEqual(@as(u32, count - 1), locations.route.get(500_000 + count - 1).?.local_id);
+        try std.testing.expect(locations.route.get(600_000) == null);
+        try std.testing.expectEqual(@as(u32, 0), locations.route.get(1000).?.local_id);
+        locations.detachLocked(alloc, 20);
+        locations.settle(alloc);
+    }
 
     // Retirement keeps half of every step however much routing is queued.
     try attachVersionLocationsTestSegment(alloc, &locations, 8, 100_000, count);

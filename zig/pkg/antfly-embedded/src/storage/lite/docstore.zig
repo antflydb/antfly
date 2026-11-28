@@ -100,6 +100,85 @@ test "lite detached writer admission fences documents and index catalogs" {
     try std.testing.expectEqual(@as(usize, 0), admission.active);
 }
 
+// lite-cross-process-commit-sealing.md §5.4: a lease handoff waits for the
+// last admitted append, never a seal: neither one a leader runs, nor one the
+// handoff's own drive would otherwise run before returning.
+test "lite pipelined lease handoff waits for appends, not seals" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    const Admission = struct {
+        fn enter(_: *anyopaque, _: PublicationScope) !void {}
+        fn leave(_: *anyopaque) void {}
+    };
+    const Put = struct {
+        fn apply(ctx: *anyopaque, file: *native.NativeFile) !void {
+            const key: *const []const u8 = @ptrCast(@alignCast(ctx));
+            try file.putDocument(key.*, "value");
+        }
+    };
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "pipelined-handoff.aflite");
+    defer a.free(path);
+    var store = try Store.createWithOptions(a, path, .{ .io = io, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    store.maintenance_start_suppressed = true;
+    try store.file.releaseWriterOwnership();
+    var token: u8 = 0;
+    store.writer_admission = .{ .ptr = &token, .enter = Admission.enter, .leave = Admission.leave };
+    defer store.writer_admission = null;
+    const delay_ns: u64 = 400 * std.time.ns_per_ms;
+
+    // Queued with no leader: the handoff appends it and returns; the seal
+    // follows once the lease is gone.
+    {
+        var lease = try native.lockWriterPathWithIo(a, io, path);
+        var key: []const u8 = "queued";
+        // A ride-along member leads nothing: queued with no leader.
+        const staged = try store.enqueueRequest(.{ .context = @ptrCast(&key), .apply = Put.apply }, true);
+        store.file.test_sync_delay_ns.store(delay_ns, .monotonic);
+        const started = std.Io.Clock.awake.now(io).nanoseconds;
+        store.prepareLeaseHandoff();
+        const took: u64 = @intCast(std.Io.Clock.awake.now(io).nanoseconds - started);
+        lease.close();
+        try std.testing.expect(took < delay_ns);
+        try std.testing.expect(staged.request.appended and !staged.request.done);
+        store.sealAfterHandoff();
+        try staged.ticket().wait();
+        store.file.test_sync_delay_ns.store(0, .monotonic);
+    }
+
+    // A leader sealing its group does not hold the handoff either.
+    {
+        var lease = try native.lockWriterPathWithIo(a, io, path);
+        var key: []const u8 = "led";
+        const staged = try store.enqueue(.{ .context = @ptrCast(&key), .apply = Put.apply });
+        store.file.test_sync_delay_ns.store(delay_ns, .monotonic);
+        try std.testing.expect(staged.become_leader);
+        const thread = try std.Thread.spawn(.{}, Store.Staged.drive, .{staged});
+        const region = (try store.file.regionForInode()).?;
+        var waited: usize = 0;
+        while (!staged.request.appended and waited < 10_000) : (waited += 1) std.Io.sleep(io, .fromMilliseconds(1), .awake) catch {};
+        try std.testing.expect(staged.request.appended);
+        const started = std.Io.Clock.awake.now(io).nanoseconds;
+        store.prepareLeaseHandoff();
+        const took: u64 = @intCast(std.Io.Clock.awake.now(io).nanoseconds - started);
+        lease.close();
+        try std.testing.expect(took < delay_ns / 2);
+        thread.join();
+        try staged.ticket().wait();
+        try std.testing.expect(region.sealState().sealed_sequence >= store.file.committedSequence());
+        store.file.test_sync_delay_ns.store(0, .monotonic);
+    }
+    var reopened = try native.NativeFile.openWithIo(a, io, path, .{ .read_only = true, .internal_reader = true });
+    defer reopened.close();
+    for ([_][]const u8{ "queued", "led" }) |key| {
+        const value = (try reopened.getDocumentAlloc(a, key)) orelse return error.TestUnexpectedResult;
+        a.free(value);
+    }
+}
+
 test "lite physical catalog change fences only the changed index scope" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -2918,6 +2997,10 @@ const MutationRequest = struct {
     complete: ?Store.MutationPlan.Completion = null,
     next: ?*MutationRequest = null,
     done: bool = false,
+    /// Appended and published, awaiting the seal stage (`runSealStage`).
+    appended: bool = false,
+    /// The next appended batch's head, on the seal stage's list.
+    seal_next: ?*MutationRequest = null,
     durable: bool = true,
     index_only: bool = false,
     artifact_lease: bool = false,
@@ -3248,6 +3331,15 @@ pub const Store = struct {
     /// The draining leader is applying (appending) a group; false while it
     /// seals one. See `prepareLeaseHandoff`.
     commit_applying: bool = false,
+    /// The seal stage (lite-cross-process-commit-sealing.md §5.3): appended
+    /// batches awaiting a seal, oldest first, under `commit_mutex`. It runs
+    /// apart from the append stage, so a lease handoff waits for appends
+    /// only. `seal_context` is the newest batch's, with the oldest batch's
+    /// cut generation: a cut since any of them leaves all uncertain.
+    seal_head: ?*MutationRequest = null,
+    seal_tail: ?*MutationRequest = null,
+    seal_context: ?native.NativeFile.SealContext = null,
+    seal_running: bool = false,
     /// Group-commit bounds (WS2): at most this many staged requests, or this
     /// many estimated bytes, join one native transaction/fsync. A single
     /// request larger than `group_max_bytes` still forms its own group of
@@ -5787,6 +5879,13 @@ pub const Store = struct {
             const io = self.store.file.runtime();
             self.store.commit_mutex.lockUncancelable(io);
             while (!self.request.done) {
+                // Appended with nobody sealing (a handoff appended it): seal.
+                if (self.request.appended and !self.store.seal_running and self.store.seal_head != null) {
+                    self.store.commit_mutex.unlock(io);
+                    self.store.runSealStage();
+                    self.store.commit_mutex.lockUncancelable(io);
+                    continue;
+                }
                 if (self.request.ride_along and self.heldByMaintenance()) {
                     // A leader already draining covers this request: wait
                     // for its group to complete instead of retrying the
@@ -6126,7 +6225,9 @@ pub const Store = struct {
     /// (lite-cross-process-commit-sealing.md §5.4), so a group's seal no
     /// longer holds the lease. Otherwise the group must be durable first.
     pub fn prepareLeaseHandoff(self: *Store) void {
-        if (!self.file.pipelined_seal) {
+        // Decided here, not by whether a group has pipelined yet: the
+        // handoff may drive this store's first group.
+        if (!self.pipelineSeal()) {
             self.ensureDurableForReuse();
             self.sync() catch {};
             return;
@@ -6136,8 +6237,11 @@ pub const Store = struct {
         const become_leader = self.commit_head != null and !self.commit_draining;
         if (become_leader) self.commit_draining = true;
         self.commit_mutex.unlock(io);
-        if (become_leader) self.driveMutationCoordinator(true, null);
+        // Append only: sealing after the lease goes is `sealAfterHandoff`.
+        if (become_leader) self.driveMutationStages(true, null, false);
         self.commit_mutex.lockUncancelable(io);
+        // A leader elsewhere seals only after its appends, so this waits for
+        // the last admitted append, never a barrier.
         while (self.commit_applying or (self.commit_head != null and self.commit_draining)) self.commit_ready.waitUncancelable(io, &self.commit_mutex);
         self.commit_mutex.unlock(io);
     }
@@ -6168,6 +6272,11 @@ pub const Store = struct {
         const io = self.file.runtime();
         self.commit_mutex.lockUncancelable(io);
         while (self.commit_draining) self.commit_ready.waitUncancelable(io, &self.commit_mutex);
+        self.commit_mutex.unlock(io);
+        // Durable means sealed: finish the seal stage too.
+        self.runSealStage();
+        self.commit_mutex.lockUncancelable(io);
+        while (self.seal_running) self.commit_ready.waitUncancelable(io, &self.commit_mutex);
         self.commit_mutex.unlock(io);
     }
 
@@ -6628,6 +6737,13 @@ pub const Store = struct {
     /// batch of ride-along-only members, all `durable = false`, would take
     /// the deferred-publication path and never actually fsync.
     fn driveMutationCoordinator(self: *Store, force_durable: bool, own_request: ?*MutationRequest) void {
+        self.driveMutationStages(force_durable, own_request, true);
+    }
+
+    /// The append stage, then, when `seal`, the seal stage for what it
+    /// appended. A handoff appends only; its batches' waiters, or the lane
+    /// after the lease goes, seal them.
+    fn driveMutationStages(self: *Store, force_durable: bool, own_request: ?*MutationRequest, seal: bool) void {
         const io = self.file.runtime();
         // Group commit: writers stage one at a time under the writer lane,
         // so a writer still staging when this leader drains would otherwise
@@ -6667,12 +6783,19 @@ pub const Store = struct {
             // Appended: a lease handoff need not wait for the seal.
             self.commit_mutex.lockUncancelable(io);
             self.commit_applying = false;
+            const queued_seal: ?native.NativeFile.SealContext = if (applied) |maybe| maybe else |_| null;
+            if (queued_seal) |pending| {
+                self.queueForSealLocked(head, pending);
+                const stop_here = if (own_request) |req| (req.done or req.appended) and self.non_ride_along_pending_count == 0 else false;
+                if (stop_here) self.commit_draining = false;
+                self.commit_ready.broadcast(io);
+                self.commit_mutex.unlock(io);
+                if (stop_here) break;
+                continue;
+            }
             self.commit_ready.broadcast(io);
             self.commit_mutex.unlock(io);
-            const result: anyerror!void = if (applied) |seal|
-                (if (seal) |pending| self.sealGroup(pending) else {})
-            else |err|
-                err;
+            const result: anyerror!void = if (applied) |_| {} else |err| err;
             var completed: ?*MutationRequest = head;
             while (completed) |item| : (completed = item.next) {
                 // A group failure supersedes every per-member result.
@@ -6707,7 +6830,7 @@ pub const Store = struct {
             // it forever (observed live: a derived worker deadlocked
             // against the main thread waiting on it, both parked, nothing
             // left to ever lead the queue again).
-            const stop_here = if (own_request) |req| req.done and self.non_ride_along_pending_count == 0 else false;
+            const stop_here = if (own_request) |req| (req.done or req.appended) and self.non_ride_along_pending_count == 0 else false;
             if (stop_here) self.commit_draining = false;
             self.commit_ready.broadcast(io);
             self.commit_mutex.unlock(io);
@@ -6717,6 +6840,7 @@ pub const Store = struct {
             }
             if (stop_here) break;
         }
+        if (seal) self.runSealStage();
         // Start after publication, and only once -- after this leader's
         // entire queue (including anything staged while it was draining
         // earlier batches) is confirmed empty. Calling this per-batch,
@@ -7166,6 +7290,69 @@ pub const Store = struct {
             return false;
         };
         return true;
+    }
+
+    fn queueForSealLocked(self: *Store, head: *MutationRequest, seal: native.NativeFile.SealContext) void {
+        var item: ?*MutationRequest = head;
+        while (item) |member| : (item = member.next) member.appended = true;
+        var context = seal;
+        if (self.seal_context) |queued| context.pending.cut_generation = queued.pending.cut_generation;
+        self.seal_context = context;
+        head.seal_next = null;
+        if (self.seal_tail) |tail| tail.seal_next = head else self.seal_head = head;
+        self.seal_tail = head;
+    }
+
+    /// The seal stage: one seal covers every appended batch queued so far,
+    /// then their members complete. One runner at a time; another caller
+    /// returns at once, and its batches complete with the runner's.
+    pub fn runSealStage(self: *Store) void {
+        const io = self.file.runtime();
+        while (true) {
+            self.commit_mutex.lockUncancelable(io);
+            if (self.seal_running or self.seal_head == null) {
+                self.commit_mutex.unlock(io);
+                return;
+            }
+            self.seal_running = true;
+            const batches = self.seal_head;
+            const context = self.seal_context.?;
+            self.seal_head = null;
+            self.seal_tail = null;
+            self.seal_context = null;
+            self.commit_mutex.unlock(io);
+
+            const result = self.sealGroup(context);
+            var batch = batches;
+            while (batch) |head| : (batch = head.seal_next) {
+                var item: ?*MutationRequest = head;
+                while (item) |member| : (item = member.next) {
+                    result catch |err| {
+                        member.result = err;
+                    };
+                    if (member.complete) |complete| {
+                        const outcome: anyerror!u64 = if (member.result) |_| member.committed_sequence else |err| err;
+                        complete(member.context, outcome);
+                    }
+                }
+            }
+            self.commit_mutex.lockUncancelable(io);
+            batch = batches;
+            while (batch) |head| : (batch = head.seal_next) {
+                var item: ?*MutationRequest = head;
+                while (item) |member| : (item = member.next) member.done = true;
+            }
+            self.seal_running = false;
+            self.commit_ready.broadcast(io);
+            self.commit_mutex.unlock(io);
+        }
+    }
+
+    /// After a lane let the lease go: seal what the handoff appended. The
+    /// seal needs no lease, so a group whose waiters are gone, or never
+    /// existed, still becomes durable with no later writer.
+    pub fn sealAfterHandoff(self: *Store) void {
+        if (self.file.pipelined_seal) self.runSealStage();
     }
 
     /// Seals a pipelined group without the store lock, then adopts the
@@ -11828,7 +12015,7 @@ test "lite maintenance upgrades a v11 redo file without reclamation debt" {
     defer store.close();
     try std.testing.expectEqual(native.format_version, store.file.header.diskFormatVersion());
     try store.maintainOnce(false);
-    try std.testing.expectEqual(native.segmented_redo_format_version | native.sealed_redo_format_bit, store.file.header.diskFormatVersion());
+    try std.testing.expectEqual(native.segmented_redo_format_version | native.sealed_redo_format_bit | native.sealed_tail_format_bit, store.file.header.diskFormatVersion());
     var read = try store.beginRead();
     defer read.abort();
     try std.testing.expectEqualStrings("old", try read.get("doc"));

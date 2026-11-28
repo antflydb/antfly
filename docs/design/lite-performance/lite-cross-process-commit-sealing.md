@@ -61,8 +61,17 @@ made it.
 
 ## 4. Shared state
 
-These are new region fields, so the region format version is bumped. All of
-them are guarded by one seqlock.
+These are new region fields, so the region format version is bumped (v8).
+
+- **The appended tail is double-buffered.** Publication `n` fills slot `n & 1`, which no reader is directed to. Each slot carries a checksum over its fields and `n`. Only then does `tail_published` advance to `n`.
+  - A writer that dies anywhere in a publish leaves publication `n - 1` current and whole, so no state needs repair.
+  - A reader retries only while a live writer refills the slot it is reading.
+  - A reset is a single store of zero.
+
+**Compatibility fence.** An older binary treats a v8 region as corrupt and may fall back to regionless access, so the region version cannot fence it out. Instead, every protected file this binary creates or publishes carries the data file's `sealed_tail_format_bit`.
+- An older binary's version check rejects the bit, so it fails at open, or on its next resync, before any mutation.
+- Pipelining requires the bit. Older files keep syncing under the lease and stay fully usable by both versions.
+- This was checked with real libraries in both directions: v6 refuses a new file; v6 and v8 share an old one sequentially; and concurrent cross-version holders get `FileBusy`.
 
 | Field | Meaning |
 |---|---|
@@ -100,8 +109,11 @@ Run by a waiter holding the seal lock:
 
 1. If the file is poisoned, stop.
 2. Read `A`.
-3. If `A` is from another run, or `A.sequence` is at or below `F.sequence`,
-   the file is already sealed: release the lock and return.
+3. If `A.sequence` is at or below the sealed sequence, return.
+4. If the frontier slot on disk already covers `A`, a takeover, a fold or a dead sealer wrote it. A dead sealer may have died between writing the slot and syncing it, so:
+   - unless the region holds a matching synced-frontier proof, sync now;
+   - publish the watermark;
+   - only then announce the seal.
 4. `syncRedoData()`.
 5. Write the next frontier slot `{salt, A.sequence, A.end_offset, segment}`,
    then `syncRedoData()`.
@@ -143,9 +155,15 @@ own commit: the idle path.
 
 ### 5.4 Lease release
 
+The append stage and the seal stage are scheduled independently.
+- A leader appends every group it drains. Appended batches queue for the seal stage.
+- One seal stage runner seals the newest batch, which covers all queued batches, and then completes them.
+- A handoff waits only until admission is closed and the last admitted append is published. When no leader is running, it drives the append stage itself, without sealing.
+- After the lease goes, the releasing lane runs the seal stage (`sealAfterHandoff`), so a group with no waiters still becomes durable with no later writer.
+- Waiters whose batch is appended help run the seal stage too.
+
 A lease release no longer needs durability. It needs every drained member's
-records appended and `A` published, which `ensureDurableForReuse` (renamed to
-reflect it) guarantees by draining the queue. The `store.sync()` at the
+records appended and `A` published, which `prepareLeaseHandoff` guarantees. The `store.sync()` at the
 release sites goes, and the lane can hand off right after a group appends
 when a foreign writer waits.
 
@@ -208,11 +226,12 @@ Cross-process fork tests (the `exerciseForeignRedoSuffix` and `xprocRunTest`
 patterns), with the child killed at each boundary:
 
 1. after its records are written, before `A` is published;
+1a. mid-publication of `A`, after the next slot is filled and before it is published (`test_tail_publish_crash`);
 2. after `A`, before the lease is released;
 3. after the lease is released, with no other writer: the parent waiter
    seals (the idle queue);
 4. while sealing, after the data fsync and before the frontier write;
-5. after the frontier write, before its fsync and the `F` publication;
+5. after the frontier write, before its fsync; and after that fsync, before the proof and the `F` publication. Either way the successor must complete the barrier and publish the watermark before acknowledging;
 6. during takeover: after adopting `A`, before its own append; and after
    appending behind an adopted tail, before sealing;
 7. a torn tail behind a published `A` (bytes zeroed) is cut, and the waiter
@@ -230,7 +249,7 @@ but no half-applied group appears.
 
 ## 7. Where it lives
 
-- Region: `SealBlock` in `shared_lock_region.zig` (format v7), with
+- Region: `SealBlock` in `shared_lock_region.zig` (format v8), with
   `publishAppendedTail`, `sealState`, `noteSealed`, `noteCut`, `poisonSeal`,
   `waitSealEpoch` and `tryLockFrontierBarrier`. A cold open with no live
   peer clears poison and the appended tail.

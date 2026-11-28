@@ -1524,6 +1524,8 @@ pub const WriterLane = struct {
                 self.mutex.unlock(io);
                 if (overdue_store) |held_store| held_store.prepareLeaseHandoff();
                 overdue.close();
+                // The seal needs no lease: never hold it across one.
+                if (overdue_store) |held_store| held_store.sealAfterHandoff();
                 self.mutex.lockUncancelable(io);
                 continue;
             }
@@ -2156,6 +2158,7 @@ pub const WriterLane = struct {
         self.signalReleased(io);
         store.prepareLeaseHandoff();
         lease.close();
+        store.sealAfterHandoff();
     }
 
     /// `WriterLane` is embedded by value in `Owner` (`owner.writer_lane`),
@@ -2243,6 +2246,7 @@ pub const WriterLane = struct {
         const self = release.lane;
         if (release.store) |held_store| held_store.prepareLeaseHandoff();
         release.lease.close();
+        if (release.store) |held_store| held_store.sealAfterHandoff();
         const io = h.handleLockIo();
         self.mutex.lockUncancelable(io);
         self.checked_out = false;
@@ -2321,6 +2325,7 @@ pub const WriterLane = struct {
             held_store.prepareLeaseHandoff();
         }
         lease.close();
+        if (store) |held_store| held_store.sealAfterHandoff();
         self.mutex.lockUncancelable(io);
         self.checked_out = false;
         self.noteReleased();

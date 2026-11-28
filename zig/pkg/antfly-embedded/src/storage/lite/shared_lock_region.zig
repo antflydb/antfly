@@ -120,11 +120,13 @@ const magic: [8]u8 = "AFLLOCK1".*;
 // version mismatch always was -- including this one.
 // v6 serializes each WAL watermark publication with a crash-recoverable
 // owner word. Older writers cannot participate in this protocol.
-// v7 adds the commit-sealing block (`SealBlock`): a lease holder publishes
-// the redo it appended without syncing, and any process seals it. A v6
-// writer would hold the lease through its own barriers and never seal a
-// peer's tail, so it cannot share a file with v7 ones.
-const format_version: u32 = 7;
+// v8 adds the commit-sealing block (`SealBlock`): a lease holder publishes
+// the redo it appended without syncing, and any process seals it. An older
+// binary treats this region as corrupt and can fall back to regionless
+// access, so the region version is not the fence: a file whose writers
+// pipeline carries the data file's sealed-tail format bit, which an older
+// binary refuses to open (native.zig `sealed_tail_format_bit`).
+const format_version: u32 = 8;
 
 /// Fixed size of the header itself. The header's own `region_bytes` and
 /// `max_readers` fields (not this constant) are the source of truth for
@@ -318,24 +320,45 @@ pub const SealState = struct {
     }
 };
 
-/// The commit-sealing extension (v7), after the publication owner word.
-/// The appended tail is a seqlock tuple; the rest are single words.
+/// One published appended tail. `check` covers the fields and `stamp`, the
+/// publication number that selected this slot.
+const TailSlot = extern struct {
+    salt: std.atomic.Value(u64),
+    sequence: std.atomic.Value(u64),
+    end_offset: std.atomic.Value(u64),
+    reset_generation: std.atomic.Value(u32),
+    segment: std.atomic.Value(u32),
+    stamp: std.atomic.Value(u64),
+    check: std.atomic.Value(u64),
+
+    fn checksum(salt: u64, sequence: u64, end_offset: u64, reset_generation: u32, segment: u32, stamp: u64) u64 {
+        var hasher = std.hash.Wyhash.init(0x5ea1_7a11);
+        inline for (.{ salt, sequence, end_offset, @as(u64, reset_generation), @as(u64, segment), stamp }) |word| {
+            hasher.update(std.mem.asBytes(&word));
+        }
+        return hasher.final();
+    }
+};
+
+/// The commit-sealing extension, after the publication owner word.
+///
+/// The appended tail is double-buffered so a writer that dies mid-publish
+/// never leaves readers without a complete tuple: publication `n` fills
+/// slot `n & 1`, which no reader is directed to, and only then advances
+/// `tail_published` to `n`. The slot it leaves is publication `n - 1`,
+/// still whole. No state needs repair, and a reset is one store of zero.
 const SealBlock = extern struct {
-    tail_generation: std.atomic.Value(u32),
+    /// The current publication number; 0 when none.
+    tail_published: std.atomic.Value(u64),
     seal_epoch: std.atomic.Value(u32),
     cut_generation: std.atomic.Value(u32),
-    appended_reset_generation: std.atomic.Value(u32),
-    appended_segment: std.atomic.Value(u32),
-    _pad: u32 = 0,
-    appended_salt: std.atomic.Value(u64),
-    appended_sequence: std.atomic.Value(u64),
-    appended_offset: std.atomic.Value(u64),
     sealed_sequence: std.atomic.Value(u64),
     poison_sequence: std.atomic.Value(u64),
+    slots: [2]TailSlot,
 };
 
 comptime {
-    std.debug.assert(@sizeOf(SealBlock) == 64);
+    std.debug.assert(@sizeOf(SealBlock) == 128);
 }
 
 /// §8.3's fixed reader-slot layout: one per concurrent reader the region
@@ -1311,37 +1334,49 @@ pub const Region = struct {
     }
 
     /// Publishes the redo this lease holder appended, after its writes
-    /// returned and before anything syncs it. Lease holder only.
+    /// returned and before anything syncs it. Lease holder only (a cut runs
+    /// under the lease too). A writer that dies anywhere in here leaves the
+    /// previous publication current and whole.
     pub fn publishAppendedTail(self: *Region, tail: AppendedTail) void {
         const block = self.sealBlock();
-        const generation = block.tail_generation.load(.monotonic);
-        block.tail_generation.store(generation +% 1, .release);
-        block.appended_salt.store(tail.salt, .monotonic);
-        block.appended_reset_generation.store(tail.reset_generation, .monotonic);
-        block.appended_segment.store(tail.segment, .monotonic);
-        block.appended_sequence.store(tail.sequence, .monotonic);
-        block.appended_offset.store(tail.end_offset, .monotonic);
-        block.tail_generation.store(generation +% 2, .release);
+        const next = block.tail_published.load(.acquire) +% 1;
+        const slot = &block.slots[@intCast(next & 1)];
+        slot.salt.store(tail.salt, .monotonic);
+        slot.sequence.store(tail.sequence, .monotonic);
+        slot.end_offset.store(tail.end_offset, .monotonic);
+        slot.reset_generation.store(tail.reset_generation, .monotonic);
+        slot.segment.store(tail.segment, .monotonic);
+        slot.stamp.store(next, .monotonic);
+        slot.check.store(TailSlot.checksum(tail.salt, tail.sequence, tail.end_offset, tail.reset_generation, tail.segment, next), .release);
+        if (builtin.is_test) if (test_tail_publish_crash) std.c._exit(0);
+        block.tail_published.store(next, .release);
     }
 
-    /// The last published appended tail, or null before any.
+    /// Fork tests: the process exits after filling the next tail slot and
+    /// before publishing it.
+    pub var test_tail_publish_crash: bool = false;
+
+    /// The last published appended tail, or null before any. Retries only
+    /// while a live writer refills the slot it is reading.
     pub fn readAppendedTail(self: *const Region) ?AppendedTail {
         const block = self.sealBlock();
         while (true) {
-            const before = block.tail_generation.load(.acquire);
-            if (before & 1 != 0) {
-                std.atomic.spinLoopHint();
-                continue;
-            }
+            const published = block.tail_published.load(.acquire);
+            if (published == 0) return null;
+            const slot = &block.slots[@intCast(published & 1)];
+            const check = slot.check.load(.acquire);
             const tail: AppendedTail = .{
-                .salt = block.appended_salt.load(.monotonic),
-                .reset_generation = block.appended_reset_generation.load(.monotonic),
-                .segment = block.appended_segment.load(.monotonic),
-                .sequence = block.appended_sequence.load(.monotonic),
-                .end_offset = block.appended_offset.load(.monotonic),
+                .salt = slot.salt.load(.monotonic),
+                .reset_generation = slot.reset_generation.load(.monotonic),
+                .segment = slot.segment.load(.monotonic),
+                .sequence = slot.sequence.load(.monotonic),
+                .end_offset = slot.end_offset.load(.monotonic),
             };
-            if (block.tail_generation.load(.acquire) != before) continue;
-            return if (tail.sequence == 0) null else tail;
+            const stamp = slot.stamp.load(.monotonic);
+            if (stamp == published and check == TailSlot.checksum(tail.salt, tail.sequence, tail.end_offset, tail.reset_generation, tail.segment, stamp) and
+                block.tail_published.load(.acquire) == published)
+                return if (tail.sequence == 0) null else tail;
+            std.atomic.spinLoopHint();
         }
     }
 
@@ -1913,14 +1948,10 @@ pub const Region = struct {
         // file to its last sealed frontier, and appends resume.
         if (!need_init) {
             const block: *SealBlock = @ptrCast(@alignCast(mapping.ptr + @as(usize, @intCast(sealBlockOffset(final_max_readers)))));
-            if (block.poison_sequence.load(.acquire) != 0 or block.appended_sequence.load(.acquire) != 0) {
+            if (block.poison_sequence.load(.acquire) != 0 or block.tail_published.load(.acquire) != 0) {
                 if (ensureNoLivePeer(io, fd_entry, &existing_raw, map_len)) |_| {
                     block.poison_sequence.store(0, .release);
-                    const generation = block.tail_generation.load(.monotonic);
-                    block.tail_generation.store(generation +% 1, .release);
-                    block.appended_sequence.store(0, .monotonic);
-                    block.appended_offset.store(0, .monotonic);
-                    block.tail_generation.store(generation +% 2, .release);
+                    block.tail_published.store(0, .release);
                 } else |_| {}
             }
         }
