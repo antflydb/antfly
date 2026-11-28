@@ -449,6 +449,13 @@ preparation API do not by themselves complete these remaining requirements:
   callers share the same short patch-row lifetime. Seven Native and
   Metal checks passed locally, and Spark passed all four CUDA and
   cleanup checks, including parity against the Native image producer.
+  ColQwen document scoring uses the same consuming encoder for native
+  streaming and compatibility projection. Its imported-session route
+  retires each input after the session returns. A pre-submission decline
+  preserves the entire input cohort for compatibility, while failure
+  after consumption retires only the remaining images. Six Native and
+  Metal checks and two Spark checks passed, covering held outputs,
+  imported and native allocation failures, and provider parity.
 
 - Imported ONNX and architecture graphs share the bounded specialization owner
   in `execution/specialization_cache.zig`, with stable executable handles,

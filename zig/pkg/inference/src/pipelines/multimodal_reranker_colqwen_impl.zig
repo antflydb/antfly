@@ -255,8 +255,9 @@ pub fn scoreDocument(
     if (images.len == 0) return error.NoImages;
 
     var prepared_images = std.ArrayListUnmanaged(qwen2vl.PreparedImage).empty;
+    var consumed_images: usize = 0;
     defer {
-        for (prepared_images.items) |*img| img.deinit();
+        for (prepared_images.items[consumed_images..]) |*img| img.deinit();
         prepared_images.deinit(allocator);
     }
     // Reserve list metadata before producing any owner. Appending a completed
@@ -272,10 +273,10 @@ pub fn scoreDocument(
     defer prepared_doc.deinit();
 
     var doc_encoded = if (vision_session == null)
-        (try encodeDocumentStreamingNative(cb, allocator, gpt_cfg, prep_cfg, prepared_doc, prepared_images.items, execution_control)) orelse
-            try encodePreparedDocumentCompatibility(cb, allocator, vision_session, gpt_cfg, prep_cfg, prepared_doc, prepared_images.items, execution_control)
+        (try encodeDocumentStreamingNative(cb, allocator, gpt_cfg, prep_cfg, prepared_doc, prepared_images.items, &consumed_images, execution_control)) orelse
+            try encodePreparedDocumentCompatibility(cb, allocator, vision_session, gpt_cfg, prep_cfg, prepared_doc, prepared_images.items, &consumed_images, execution_control)
     else
-        try encodePreparedDocumentCompatibility(cb, allocator, vision_session, gpt_cfg, prep_cfg, prepared_doc, prepared_images.items, execution_control);
+        try encodePreparedDocumentCompatibility(cb, allocator, vision_session, gpt_cfg, prep_cfg, prepared_doc, prepared_images.items, &consumed_images, execution_control);
     defer doc_encoded.deinit();
 
     return reranking.lateInteractionScore(
@@ -300,8 +301,10 @@ fn encodePreparedDocumentCompatibility(
     prep_cfg: qwen2vl.PreprocessorConfig,
     prepared_doc: qwen2vl.PreparedTextInput,
     prepared_images: []const qwen2vl.PreparedImage,
+    consumed_images: *usize,
     execution_control: ?InferenceExecutionControl,
 ) !EncodedSequence {
+    std.debug.assert(consumed_images.* == 0);
     var image_embeddings = std.ArrayListUnmanaged([]f32).empty;
     var native_image_embeddings = std.ArrayListUnmanaged(NativeImageEmbedding).empty;
     defer {
@@ -315,8 +318,9 @@ fn encodePreparedDocumentCompatibility(
         for (prepared_images, 0..) |prepared, index| {
             if (execution_control) |control|
                 try control.update(.executing, @intCast(index), @intCast(prepared_images.len));
+            consumed_images.* += 1;
             native_image_embeddings.appendAssumeCapacity(.{
-                .tensor = try qwen2vl_vision.encodePreparedImageTokensTensor(cb, allocator, gpt_cfg, prep_cfg, prepared),
+                .tensor = try qwen2vl_vision.encodeOwnedPreparedImageTokensTensor(cb, allocator, gpt_cfg, prep_cfg, prepared),
                 .token_count = prepared.image_token_count,
             });
         }
@@ -325,7 +329,10 @@ fn encodePreparedDocumentCompatibility(
         for (prepared_images, 0..) |prepared, index| {
             if (execution_control) |control|
                 try control.update(.executing, @intCast(index), @intCast(prepared_images.len));
-            image_embeddings.appendAssumeCapacity(try encodeImageTokens(cb, allocator, vision_session, gpt_cfg, prep_cfg, prepared, execution_control));
+            consumed_images.* += 1;
+            var owned = prepared;
+            defer owned.deinit();
+            image_embeddings.appendAssumeCapacity(try encodeImageTokens(cb, allocator, vision_session, gpt_cfg, prep_cfg, owned, execution_control));
         }
     }
 
@@ -345,9 +352,10 @@ fn encodeDocumentStreamingNative(
     prep_cfg: qwen2vl.PreprocessorConfig,
     prepared: qwen2vl.PreparedTextInput,
     images: []const qwen2vl.PreparedImage,
+    consumed_images: *usize,
     execution_control: ?InferenceExecutionControl,
 ) !?EncodedSequence {
-    var producer = NativeVisionProducer{ .cb = cb, .allocator = allocator, .cfg = cfg, .prep_cfg = prep_cfg, .images = images, .control = execution_control };
+    var producer = NativeVisionProducer{ .cb = cb, .allocator = allocator, .cfg = cfg, .prep_cfg = prep_cfg, .images = images, .consumed_images = consumed_images, .control = execution_control };
     return encodeDocumentStreamingProducer(cb, allocator, cfg, prep_cfg, prepared, images, &producer, execution_control);
 }
 
@@ -357,9 +365,15 @@ const NativeVisionProducer = struct {
     cfg: gpt_mod.Config,
     prep_cfg: qwen2vl.PreprocessorConfig,
     images: []const qwen2vl.PreparedImage,
+    consumed_images: ?*usize = null,
     control: ?InferenceExecutionControl,
     fn produce(self: *@This(), index: usize) !CT {
         if (self.control) |control| try control.update(.executing, @intCast(index), @intCast(self.images.len));
+        if (self.consumed_images) |consumed| {
+            std.debug.assert(consumed.* == index);
+            consumed.* += 1;
+            return qwen2vl_vision.encodeOwnedPreparedImageTokensTensor(self.cb, self.allocator, self.cfg, self.prep_cfg, self.images[index]);
+        }
         return qwen2vl_vision.encodePreparedImageTokensTensor(self.cb, self.allocator, self.cfg, self.prep_cfg, self.images[index]);
     }
     fn release(self: *@This(), tensor: CT) void {
