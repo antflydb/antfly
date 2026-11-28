@@ -97,6 +97,12 @@ class AppleBridgeArtifactTests(unittest.TestCase):
         generate = next(
             line for line in makefile.splitlines() if line.startswith("generate:")
         )
+        prerequisites = generate.partition(":")[2].partition("#")[0].split()
+        stub_targets = [
+            target
+            for target in prerequisites
+            if target not in {"apple-bridge-check", "apple-bridge-generate"}
+        ]
         targets = makefile[
             makefile.index("apple-bridge-check:") : makefile.index(
                 "graph-identifier-generate:"
@@ -125,16 +131,16 @@ class AppleBridgeArtifactTests(unittest.TestCase):
                 + "\n"
                 + generate
                 + "\n\t@:\n"
-                + "graph-identifier-generate provider-matrix-generate:\n\t@:\n"
+                + "".join(f"{target}:\n\t@:\n" for target in stub_targets)
                 + targets
             )
-            subprocess.run(
+            result = subprocess.run(
                 ["make", "-f", str(fixture), "-j4", "generate"],
                 env={**os.environ, "PATH": str(root) + os.pathsep + os.environ["PATH"]},
-                check=True,
                 capture_output=True,
                 text=True,
             )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_committed_bridge_matches_its_source(self):
         bridge.verify(bridge.SOURCE.parent.parent / "prebuilt/arm64", "arm64")

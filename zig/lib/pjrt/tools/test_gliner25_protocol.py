@@ -81,7 +81,9 @@ class ProtocolTests(unittest.TestCase):
         self.assertTrue(bench.compare_to_cpu(within, fixture, 0.02)["passed"])
         self.assertFalse(bench.compare_to_cpu(outside, fixture, 0.02)["passed"])
         # A different peer's error cannot become this backend's reference.
-        self.assertTrue(bench.compare_to_cpu(fixture["cpu_logits"], fixture, 0.02)["passed"])
+        self.assertTrue(
+            bench.compare_to_cpu(fixture["cpu_logits"], fixture, 0.02)["passed"]
+        )
 
     def test_qualification_rejects_a_small_error_argmax_flip(self):
         reference = np.zeros(14)

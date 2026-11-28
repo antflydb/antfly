@@ -51,8 +51,10 @@ GRAPH_FUNDING_DENIAL = re.compile(
 
 def graph_funding_denials(text):
     return [
-        {key: value if key in ("stage", "error") else int(value)
-         for key, value in match.groupdict().items()}
+        {
+            key: value if key in ("stage", "error") else int(value)
+            for key, value in match.groupdict().items()
+        }
         for match in GRAPH_FUNDING_DENIAL.finditer(text)
     ]
 
@@ -76,7 +78,13 @@ def graph_first_replays(text):
 
 def graph_retirements(text):
     return [
-        dict(reason=reason, phase=phase, epoch=int(epoch), rows=int(rows), progress=int(progress))
+        dict(
+            reason=reason,
+            phase=phase,
+            epoch=int(epoch),
+            rows=int(rows),
+            progress=int(progress),
+        )
         for reason, phase, epoch, rows, progress in re.findall(
             r"LIGHTONOCR3 cuda_model_graph_retired reason=(\w+) phase=(\w+) "
             r"epoch=(\d+) rows=(\d+) progress=(\d+)",
@@ -2110,8 +2118,11 @@ def main():
     parser.add_argument("--require-lighton-bf16-recurrent-prefill", action="store_true")
     parser.add_argument("--require-lighton-model-graph", action="store_true")
     parser.add_argument(
-        "--require-model-graph-replay-rows", type=int, choices=range(2, 129),
-        metavar="ROWS", help="Require a timed graph replay at this exact cohort width",
+        "--require-model-graph-replay-rows",
+        type=int,
+        choices=range(2, 129),
+        metavar="ROWS",
+        help="Require a timed graph replay at this exact cohort width",
     )
     parser.add_argument("--require-wide-packed-prefill", action="store_true")
     parser.add_argument("--require-lighton-norm-weight-cache", action="store_true")
@@ -2445,7 +2456,9 @@ def main():
         parser.error("--require-compact-kv requires --compact-kv")
     if args.require_model_graph_replay_rows is not None:
         if not args.policy_rounds or "batch" not in args.modes:
-            parser.error("--require-model-graph-replay-rows requires timed batch --policy-rounds")
+            parser.error(
+                "--require-model-graph-replay-rows requires timed batch --policy-rounds"
+            )
         if args.require_model_graph_replay_rows > args.batch_rows:
             parser.error("--require-model-graph-replay-rows must fit --batch-rows")
     if args.require_physical128 and not args.policy_rounds:

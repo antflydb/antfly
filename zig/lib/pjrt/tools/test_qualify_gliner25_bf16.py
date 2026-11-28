@@ -25,8 +25,10 @@ import numpy as np
 from qualify_gliner25_bf16 import compare, main, sha
 
 
-FIXTURE = {"inputs": [{"shape": [1, 64]}, {}, {"shape": [1, 14]}],
-           "outputs": [{"shape": [14]}]}
+FIXTURE = {
+    "inputs": [{"shape": [1, 64]}, {}, {"shape": [1, 14]}],
+    "outputs": [{"shape": [14]}],
+}
 
 
 def logits(topic):
@@ -43,32 +45,80 @@ class Bf16QualificationTests(unittest.TestCase):
         values = [logits(0.2).tolist()]
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            manifest, reference, native, output = (root / name for name in
-                                                   ("manifest", "reference", "native", "output"))
-            manifest.write_text(json.dumps({"model_sha256": "model", "cases": [fixture]}))
-            reference.write_text(json.dumps({
-                "precision": "bf16", "dtype": "torch.bfloat16", "model_sha256": "model",
-                "manifest_sha256": sha(manifest), "inference_mode": True, "autocast": False,
-                "matmul_settings": {"allow_bf16_reduced_precision_reduction": True},
-                "cases": [{"id": "case", "logits": values}],
-            }))
-            report = {"backend": "cuda", "encoder_dtype": "bf16", "cuda": {
-                "gliner25_bf16_attention_calls": 1, "gliner25_bf16_ffn_calls": 1,
-            }, "cases": [{"id": "case", "logits": values, "physical_forwards": 1}]}
-            argv = ["qualify", "--manifest", str(manifest), "--reference", str(reference),
-                    "--native", str(native), "--out", str(output)]
+            manifest, reference, native, output = (
+                root / name for name in ("manifest", "reference", "native", "output")
+            )
+            manifest.write_text(
+                json.dumps({"model_sha256": "model", "cases": [fixture]})
+            )
+            reference.write_text(
+                json.dumps(
+                    {
+                        "precision": "bf16",
+                        "dtype": "torch.bfloat16",
+                        "model_sha256": "model",
+                        "manifest_sha256": sha(manifest),
+                        "inference_mode": True,
+                        "autocast": False,
+                        "matmul_settings": {
+                            "allow_bf16_reduced_precision_reduction": True
+                        },
+                        "cases": [{"id": "case", "logits": values}],
+                    }
+                )
+            )
+            report = {
+                "backend": "cuda",
+                "encoder_dtype": "bf16",
+                "cuda": {
+                    "gliner25_bf16_attention_calls": 1,
+                    "gliner25_bf16_ffn_calls": 1,
+                },
+                "cases": [{"id": "case", "logits": values, "physical_forwards": 1}],
+            }
+            argv = [
+                "qualify",
+                "--manifest",
+                str(manifest),
+                "--reference",
+                str(reference),
+                "--native",
+                str(native),
+                "--out",
+                str(output),
+            ]
             with patch("sys.argv", argv):
-                fp32 = {"precision": "fp32", "encoder_dtype": "f32", "cuda": {
-                    "gliner25_bf16_attention_calls": 0, "gliner25_bf16_ffn_calls": 0,
-                }}
-                for update in (fp32, {"backend": "native"}, {"encoder_dtype": "f32"},
-                               {"cuda": None}, {"cuda": {"gliner25_bf16_attention_calls": 1,
-                                                         "gliner25_bf16_ffn_calls": 0}},
-                               {"cuda": {"gliner25_bf16_attention_calls": 0,
-                                         "gliner25_bf16_ffn_calls": 1}}):
+                fp32 = {
+                    "precision": "fp32",
+                    "encoder_dtype": "f32",
+                    "cuda": {
+                        "gliner25_bf16_attention_calls": 0,
+                        "gliner25_bf16_ffn_calls": 0,
+                    },
+                }
+                for update in (
+                    fp32,
+                    {"backend": "native"},
+                    {"encoder_dtype": "f32"},
+                    {"cuda": None},
+                    {
+                        "cuda": {
+                            "gliner25_bf16_attention_calls": 1,
+                            "gliner25_bf16_ffn_calls": 0,
+                        }
+                    },
+                    {
+                        "cuda": {
+                            "gliner25_bf16_attention_calls": 0,
+                            "gliner25_bf16_ffn_calls": 1,
+                        }
+                    },
+                ):
                     with self.subTest(update=update):
                         native.write_text(json.dumps(report | update))
-                        with self.assertRaisesRegex(ValueError, "did not execute CUDA BF16"):
+                        with self.assertRaisesRegex(
+                            ValueError, "did not execute CUDA BF16"
+                        ):
                             main()
                         self.assertFalse(output.exists())
                 native.write_text(json.dumps(report))
@@ -84,10 +134,14 @@ class Bf16QualificationTests(unittest.TestCase):
         self.assertEqual(len(result["boundary_changes"]), 1)
 
     def test_confidence_drift_fails_even_when_decisions_match(self):
-        self.assertFalse(compare(logits(0.58), logits(0.55), FIXTURE, 0.02, True)["passed"])
+        self.assertFalse(
+            compare(logits(0.58), logits(0.55), FIXTURE, 0.02, True)["passed"]
+        )
 
     def test_confident_threshold_change_fails(self):
-        self.assertFalse(compare(logits(0.42), logits(0.35), FIXTURE, 0.02, True)["passed"])
+        self.assertFalse(
+            compare(logits(0.42), logits(0.35), FIXTURE, 0.02, True)["passed"]
+        )
 
     def test_argmax_tie_requires_bounded_policy(self):
         ref, actual = logits(0.2), logits(0.2)
@@ -102,10 +156,14 @@ class Bf16QualificationTests(unittest.TestCase):
                 compare(bad, logits(0.2), FIXTURE, 0.02, True)
 
     def test_custom_tasks_and_threshold(self):
-        fixture = {"inputs": [{"shape": [1, 64]}, {}, {"shape": [1, 3]}],
-                   "outputs": [{"shape": [3]}], "classification_tasks": [
-                       {"name": "sentiment", "size": 2},
-                       {"name": "flag", "size": 1, "multi_label": True, "threshold": 0.7}]}
+        fixture = {
+            "inputs": [{"shape": [1, 64]}, {}, {"shape": [1, 3]}],
+            "outputs": [{"shape": [3]}],
+            "classification_tasks": [
+                {"name": "sentiment", "size": 2},
+                {"name": "flag", "size": 1, "multi_label": True, "threshold": 0.7},
+            ],
+        }
         r = np.array([2, 0, np.log(0.699 / 0.301)])
         a = np.array([2, 0, np.log(0.701 / 0.299)])
         self.assertTrue(compare(a, r, fixture, 0.02, True)["passed"])
@@ -115,9 +173,12 @@ class Bf16QualificationTests(unittest.TestCase):
             compare(a, r, fixture, 0.02, True)
 
     def test_entity_pool_order_is_not_a_public_decision(self):
-        fixture = {"kind": "entities", "inputs": [{"shape": [1, 8]}, {},
-                   {"shape": [1, 2]}, {}, {"shape": [1, 1]}],
-                   "outputs": [{"shape": [18]}], "candidate_indices_offset": 12}
+        fixture = {
+            "kind": "entities",
+            "inputs": [{"shape": [1, 8]}, {}, {"shape": [1, 2]}, {}, {"shape": [1, 1]}],
+            "outputs": [{"shape": [18]}],
+            "candidate_indices_offset": 12,
+        }
         ref = np.array([0] * 8 + [-5, 0, 2, 1, 0, 1, 1, 2, 1, 1], dtype=float)
         actual = np.array([0] * 8 + [-5, 0, 1, 2, 1, 2, 0, 1, 1, 1], dtype=float)
         self.assertTrue(compare(actual, ref, fixture, 0.02, True, {})["passed"])

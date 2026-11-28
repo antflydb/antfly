@@ -2972,7 +2972,7 @@ def _three_by_three_cluster_backup_restore(
     ] == backup_tables
     manifests = {
         _backup_entry_public_name(entry): json.loads(
-            (repository / f'{entry["table_backup_id"]}-metadata.json').read_text(
+            (repository / f"{entry['table_backup_id']}-metadata.json").read_text(
                 encoding="utf-8"
             )
         )
@@ -3022,7 +3022,7 @@ def _three_by_three_cluster_backup_restore(
                 encoding="utf-8"
             )
         )
-        (repository / ".antfly-incomplete" / f'{head["attempt_id"]}.json').unlink()
+        (repository / ".antfly-incomplete" / f"{head['attempt_id']}.json").unlink()
 
     def run_restore(restore_payload: dict, attempt: str) -> dict:
         restore_coordinator_url = None
@@ -3085,7 +3085,9 @@ def _three_by_three_cluster_backup_restore(
             ]
             for api_url in candidate_urls:
                 try:
-                    response = session.get(f"{api_url}/restore/jobs/{job_id}", timeout=1)
+                    response = session.get(
+                        f"{api_url}/restore/jobs/{job_id}", timeout=1
+                    )
                 except requests.RequestException:
                     continue
                 if response.status_code == 503:
@@ -3111,7 +3113,6 @@ def _three_by_three_cluster_backup_restore(
             f"{cluster.debug_logs()}"
         )
         return restore_job
-
 
     restore_payload = {
         "backup_id": backup_id,
@@ -3154,6 +3155,7 @@ def _three_by_three_cluster_backup_restore(
     )
 
     if not damage_sibling:
+
         def restored_docs_visible_from_every_data_node() -> bool | None:
             for api_url in cluster.data_api_urls:
                 for key, expected in source_docs.items():
@@ -3837,7 +3839,7 @@ def _cluster_restore_modes(backup_api, *, concurrent_observers=False):
             if _backup_entry_public_name(entry) == table_b
         )
         sibling_manifest = json.loads(
-            (repository / f'{sibling["table_backup_id"]}-metadata.json').read_text()
+            (repository / f"{sibling['table_backup_id']}-metadata.json").read_text()
         )
         (repository / sibling_manifest["shards"][0]["snapshot_path"]).unlink()
 
