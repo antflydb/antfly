@@ -330,9 +330,7 @@ fn encodePreparedDocumentCompatibility(
             if (execution_control) |control|
                 try control.update(.executing, @intCast(index), @intCast(prepared_images.len));
             consumed_images.* += 1;
-            var owned = prepared;
-            defer owned.deinit();
-            image_embeddings.appendAssumeCapacity(try encodeImageTokens(cb, allocator, vision_session, gpt_cfg, prep_cfg, owned, execution_control));
+            image_embeddings.appendAssumeCapacity(try runVisionSession(allocator, vision_session.?, prepared, gpt_cfg.hidden_size, execution_control, true));
         }
     }
 
@@ -559,7 +557,7 @@ pub fn encodeImageTokens(
     execution_control: ?InferenceExecutionControl,
 ) ![]f32 {
     if (vision_session) |vs| {
-        return runVisionSession(allocator, vs, prepared, gpt_cfg.hidden_size, execution_control);
+        return runVisionSession(allocator, vs, prepared, gpt_cfg.hidden_size, execution_control, false);
     }
     return qwen2vl_vision.encodePreparedImageTokens(cb, allocator, gpt_cfg, prep_cfg, prepared);
 }
@@ -572,7 +570,13 @@ fn runVisionSession(
     prepared: qwen2vl.PreparedImage,
     expected_hidden_size: u32,
     execution_control: ?InferenceExecutionControl,
+    comptime take_pixels: bool,
 ) ![]f32 {
+    var owns_pixels = take_pixels;
+    defer if (owns_pixels) {
+        var owned = prepared;
+        owned.deinit();
+    };
     const input_info = vision_session.inputInfo();
     var needs_grid = false;
     for (input_info) |info| {
@@ -580,7 +584,11 @@ fn runVisionSession(
     }
 
     const pixel_shape = [_]i64{ 1, 3, @intCast(prepared.resized_height), @intCast(prepared.resized_width) };
-    var pixel_tensor = try Tensor.initFloat32(allocator, "pixel_values", &pixel_shape, prepared.pixel_values);
+    var pixel_tensor = if (take_pixels)
+        try Tensor.initFloat32Owned(prepared.allocator, "pixel_values", &pixel_shape, prepared.pixel_values)
+    else
+        try Tensor.initFloat32(allocator, "pixel_values", &pixel_shape, prepared.pixel_values);
+    owns_pixels = false;
     defer pixel_tensor.deinit();
 
     var grid_tensor: ?Tensor = null;
@@ -1332,7 +1340,13 @@ const DocumentProducerOomFixture = struct {
         return .native;
     }
     fn close(_: *anyopaque) void {}
-    fn vision(_: *anyopaque, _: []const Tensor, a: std.mem.Allocator) ![]Tensor {
+    const VisionContext = struct { expected_pixels: ?[]const f32 = null };
+
+    fn vision(raw: *anyopaque, inputs: []const Tensor, a: std.mem.Allocator) ![]Tensor {
+        const ctx: *const VisionContext = @ptrCast(@alignCast(raw));
+        if (ctx.expected_pixels) |expected| {
+            try std.testing.expectEqual(@intFromPtr(expected.ptr), @intFromPtr(inputs[0].data.ptr));
+        }
         const values = [_]f32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 };
         const outputs = try a.alloc(Tensor, 1);
         errdefer a.free(outputs);
@@ -1351,7 +1365,7 @@ const DocumentProducerOomFixture = struct {
         var table = token.vtable.*;
         table.encode = encode;
         token.vtable = &table;
-        var context: u8 = 0;
+        var context: VisionContext = .{};
         const imported = backends.Session{ .ptr = &context, .vtable = &.{ .run = vision, .inputInfo = info, .outputInfo = info, .backend = backend, .close = close } };
         var config = ResidentDocumentFixture.config();
         config.vision_embed_dim = 4;
@@ -1359,6 +1373,11 @@ const DocumentProducerOomFixture = struct {
         config.vision_num_attention_heads = 1;
         const prep = qwen2vl.PreprocessorConfig{ .min_pixels = 16, .max_pixels = 16, .patch_size = 2, .merge_size = 1, .temporal_patch_size = 1 };
         const query = EncodedSequence{ .allocator = a, .input_ids = @constCast(&[_]i32{1}), .attention_mask = @constCast(&[_]i32{1}), .hidden_states = @constCast(&[_]f32{ 1, 2, 3 }), .hidden_size = 3 };
+        const owned = try qwen2vl.prepareImage(a, &png_1x1, prep);
+        context.expected_pixels = owned.pixel_values;
+        const projected = try runVisionSession(a, imported, owned, config.hidden_size, null, true);
+        a.free(projected);
+        context.expected_pixels = null;
         const score = try scoreDocument(&cb, a, imported, token, .{}, config, prep, query, "doc", &.{ &png_1x1, &png_1x1 }, 12, false, null);
         try std.testing.expect(std.math.isFinite(score));
         // The canonical Native branch reaches its real patch-weight lookup

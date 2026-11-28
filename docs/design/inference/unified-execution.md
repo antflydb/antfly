@@ -456,6 +456,11 @@ preparation API do not by themselves complete these remaining requirements:
   after consumption retires only the remaining images. Six Native and
   Metal checks and two Spark checks passed, covering held outputs,
   imported and native allocation failures, and provider parity.
+  The imported vision input now adopts the normalized pixels directly
+  into its host tensor. The tensor releases the pixels on session exit,
+  and the prepared image keeps cleanup responsibility if shape allocation
+  fails. Four focused checks passed, including pointer identity at the
+  session callback, allocation failure and Native/Metal output parity.
 
 - Imported ONNX and architecture graphs share the bounded specialization owner
   in `execution/specialization_cache.zig`, with stable executable handles,
