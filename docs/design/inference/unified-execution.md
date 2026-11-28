@@ -3117,3 +3117,16 @@ both 56 and 60 rows, with a 10,240-byte peak. Of those allocations,
 decoder's hidden-width and head-width adjusted normalization weights
 with the production cache disabled. This is a targeted remaining
 workspace candidate. Wide capture and replay remain unqualified.
+
+At `e32afca66d`, all 45 focused Spark checks passed with zero skips.
+The cache-disabled two-page fixture matched serial output and replayed
+with a declared zero-byte plan. The separate unfused fixture matched
+serial output with observed replay and zero learned bytes. On 4B,
+two 98-row observed plans recorded zero allocations, events and bytes.
+The profiled run completed all 256 pages with serial parity and replayed
+declared zero-byte plans at 60 and 18 rows. The unprofiled run replayed
+an observed zero-byte plan at 98 rows and a declared plan at 61 rows,
+then returned retryable resource unavailability before finishing all
+pages. The norm-weight migration removes the observed 10,240-byte
+peak. Sustained wide declared replay and progress under retirement
+pressure remain open.
