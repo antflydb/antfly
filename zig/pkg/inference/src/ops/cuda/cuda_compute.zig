@@ -7502,8 +7502,9 @@ pub const CudaCompute = struct {
     fn cacheRequestState(self: *CudaCompute, request: CacheFunding.Request) !CacheRequestState {
         switch (request) {
             .audio_learning => |value| {
-                const entry = self.audio_plans.availableFor(value.key) orelse return .{};
-                if (entry.owner) |owner| if (owner.managed) return .{};
+                if (self.audio_plans.availableFor(value.key)) |entry| {
+                    if (entry.owner) |owner| if (owner.managed) return .{};
+                } else if (!value.declared_cold) return .{};
                 return .{ .miss = true, .amounts = .{ .host_scratch_bytes = @sizeOf(@import("audio_execution_plan.zig").Owner) } };
             },
             .decoder => |sequence| {
@@ -21475,7 +21476,7 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
     const entry = try self.audio_plans.getWithCleanup(base_key, plan_cleanup);
     if (!entry.disabled and entry.owner == null) if (dispatch.workspace) |workspace| {
         if (self.ctx.prepared_cache_funding) |funding| {
-            var lease = funding.take(.{ .audio_learning = .{ .key = base_key } }, .{ .host_scratch_bytes = @sizeOf(plan_mod.Owner) }) catch |err| switch (err) {
+            var lease = funding.take(.{ .audio_learning = .{ .key = base_key, .declared_cold = true } }, .{ .host_scratch_bytes = @sizeOf(plan_mod.Owner) }) catch |err| switch (err) {
                 error.UnpreparedCacheAdmission => return null,
                 else => return err,
             };
@@ -60401,6 +60402,10 @@ test "CUDA audio learning cache state uses actual warm no-plan eligibility and o
     var compute = metadataOnlyTestCompute();
     const request: CacheFunding.Request = .{ .audio_learning = .{ .key = 71 } };
     try std.testing.expect(!(try compute.cacheRequestState(request)).miss);
+    const declared: CacheFunding.Request = .{ .audio_learning = .{ .key = 71, .declared_cold = true } };
+    const cold_declaration = try compute.cacheRequestState(declared);
+    try std.testing.expect(cold_declaration.miss);
+    try std.testing.expectEqual(@sizeOf(plan_mod.Owner), cold_declaration.amounts.host_scratch_bytes);
     compute.audio_plans.entries[0] = .{ .key = 71, .stamp = 1 };
     try std.testing.expect(!(try compute.cacheRequestState(request)).miss);
     compute.audio_plans.entries[0].warmed = true;

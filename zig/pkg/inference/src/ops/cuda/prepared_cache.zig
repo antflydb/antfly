@@ -120,7 +120,7 @@ pub const CapturedArena = struct {
 };
 
 pub const Request = union(enum) {
-    audio_learning: struct { key: u64 },
+    audio_learning: struct { key: u64, declared_cold: bool = false },
     external_prefill: @import("prefill_workspace.zig").Request,
     derived_weight: DerivedWeight,
     captured_storage: CapturedStorage,
@@ -1513,7 +1513,8 @@ fn qualifyAudioMetadataRetirement(comptime adopt_warm_plan: bool) !void {
     defer pin.release();
     const plan_mod = @import("audio_execution_plan.zig");
     const bytes = @sizeOf(plan_mod.Owner);
-    var funding: ?*Funding = try Funding.createWithAllocator(std.testing.allocator, .{ .requests = &.{.{ .audio_learning = .{ .key = 93 } }} });
+    const request: Request = .{ .audio_learning = .{ .key = 93, .declared_cold = !adopt_warm_plan } };
+    var funding: ?*Funding = try Funding.createWithAllocator(std.testing.allocator, .{ .requests = &.{request} });
     defer if (funding) |value| {
         if (value.state == .bound) value.unbind();
         value.finishOutsideExecution();
@@ -1538,7 +1539,7 @@ fn qualifyAudioMetadataRetirement(comptime adopt_warm_plan: bool) !void {
     var epoch = try guard.retainEpoch();
     defer epoch.release();
     try funding.?.bind(&publication_epoch);
-    var token = try funding.?.take(.{ .audio_learning = .{ .key = 93 } }, .{ .host_scratch_bytes = bytes });
+    var token = try funding.?.take(request, .{ .host_scratch_bytes = bytes });
     const owner = if (adopt_warm_plan) warm: {
         const raw = try plan_mod.Owner.create(std.testing.allocator);
         errdefer raw.destroyUnusedOutsideExecution();
