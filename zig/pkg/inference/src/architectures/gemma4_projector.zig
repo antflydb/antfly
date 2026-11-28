@@ -5141,7 +5141,7 @@ const F32AudioDeclaration = struct {
         };
     }
 
-    fn linear(self: *F32AudioDeclaration, kind: grouped_audio_block.Projection, second: bool, input: Value) !Value {
+    pub fn linear(self: *F32AudioDeclaration, kind: grouped_audio_block.Projection, second: bool, input: Value) !Value {
         const recipe = self.plan.recipe;
         const spec = try self.bounds(kind, second);
         const geometry = groupedProjectionGeometry(recipe.hidden, recipe.intermediate, kind);
@@ -5235,36 +5235,29 @@ const F32AudioDeclaration = struct {
         return self.make(input.width);
     }
 
-    pub fn convolve(self: *F32AudioDeclaration, input: Value) !Value {
-        const pw2 = project: {
-            const activated = activate: {
-                const normed = normalize: {
-                    const stencil = convolve: {
-                        const gated = gate: {
-                            const pw1 = project_input: {
-                                const pre = try self.normalizeStage(.convolution_pre, false);
-                                defer self.release(pre);
-                                break :project_input try self.linear(.convolution_in, false, pre);
-                            };
-                            defer self.release(pw1);
-                            break :gate try self.make(input.width);
-                        };
-                        defer self.release(gated);
-                        break :convolve try self.make(input.width);
-                    };
-                    defer self.release(stencil);
-                    break :normalize try self.normalizeStage(.convolution_post, false);
-                };
-                defer self.release(normed);
-                break :activate try self.make(input.width);
-            };
-            defer self.release(activated);
-            break :project try self.linear(.convolution_out, false, activated);
-        };
-        defer self.release(pw2);
-        return self.make(input.width);
+    pub fn norm(self: *F32AudioDeclaration, kind: grouped_audio_block.Norm, second: bool, _: Value) !Value {
+        return self.normalizeStage(kind, second);
+    }
+
+    pub const normalizeBounded = norm;
+
+    pub fn unary(self: *F32AudioDeclaration, kind: grouped_audio_block.Unary, input: Value) !Value {
+        return self.plan.unary(kind, input);
+    }
+
+    pub fn add(self: *F32AudioDeclaration, lhs: Value, rhs: Value) !Value {
+        return self.plan.add(lhs, rhs);
     }
 };
+
+fn audioNormWeightKind(kind: grouped_audio_block.Norm, gguf: bool) grouped_audio_block.Norm {
+    if (!gguf) return kind;
+    return switch (kind) {
+        .convolution_pre => .convolution_post,
+        .convolution_post => .convolution_pre,
+        else => kind,
+    };
+}
 
 fn groupedNormName(buffer: *[128]u8, layer: usize, kind: grouped_audio_block.Norm, second: bool) ![]const u8 {
     const stem: []const u8 = switch (kind) {
@@ -5317,14 +5310,21 @@ const GroupedAudioBlock = struct {
     }
 
     pub fn norm(self: *const GroupedAudioBlock, kind: grouped_audio_block.Norm, second: bool, input: CT) !CT {
+        return self.normWithBound(kind, second, input, false);
+    }
+
+    fn normWithBound(self: *const GroupedAudioBlock, kind: grouped_audio_block.Norm, second: bool, input: CT, apply_bound: bool) !CT {
         var buffer: [128]u8 = undefined;
-        const name = try groupedNormName(&buffer, self.layer, kind, second);
+        const weight_kind = audioNormWeightKind(kind, self.store.gguf != null);
+        const name = try groupedNormName(&buffer, self.layer, weight_kind, second);
         const width = self.cfg.audio_hidden;
         const rows = self.inputs.valid_mask.len;
         const weight = try projectorVectorWeightCt(self.cb, self.allocator, self.store, name, width);
+        const source = if (apply_bound) try audioSourceGradientBounded(self.cb, self.cfg, input) else input;
+        defer if (source != input) self.cb.free(source);
         if (kind == .convolution_post)
-            return audioSourceChannelRms(self.cb, self.allocator, self.cfg, input, weight, rows, width, self.inputs.segments);
-        return audioSourceRms(self.cb, self.cfg, input, weight, rows, width, .contiguous, rows);
+            return audioSourceChannelRms(self.cb, self.allocator, self.cfg, source, weight, rows, width, self.inputs.segments);
+        return audioSourceRms(self.cb, self.cfg, source, weight, rows, width, .contiguous, rows);
     }
 
     pub fn linear(self: *const GroupedAudioBlock, kind: grouped_audio_block.Projection, second: bool, input: CT) !CT {
@@ -5523,13 +5523,37 @@ const AudioLayer = struct {
         return audioSourceRoundOwned(self.cb, self.cfg, try self.cb.add(input, normed));
     }
 
-    pub fn convolve(self: *const AudioLayer, input: CT) !CT {
+    fn operations(self: *const AudioLayer) GroupedAudioBlock {
+        return .{ .cb = self.cb, .allocator = self.allocator, .store = self.store, .cfg = self.cfg, .inputs = self.inputs, .layer = self.layer };
+    }
+
+    pub fn norm(self: *const AudioLayer, kind: grouped_audio_block.Norm, second: bool, input: CT) !CT {
+        return self.operations().norm(kind, second, input);
+    }
+
+    pub fn normalizeBounded(self: *const AudioLayer, kind: grouped_audio_block.Norm, second: bool, input: CT) !CT {
+        return self.operations().normWithBound(kind, second, input, true);
+    }
+
+    pub fn linear(self: *const AudioLayer, kind: grouped_audio_block.Projection, second: bool, input: CT) !CT {
+        return self.operations().linear(kind, second, input);
+    }
+
+    pub fn unary(self: *const AudioLayer, kind: grouped_audio_block.Unary, input: CT) !CT {
+        return self.operations().unary(kind, input);
+    }
+
+    pub fn add(self: *const AudioLayer, lhs: CT, rhs: CT) !CT {
+        return self.operations().add(lhs, rhs);
+    }
+
+    pub fn beforeConvolution(_: *const AudioLayer) void {
         audioProfileMark(.norms);
-        const result = try audioLightConv(self.cb, self.allocator, self.store, self.cfg, input, self.inputs.valid_mask.len, self.layer, self.inputs.segments, self.inputs.segment_starts);
-        errdefer self.cb.free(result);
+    }
+
+    pub fn afterConvolution(self: *const AudioLayer, result: CT) !void {
         if (@import("builtin").is_test and self.layer == 0) try embeddingGemma2StageTensor(self.cb, self.allocator, "audio_0_lconv1d", result);
         audioProfileMark(.lconv);
-        return result;
     }
 };
 
@@ -5606,10 +5630,6 @@ fn scaleRows(cb: *const ComputeBackend, allocator: std.mem.Allocator, input: CT,
     return cb.fromFloat32Shape(data, &shape);
 }
 
-fn audioConvNormNames(gguf: bool) struct { pre: []const u8, post: []const u8 } {
-    return if (gguf) .{ .pre = "conv_norm", .post = "norm_conv" } else .{ .pre = "norm_conv", .post = "conv_norm" };
-}
-
 test "gemma4 audio HF and converted GGUF query scales agree without double softplus" {
     const a = std.testing.allocator;
     const raw = [_]f32{ -5, -2, 0, 1 };
@@ -5624,65 +5644,12 @@ test "gemma4 audio HF and converted GGUF query scales agree without double softp
 }
 
 test "gemma4 audio converted GGUF convolution norms preserve original HF roles" {
-    const a = std.testing.allocator;
-    const hf = audioConvNormNames(false);
-    const gguf = audioConvNormNames(true);
-    var buf: [128]u8 = undefined;
-    const hf_pre = try @import("embedding_gemma2_media_weights.zig").name(a, try fmt(&buf, "a.blk.0.{s}.weight", .{hf.pre}));
-    defer a.free(hf_pre);
+    var buf: [256]u8 = undefined;
+    const hf_pre = try hf_weights.resolve(&buf, "a.blk.0.norm_conv.weight");
     try std.testing.expectEqualStrings("audio_tower.layers.0.lconv1d.pre_layer_norm.weight", hf_pre);
-    // Upstream GGUF maps pre_layer_norm -> conv_norm, conv_norm -> norm_conv.
-    try std.testing.expectEqualStrings("conv_norm", gguf.pre);
-    try std.testing.expectEqualStrings("norm_conv", gguf.post);
-    try std.testing.expectEqualStrings("conv_norm", hf.post);
-}
-
-fn audioLightConv(
-    cb: *const ComputeBackend,
-    allocator: std.mem.Allocator,
-    store: *ProjectorWeights,
-    cfg: AudioConfig,
-    input: CT,
-    rows: usize,
-    layer: usize,
-    segments: []const usize,
-    segment_starts: ?CT,
-) !CT {
-    var buf: [128]u8 = undefined;
-    // GGUF's inherited tensor mapping swaps the two convolution norm names.
-    // Keep HF's logical names intact for the EmbeddingGemma 2 path.
-    const norm_names = audioConvNormNames(store.gguf != null);
-    const pw2 = finish_projection: {
-        const activated = activate: {
-            const conv_normed = normalize: {
-                const conv = depthwise: {
-                    const glu = gate: {
-                        const pw1 = project: {
-                            const pre_w = try projectorVectorWeightCt(cb, allocator, store, try fmt(&buf, "a.blk.{d}.{s}.weight", .{ layer, norm_names.pre }), cfg.audio_hidden);
-                            const normed = try audioSourceRms(cb, cfg, input, pre_w, rows, cfg.audio_hidden, .contiguous, rows);
-                            defer cb.free(normed);
-                            break :project try audioSourceLinear(cb, allocator, store, cfg, normed, try fmt(&buf, "a.blk.{d}.conv_pw1", .{layer}), rows, cfg.audio_hidden, cfg.audio_hidden * 2, .row_major, false, false);
-                        };
-                        defer cb.free(pw1);
-                        break :gate try audioSourceRoundOwned(cb, cfg, try applyGlu(cb, allocator, pw1, rows, cfg.audio_hidden));
-                    };
-                    defer cb.free(glu);
-                    break :depthwise try audioSourceRoundOwned(cb, cfg, try depthwiseCausalConvSegments(cb, allocator, store, glu, rows, cfg.audio_hidden, cfg.conv_kernel_size, segments, segment_starts, try fmt(&buf, "a.blk.{d}.conv_dw.weight", .{layer})));
-                };
-                defer cb.free(conv);
-                const conv_norm_w = try projectorVectorWeightCt(cb, allocator, store, try fmt(&buf, "a.blk.{d}.{s}.weight", .{ layer, norm_names.post }), cfg.audio_hidden);
-                const conv_bounded = try audioSourceGradientBounded(cb, cfg, conv);
-                defer if (conv_bounded != conv) cb.free(conv_bounded);
-                break :normalize try audioSourceChannelRms(cb, allocator, cfg, conv_bounded, conv_norm_w, rows, cfg.audio_hidden, segments);
-            };
-            defer cb.free(conv_normed);
-            break :activate try audioSourceRoundOwned(cb, cfg, try cb.silu(conv_normed));
-        };
-        defer cb.free(activated);
-        break :finish_projection try audioSourceLinear(cb, allocator, store, cfg, activated, try fmt(&buf, "a.blk.{d}.conv_pw2", .{layer}), rows, cfg.audio_hidden, cfg.audio_hidden, .column_major, false, false);
-    };
-    defer cb.free(pw2);
-    return audioSourceRoundOwned(cb, cfg, try cb.add(input, pw2));
+    try std.testing.expectEqual(.convolution_post, audioNormWeightKind(.convolution_pre, true));
+    try std.testing.expectEqual(.convolution_pre, audioNormWeightKind(.convolution_post, true));
+    try std.testing.expectEqual(.convolution_pre, audioNormWeightKind(.convolution_pre, false));
 }
 
 fn audioQkvFits(rows: usize, width: usize) bool {

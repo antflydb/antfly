@@ -31,6 +31,7 @@ pub const Physical = union(enum) {
 };
 
 fn boundedNorm(ctx: anytype, input: @TypeOf(ctx.*).Value, kind: Norm, second: bool) !@TypeOf(ctx.*).Value {
+    if (@hasDecl(@TypeOf(ctx.*), "normalizeBounded")) return ctx.normalizeBounded(kind, second, input);
     const bounded = try ctx.unary(.bound, input);
     defer ctx.release(bounded);
     return ctx.norm(kind, second, bounded);
@@ -124,9 +125,11 @@ pub fn run(ctx: anytype, input: @TypeOf(ctx.*).Value) !@TypeOf(ctx.*).Value {
                 break :attention try ctx.add(ff1, normed);
             };
             defer ctx.release(residual);
-            break :conv if (custom) try ctx.convolve(residual) else try convolve(ctx, residual);
+            if (@hasDecl(Context, "beforeConvolution")) ctx.beforeConvolution();
+            break :conv try convolve(ctx, residual);
         };
         defer ctx.release(convolution);
+        if (@hasDecl(Context, "afterConvolution")) try ctx.afterConvolution(convolution);
         break :feed_forward if (custom) try ctx.feedForward(convolution, true) else try feedForward(ctx, convolution, true);
     };
     defer ctx.release(ff2);

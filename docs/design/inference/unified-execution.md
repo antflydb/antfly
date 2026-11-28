@@ -3180,6 +3180,14 @@ recorded 15 arena executions and six graph replays. The timed arms
 measure warm whole-request latency. The physical fixture above
 establishes that the declared route skips allocation learning.
 
+Convolution execution and both CUDA declarations now share one stage
+body. The GGUF adapter retains its converted normalization weight
+mapping. The nine released Spark cases kept exact eager parity and the
+same arena capacities. Five local checks passed, including the official
+E4B QAT GGUF projector on Metal. The resident single- and two-clip
+outputs matched exactly, and the fully device-executed result was
+within 0.00563 of the host reference.
+
 ### Isolated Metal E4B HTTP comparison at `58b3917a89`
 
 The local M4 Max used the same pinned binaries as the mixed serving
