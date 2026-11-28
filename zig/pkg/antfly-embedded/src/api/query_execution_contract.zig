@@ -3326,12 +3326,14 @@ pub fn parseStorageKernelDocumentArtifactManifestResponse(alloc: std.mem.Allocat
 test "storage artifact inspection carries the reprocess intent across the owner boundary" {
     const a = std.testing.allocator;
     var manifest = try parseStorageKernelDocumentArtifactManifestResponse(a,
-        \\{"document_id":"doc","artifact_name":"ocr","artifact_id":"asset","manifest_json":"{}","generation":1,"reprocess":{"requested_generation":2,"status":"pending"}}
+        \\{"document_id":"doc","artifact_name":"ocr","artifact_id":"asset","manifest_json":"{}","generation":1,"reprocess":{"requested_generation":2,"status":"pending","worker":{"scanned_sequence":9,"applied_sequence":8,"target_sequence":10,"retry_queue_full":false,"retrying":false,"failed":false,"background_running":true}}}
     );
     defer manifest.deinit(a);
     try std.testing.expectEqual(@as(u64, 1), manifest.generation);
     try std.testing.expectEqual(@as(u64, 2), manifest.reprocess.?.requested_generation);
     try std.testing.expectEqual(.pending, manifest.reprocess.?.status);
+    try std.testing.expectEqual(@as(u64, 10), manifest.reprocess.?.worker.?.target_sequence);
+    try std.testing.expect(manifest.reprocess.?.worker.?.next_retry_at_ms == null);
 }
 
 pub fn parseStorageKernelDocumentArtifactManifestsResponse(alloc: std.mem.Allocator, body: []const u8) !db_mod.types.DocumentArtifactManifestList {

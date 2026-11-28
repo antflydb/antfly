@@ -1100,7 +1100,7 @@ pub const DocumentArtifactReprocessStatus = struct {
         target_sequence: u64,
         retry_queue_full: bool,
         retrying: bool,
-        next_retry_at_ms: ?u64,
+        next_retry_at_ms: ?u64 = null,
         failed: bool,
         background_running: bool,
     };
