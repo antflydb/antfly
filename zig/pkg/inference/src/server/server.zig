@@ -9908,6 +9908,14 @@ pub const Node = struct {
             var prepared = try qwen3vl_projector.prepareProjectedImageResident(allocator, ctx.cfg, images[0], limits, request.control.imageWorkControl());
             defer prepared.deinit();
             const elapsed = platform.time.monotonicNs() -| started;
+            const profile = ctx.model.session.backend() == .cuda and platform.env.getenvBool("ANTFLY_INFERENCE_READ_PROFILE");
+            const vision_started = if (profile) platform.time.monotonicNs() else 0;
+            defer if (profile) {
+                std.log.info("CUDA reader prepared vision epoch={d} post_preprocess_host_ns={d}", .{
+                    ctx.execution_id, platform.time.monotonicNs() -| vision_started,
+                });
+            };
+
             if (comptime build_options.enable_cuda) if (ctx.model.session.backend() == .cuda)
                 try ctx.preparePinnedInputUpload(try prepared.cudaPatchUploadBytes(ctx.cfg, limits), request.control);
             try request.control.check();

@@ -4025,8 +4025,8 @@ pub const CudaCompute = struct {
             const readback_host_ns = if (self.profile) platform.time.monotonicNs() -| readback_start else 0;
             if (self.log_profile) if (self.launch_route) |route| {
                 if (route == .learned) if (owner.plan) |plan| logLearnedWorkspace(plan, owner.rows);
-                std.log.info("CUDA decoder burst rows={d} route={s} submit_host_ns={d} capture_instantiate_host_ns={d} readback_host_ns={d}", .{
-                    owner.rows, @tagName(route), self.submit_host_ns, self.capture_instantiate_host_ns, readback_host_ns,
+                std.log.info("CUDA decoder burst rows={d} route={s} submit_host_ns={d} capture_instantiate_host_ns={d} readback_host_ns={d} epoch={d}", .{
+                    owner.rows, @tagName(route), self.submit_host_ns, self.capture_instantiate_host_ns, readback_host_ns, owner.epoch_id,
                 });
             };
             if (observation.kernelObservationActive()) if (self.launch_route) |route| {

@@ -291,6 +291,8 @@ pub const Executor = struct {
     }
 
     fn executePooled(self: *Executor, claimed: []const runtime.scheduler.native_generate.StepItem, publication: Publication) void {
+        const profile = self.lighton_cuda_execution_id != 0 and self.context.cb.kind() == .cuda and platform.env.getenvBool("ANTFLY_INFERENCE_READ_PROFILE");
+        const started = if (profile) platform.time.monotonicNs() else 0;
         var result = @import("shared_batch_observation.zig").call(self.batchBinding(), self.context.cb.*, .scheduled_step, claimed, describeParticipant, @This().forwardOwnedCohort, .{ self, claimed }) catch |err| {
             if (self.claimed_execution_scope) |scope| scope.drainBatch();
             publication.publish(claimed, err);
@@ -298,6 +300,14 @@ pub const Executor = struct {
         };
         defer result.deinitWithCleanup(self.context.allocator, .{ .boundary = self.context.cleanupEpoch(), .operation = self.context.cb.operationToken() }) catch platform.inference_process_supervisor.restartWorker();
         if (self.claimed_execution_scope) |scope| scope.drainBatch();
+        if (profile) {
+            const elapsed = platform.time.monotonicNs() -| started;
+            var prefill_items: usize = 0;
+            for (claimed) |item| prefill_items += @intFromBool(item.phase == .prefill);
+            std.log.info("CUDA reader scheduled step epoch={d} prefill_items={d} decode_items={d} paired_tokens={} forward_and_drain_host_ns={d}", .{
+                self.lighton_cuda_execution_id, prefill_items, claimed.len - prefill_items, result.second_greedy_tokens != null, elapsed,
+            });
+        }
         publication.publish(claimed, result);
     }
 
