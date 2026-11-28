@@ -685,7 +685,8 @@ pub fn fieldsFor(comptime T: type) []const FieldLayout {
 /// Version 79 separates frozen PREPARE time from external vote admission time.
 /// Version 83 adds reprocess state to the returned artifact manifest.
 /// Version 84 adds the committed reprocess acceptance and its write option.
-pub const descriptor_version: u32 = 84;
+/// Version 85 includes durable retry diagnostics and extraction receipt publication fencing.
+pub const descriptor_version: u32 = 85;
 pub const Descriptor = extern struct {
     version: u32 = descriptor_version,
     table_layout: native.TypeContract,

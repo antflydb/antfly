@@ -42,9 +42,10 @@ For a specific attempt, the existing source-fetch log includes the document key
 (prefix limited to 256 bytes), producer, replay sequence, and target generation.
 The log omits the source URL. The accepted sequence also appears on explicit
 retry deferral and publication interruption events. Each publication window
-checks the source captured by extraction. If the source was replaced while a
-fetch was running, the old output cannot complete the receipt. Replay can
-publish the extraction of the replacement source. Check the repair ledger
+checks the source captured by extraction. Explicit attempts also validate the
+acceptance receipt in the publication transaction. Replacing an accepted
+attempt fences its in-flight output even if the source bytes are unchanged.
+Replay can then publish from the current source and acceptance. Check the repair ledger
 for terminal failures.
 An extraction timeout reason on the published generation identifies the reported
 stage for that generation.

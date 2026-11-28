@@ -129,6 +129,29 @@ pub const Backlog = struct {
         self.dirty = true;
     }
 
+    /// A certified applied cut supersedes retry debt, including sleepers
+    /// whose provider clocks have not matured. Compact the index in one pass.
+    pub fn retireApplied(self: *Backlog, a: Allocator, applied: u64) !bool {
+        std.debug.assert(self.puts.items.len == 0);
+        var obsolete: usize = 0;
+        for (self.entries.items) |entry| obsolete += @intFromBool(entry.id.sequence <= applied);
+        if (obsolete == 0) return false;
+        try self.deletes.ensureUnusedCapacity(a, obsolete);
+        var retained: usize = 0;
+        for (self.entries.items) |entry| {
+            if (entry.id.sequence <= applied) {
+                self.deletes.appendAssumeCapacity(entry.id);
+                self.charged_bytes -= entry.charged_bytes;
+            } else {
+                self.entries.items[retained] = entry;
+                retained += 1;
+            }
+        }
+        self.entries.shrinkRetainingCapacity(retained);
+        self.dirty = true;
+        return true;
+    }
+
     pub fn decode(a: Allocator, raw: []const u8) !Backlog {
         if (raw.len < header_bytes or raw.len > header_bytes + max_entries * entry_bytes or
             !std.mem.startsWith(u8, raw, index_magic)) return error.InvalidEnrichmentState;
@@ -218,3 +241,40 @@ pub const Backlog = struct {
         try txn.put(index_key, raw);
     }
 };
+
+test "scoped retry workset checkpoints reclamation in constant bytes at the ticket limit" {
+    const a = std.testing.allocator;
+    var backlog: Backlog = .{};
+    defer backlog.deinit(a);
+    try backlog.entries.ensureTotalCapacity(a, max_entries);
+    for (0..max_entries) |i| {
+        backlog.entries.appendAssumeCapacity(.{
+            .id = .{ .document = @splat(1), .sequence = @intCast(i + 1) },
+            .deadline_ms = 10_000,
+            .bytes = 500,
+            .charged_bytes = 1_000,
+        });
+    }
+    backlog.charged_bytes = 1_000 * max_entries;
+    try std.testing.expect(!backlog.canAdd(1));
+    backlog.prune_target = max_entries + 1;
+    backlog.prune_after = backlog.entries.items[63].id;
+    backlog.prune_dirty = true;
+    const Writer = struct {
+        writes: usize = 0,
+        bytes: usize = 0,
+
+        pub fn put(self: *@This(), key: []const u8, bytes: []const u8) anyerror!void {
+            try std.testing.expectEqualStrings(prune_key, key);
+            self.writes += 1;
+            self.bytes += bytes.len;
+        }
+        pub fn delete(_: *@This(), _: []const u8) anyerror!void {
+            return error.TestUnexpectedResult;
+        }
+    };
+    var txn: Writer = .{};
+    try backlog.write(a, &txn);
+    try std.testing.expectEqual(@as(usize, 1), txn.writes);
+    try std.testing.expectEqual(@as(usize, 60), txn.bytes);
+}

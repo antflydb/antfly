@@ -60,8 +60,21 @@ pub fn stampReceipt(raw: []u8, sequence: u64) !void {
 pub fn receiptSequence(raw: []const u8, checked_intent: []const u8) ?u64 {
     if (!isReceipt(raw) or checked_intent.len != encoded_len or
         !std.mem.eql(u8, raw[4..36], checked_intent[44..76])) return null;
+    return stampedSequence(raw);
+}
+
+fn stampedSequence(raw: []const u8) ?u64 {
+    if (!isReceipt(raw)) return null;
     const sequence = std.mem.readInt(u64, raw[36..44], .little);
     return if (sequence == 0) null else sequence;
+}
+
+pub fn requireSequence(txn: anytype, key: []const u8, sequence: u64) !void {
+    const raw = txn.get(key) catch |err| switch (err) {
+        error.NotFound => return error.EnrichmentSourceChanged,
+        else => return err,
+    };
+    if (stampedSequence(raw) != sequence) return error.EnrichmentSourceChanged;
 }
 
 pub fn observeRetry(raw: []const u8) ?RetryObservation {
@@ -227,4 +240,28 @@ test "extraction receipt requires its own publication witness even when another 
     const deferred = withRetry(&receipt, 90, retry).?;
     try std.testing.expectEqual(@as(?u64, 90), receiptSequence(&deferred, &target));
     try std.testing.expectEqual(retry, observeRetry(&deferred).?);
+}
+
+test "extraction receipt publication fence accepts diagnostics and rejects a replacement attempt" {
+    const target = encode("ocr", 2);
+    var first = newReceipt(&target);
+    try stampReceipt(&first, 100);
+    const updated = withRetry(&first, 100, .{
+        .retry_at_ms = 200,
+        .reason = .provider_retry_after,
+        .stage = .ocr,
+    }).?;
+    var replacement = newReceipt(&target);
+    try stampReceipt(&replacement, 101);
+
+    const View = struct {
+        receipt: ?[]const u8,
+        pub fn get(self: @This(), _: []const u8) anyerror![]const u8 {
+            return self.receipt orelse error.NotFound;
+        }
+    };
+    try requireSequence(View{ .receipt = &first }, "receipt", 100);
+    try requireSequence(View{ .receipt = &updated }, "receipt", 100);
+    try std.testing.expectError(error.EnrichmentSourceChanged, requireSequence(View{ .receipt = &replacement }, "receipt", 100));
+    try std.testing.expectError(error.EnrichmentSourceChanged, requireSequence(View{ .receipt = null }, "receipt", 100));
 }

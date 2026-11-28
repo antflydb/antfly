@@ -313,11 +313,21 @@ pub const GeneratedWriteFence = struct {
     replay_generation: ?u64 = null,
 };
 
+const ExtractionReceiptFence = struct {
+    key: []const u8,
+    sequence: u64,
+
+    fn validate(self: @This(), txn: anytype) !void {
+        try reprocess_intent.requireSequence(txn, self.key, self.sequence);
+    }
+};
+
 pub const GeneratedSourceGuard = struct {
     key: []const u8,
     expected_digest: ?[32]u8,
     document_key: ?[]const u8 = null,
     source_sequence: u64 = 0,
+    extraction: ?ExtractionReceiptFence = null,
     embedding: ?struct {
         name: []const u8,
         generation: u64,
@@ -341,6 +351,7 @@ fn validateGeneratedSourceAfterCatalog(alloc: Allocator, txn: anytype, guard: Ge
 }
 
 fn validateGeneratedSourceRecord(alloc: Allocator, txn: anytype, guard: GeneratedSourceGuard) !void {
+    if (guard.extraction) |receipt| try receipt.validate(txn);
     if (guard.document_key) |doc_key| if (guard.source_sequence != 0) {
         if (try @import("../doc_identity.zig").lookupOrdinalTxn(alloc, txn, doc_key)) |ordinal| {
             const state = (try @import("../doc_identity.zig").lookupStateTxn(txn, ordinal)) orelse return error.InvalidDocIdentity;
@@ -854,6 +865,7 @@ const GeneratedReplayWindow = struct {
         for (self.source_guards.items) |guard| self.alloc.free(@constCast(guard.key));
         for (self.source_guards.items) |guard| if (guard.document_key) |key| self.alloc.free(@constCast(key));
         for (self.source_guards.items) |guard| if (guard.embedding) |value| self.alloc.free(value.name);
+        for (self.source_guards.items) |guard| if (guard.extraction) |value| self.alloc.free(value.key);
         self.source_guards.deinit(self.alloc);
 
         for (self.artifact_promotions.items) |promotion| {
@@ -3875,6 +3887,7 @@ const ScopedReplay = struct {
             }
         }
         const sleeping = &self.state.sleeping;
+        if (try sleeping.retireApplied(runtime.alloc, runtime.appliedSequence())) self.unsaved = true;
         if (sleeping.entries.items.len != 0 and target > sleeping.prune_through) {
             if (sleeping.prune_target == sleeping.prune_through) sleeping.prune_target = target;
             i = sleeping.lowerBound(sleeping.prune_after);
@@ -3886,18 +3899,14 @@ const ScopedReplay = struct {
                 const entry = sleeping.entries.items[i];
                 if (visited != 0 and entry.bytes > 4 * 1024 * 1024 -| bytes) break;
                 bytes += entry.bytes;
-                if (entry.id.sequence <= runtime.appliedSequence()) {
-                    try sleeping.remove(runtime.alloc, i);
+                const raw = try enrichment_state.loadScopedRetryBacklogRow(runtime.alloc, runtime.store, entry);
+                defer runtime.alloc.free(raw);
+                var decoded = try scoped_retries.State.readSleeping(runtime.alloc, entry, raw);
+                defer decoded.ticket.deinit(runtime.alloc);
+                if (ticketCurrent(decoded.ticket, try self.observeTicket(runtime, decoded.ticket, decoded.key))) {
+                    i += 1;
                 } else {
-                    const raw = try enrichment_state.loadScopedRetryBacklogRow(runtime.alloc, runtime.store, entry);
-                    defer runtime.alloc.free(raw);
-                    var decoded = try scoped_retries.State.readSleeping(runtime.alloc, entry, raw);
-                    defer decoded.ticket.deinit(runtime.alloc);
-                    if (ticketCurrent(decoded.ticket, try self.observeTicket(runtime, decoded.ticket, decoded.key))) {
-                        i += 1;
-                    } else {
-                        try sleeping.remove(runtime.alloc, i);
-                    }
+                    try sleeping.remove(runtime.alloc, i);
                 }
                 sleeping.prune_after = entry.id;
                 sleeping.prune_dirty = true;
@@ -5132,6 +5141,7 @@ fn restoreScopedRetryCache(runtime: anytype) !void {
             state.removeTicket(runtime.alloc, stale);
         } else stale += 1;
     }
+    _ = try state.sleeping.retireApplied(runtime.alloc, runtime.applied_sequence);
     const config_changed = state.config_hash != 0 and state.config_hash != try enrichmentCatalogConfigHash(runtime.alloc, runtime.index_manager);
     runtime.scoped_retry_scan_sequence = @max(state.scanned_sequence, runtime.applied_sequence);
     runtime.target_sequence = @max(runtime.target_sequence, state.scanned_sequence);
@@ -22155,11 +22165,20 @@ fn processDocumentExtractionAsset(
     const observed = (try ScopedReplay.stampFor(runtime, request, sourceRecordDigest(raw_doc))) orelse return error.EnrichmentSourceChanged;
     const primary_key = try documentSourceStoreKeyAlloc(runtime, request.doc_key);
     defer runtime.alloc.free(primary_key);
+    // An explicit acceptance can be replaced without changing the primary
+    // bytes. Revalidate that attempt inside every publication transaction.
+    const accepted_sequence = if (reprocess.sequence != 0) reprocess.sequence else request.reprocess_generation;
+    const receipt_fence: ?ExtractionReceiptFence = if (accepted_sequence != 0) .{
+        .key = try reprocess_intent.receiptKeyAlloc(runtime.alloc, request.doc_key, artifact_name),
+        .sequence = accepted_sequence,
+    } else null;
+    defer if (receipt_fence) |value| runtime.alloc.free(value.key);
     const source_guard = GeneratedSourceGuard{
         .key = primary_key,
         .expected_digest = observed.digest,
         .document_key = request.doc_key,
         .source_sequence = request.sequence,
+        .extraction = receipt_fence,
     };
     // Past this point the declared digest (if any) did not already prove
     // this extraction unnecessary: the source is about to be fetched for
@@ -22200,6 +22219,7 @@ fn processDocumentExtractionAsset(
             existing_state,
             from_generation,
             if (reprocess.sequence != 0) reprocess.sequence else published.reprocess_sequence,
+            receipt_fence,
             request.execution_json,
             window,
             scope,
@@ -22235,6 +22255,7 @@ fn processDocumentExtractionAsset(
                 existing_state,
                 from_generation,
                 if (reprocess.sequence != 0) reprocess.sequence else published.reprocess_sequence,
+                receipt_fence,
                 request.execution_json,
                 window,
                 scope,
@@ -22271,6 +22292,7 @@ fn processDocumentExtractionAsset(
             existing_state,
             from_generation,
             if (reprocess.sequence != 0) reprocess.sequence else published.reprocess_sequence,
+            receipt_fence,
             request.execution_json,
             window,
             scope,
@@ -22364,6 +22386,7 @@ fn processDocumentExtractionAsset(
                 existing_state,
                 from_generation,
                 if (reprocess.sequence != 0) reprocess.sequence else published.reprocess_sequence,
+                receipt_fence,
                 request.execution_json,
                 window,
                 scope,
@@ -22539,6 +22562,7 @@ fn processDocumentExtractionAsset(
             existing_state,
             from_generation,
             if (reprocess.sequence != 0) reprocess.sequence else published.reprocess_sequence,
+            receipt_fence,
             request.execution_json,
             window,
             scope,
@@ -22773,6 +22797,7 @@ fn processDocumentExtractionAsset(
             existing_state,
             from_generation,
             if (reprocess.sequence != 0) reprocess.sequence else published.reprocess_sequence,
+            receipt_fence,
             request.execution_json,
             window,
             scope,
@@ -22950,6 +22975,7 @@ fn writeDocumentExtractionFailureManifest(
     existing_state: ?[]const u8,
     from_generation: u64,
     reprocess_sequence: u64,
+    receipt_fence: ?ExtractionReceiptFence,
     execution_json: []const u8,
     window: *GeneratedReplayWindow,
     scope: *FailureScope,
@@ -23000,6 +23026,7 @@ fn writeDocumentExtractionFailureManifest(
     storePutBatchGuardedWithRetry(runtime, &.{.{ .key = manifest_key, .value = manifest }}, &.{}, .{
         .doc_key = doc_key,
         .digest = sourceRecordDigest(raw_doc),
+        .extraction = receipt_fence,
     }) catch |err| return FailureScope.assetPublicationFailure(scope, err);
     appendUniqueIndexedRuntimeKey(runtime.alloc, &window.changed_artifact_keys, &window.changed_artifact_key_index, manifest_key) catch |err| return FailureScope.assetPublicationFailure(scope, err);
     recordArtifactBytes(runtime, .asset, manifest.len);
@@ -29517,7 +29544,7 @@ const RuntimeDocumentPublicationSpool = struct {
             // bounded publication-window semantics as the old record loop.
             for (segment.items) |*item| {
                 if (needs_source_guard) {
-                    try appendGeneratedSourceGuard(runtime, window, source_guard.key, source_guard.expected_digest, source_guard.document_key, source_guard.source_sequence);
+                    try appendExtractionSourceGuard(runtime, window, source_guard);
                     needs_source_guard = false;
                 }
                 switch (item.record.value.action) {
@@ -30519,6 +30546,7 @@ fn runtimeDocumentExtractionWindowBytes(window: *const GeneratedReplayWindow) us
         total = addUsizeSaturating(total, guard.key.len);
         if (guard.document_key) |key| total = addUsizeSaturating(total, key.len);
         if (guard.embedding) |value| total = addUsizeSaturating(total, value.name.len);
+        if (guard.extraction) |value| total = addUsizeSaturating(total, value.key.len);
     }
     for (window.artifact_promotions.items) |promotion| {
         total = addUsizeSaturating(total, promotion.staged_key.len);
@@ -36967,6 +36995,7 @@ fn freeGeneratedSourceGuards(alloc: Allocator, guards: []const GeneratedSourceGu
         alloc.free(@constCast(guard.key));
         if (guard.document_key) |key| alloc.free(@constCast(key));
         if (guard.embedding) |value| alloc.free(value.name);
+        if (guard.extraction) |value| alloc.free(value.key);
     }
     if (guards.len > 0) alloc.free(guards);
 }
@@ -36984,6 +37013,14 @@ fn appendGeneratedSourceGuard(
     const owned_doc_key = if (document_key) |doc_key| try runtime.alloc.dupe(u8, doc_key) else null;
     errdefer if (owned_doc_key) |doc_key| runtime.alloc.free(doc_key);
     try window.source_guards.append(runtime.alloc, .{ .key = owned_key, .expected_digest = expected_digest, .document_key = owned_doc_key, .source_sequence = source_sequence });
+}
+
+fn appendExtractionSourceGuard(runtime: *EnrichmentRuntime, window: *GeneratedReplayWindow, guard: GeneratedSourceGuard) !void {
+    var receipt = guard.extraction;
+    if (receipt) |*value| value.key = try runtime.alloc.dupe(u8, value.key);
+    errdefer if (receipt) |value| runtime.alloc.free(value.key);
+    try appendGeneratedSourceGuard(runtime, window, guard.key, guard.expected_digest, guard.document_key, guard.source_sequence);
+    window.source_guards.items[window.source_guards.items.len - 1].extraction = receipt;
 }
 
 fn captureEmbeddingSourceGuard(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest, source_key: []const u8, digest: ?[32]u8) !GeneratedSourceGuard {
@@ -44481,6 +44518,7 @@ fn storePut(runtime: *EnrichmentRuntime, key: []const u8, value: []const u8) !vo
 const LocalSourceFence = struct {
     doc_key: []const u8,
     digest: ?[32]u8,
+    extraction: ?ExtractionReceiptFence = null,
     upstream_name: []const u8 = "",
     upstream_digest: ?[32]u8 = null,
     upstream_absent: bool = false,
@@ -44600,6 +44638,7 @@ fn requireLocalAssetSourceWithAllocator(runtime: *EnrichmentRuntime, alloc: Allo
 
 fn validateLocalSourceFence(runtime: *EnrichmentRuntime, txn: anytype, guard: LocalSourceFence) !void {
     if (try @import("../../source_authority.zig").maintenanceMode(txn) != .local) return error.ArtifactPublicationPending;
+    if (guard.extraction) |receipt| try receipt.validate(txn);
     if (guard.producer_recipe) |expected| {
         const entry = runtime.index_manager.getEnrichment(.asset, guard.producer_name) orelse return error.EnrichmentSourceChanged;
         if (!std.mem.eql(u8, &expected, &@import("../artifact_local_publication.zig").recipe(entry))) return error.EnrichmentSourceChanged;
@@ -56004,6 +56043,8 @@ test "durable enrichment scoped retry permits healthy targets and restores exact
     try std.testing.expectEqual(deadline, recovered.state.deadline());
     try recovered.saveAssumeLocked(&runtime, erased, null);
     try std.testing.expect(!recovered.unsaved);
+    try std.testing.expect(try recovered.state.spill(a, 0, ScopedReplay.documentResolver(&runtime)));
+    try recovered.saveAssumeLocked(&runtime, erased, null);
     runtime.applied_sequence = 100;
     runtime.retrying = true;
     runtime.next_retry_at_ms = deadline;
@@ -56043,6 +56084,35 @@ test "durable enrichment scoped retry permits healthy targets and restores exact
     const after = try restored_cohort.due(a, cohort_deadline);
     defer after.deinit(a);
     try std.testing.expectEqual(@as(usize, 2), after.groups.len);
+}
+
+test "scoped retry workset rejects stale extraction publication for an unchanged primary" {
+    const a = std.testing.allocator;
+    const Read = struct {
+        receipt: []const u8,
+        pub fn get(self: @This(), key: []const u8) anyerror![]const u8 {
+            if (std.mem.eql(u8, key, "receipt")) return self.receipt;
+            if (std.mem.eql(u8, key, "primary")) return "{}";
+            return error.NotFound;
+        }
+        pub fn put(_: @This(), _: []const u8, _: []const u8) anyerror!void {
+            return error.TestUnexpectedResult;
+        }
+    };
+    const target = reprocess_intent.encode("ocr", 2);
+    var initial = reprocess_intent.newReceipt(&target);
+    try reprocess_intent.stampReceipt(&initial, 7);
+    var replacement = reprocess_intent.newReceipt(&target);
+    try reprocess_intent.stampReceipt(&replacement, 8);
+    var guard: GeneratedSourceGuard = .{
+        .key = "primary",
+        .expected_digest = sourceRecordDigest("{}"),
+        .extraction = .{ .key = "receipt", .sequence = 7 },
+    };
+    try validateGeneratedSourceGuard(a, Read{ .receipt = &initial }, guard);
+    try std.testing.expectError(error.EnrichmentSourceChanged, validateGeneratedSourceGuard(a, Read{ .receipt = &replacement }, guard));
+    guard.extraction.?.sequence = 8;
+    try validateGeneratedSourceGuard(a, Read{ .receipt = &replacement }, guard);
 }
 
 test "scoped retry workset reports a blocked document at the durable byte limit" {
