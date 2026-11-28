@@ -13124,6 +13124,13 @@ fn attnProject(
             const name = std.fmt.bufPrint(buf, "model.layers.{d}.self_attn.{s}_proj.weight", .{ layer, proj }) catch return error.NameTooLong;
             const w = try getModelWeight(cb, config, name);
             defer cb.free(w);
+            if (comptime build_options.enable_cuda) {
+                if (config.hasQwen35VisionArchitectureContract() and cb.kind() == .cuda) {
+                    const projection: @import("../ops/cuda/bounded_decode_graph.zig").Module.AttentionProjection =
+                        if (std.mem.eql(u8, proj, "q")) .query else if (std.mem.eql(u8, proj, "k")) .key else .value;
+                    if (try @import("../ops/cuda/cuda_compute.zig").tryCapturedQkvProjection(cb, input, w, total, in_dim, out_dim, projection)) |assigned| return assigned;
+                }
+            }
             return cb.linearNoBias(input, w, total, in_dim, out_dim);
         },
         .gpt2 => {

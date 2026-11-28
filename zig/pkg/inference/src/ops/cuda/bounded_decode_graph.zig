@@ -94,6 +94,8 @@ pub const StorageLayout = struct {
     projection_staging: ?Span = null,
     attention_residual: ?Span = null,
     attention_inputs: ?Span = null,
+    attention_projections: ?Span = null,
+    attention_projection_bytes: [3]usize = @splat(0),
     layer_norm: ?Span = null,
     layer_norm_mirror: ?Span = null,
     final_norm_mirror: ?Span = null,
@@ -216,6 +218,7 @@ pub const StorageLayout = struct {
             self.ffn_outputs,
             self.attention_residual,
             self.attention_inputs,
+            self.attention_projections,
             self.layer_norm,
             self.layer_norm_mirror,
         }) |slot| if (slot) |span| {
@@ -287,6 +290,7 @@ pub const Descriptor = struct {
     future_tokens: usize,
     head_storage: HeadStorage = .full_bank,
     attention_geometry: ?DecodeScratch.Geometry = null,
+    attention_q_gate: bool = false,
     recurrent_heads: ?struct { key: usize, value: usize } = null,
     attention_layers: usize,
     recurrent_layers: usize,
@@ -438,6 +442,15 @@ pub const GraphPhase = struct {
                 const offset = try StorageLayout.aligned(try self.storage_layout.layerLiveBytes());
                 self.storage_layout.attention_inputs = try self.storage_layout.declareLayerRegion(offset, inputs.bytes);
             }
+        }
+        if (policy.layer_norm and self.descriptor.attention_layers != 0) {
+            const geometry = self.descriptor.attention_geometry orelse return error.InvalidShape;
+            const inputs = try AttentionInputs.init(self.descriptor.rows, geometry.heads, geometry.kv_heads, geometry.dim);
+            const query_bytes = if (self.descriptor.attention_q_gate) try std.math.mul(usize, inputs.query_bytes, 2) else inputs.query_bytes;
+            const bytes = try std.math.add(usize, query_bytes, try std.math.mul(usize, inputs.key_bytes, 2));
+            const offset = try StorageLayout.aligned(try self.storage_layout.layerLiveBytes());
+            self.storage_layout.attention_projections = try self.storage_layout.declareLayerRegion(offset, bytes);
+            self.storage_layout.attention_projection_bytes = .{ query_bytes, inputs.key_bytes, inputs.key_bytes };
         }
         if (policy.projection_staging) try self.declareProjectionStaging();
         if (policy.final_norm_mirror) try self.declareFinalNormMirror();
@@ -972,6 +985,22 @@ pub const Module = struct {
         const layout = self.storage_layout orelse return error.InvalidExecutionPlan;
         const span = layout.fused_head_workspace orelse return error.InvalidExecutionPlan;
         return self.bindLayerWorkspace(layout, span, span.bytes);
+    }
+
+    pub const AttentionProjection = enum { query, key, value };
+
+    pub fn bindAttentionProjection(self: *const Module, kind: AttentionProjection, bytes: usize) !?buffer.DeviceBuffer {
+        const layout = self.storage_layout orelse return error.InvalidExecutionPlan;
+        const span = layout.attention_projections orelse return null;
+        const index = @backingInt(kind);
+        if (layout.attention_projection_bytes[index] != bytes) return error.InvalidExecutionPlan;
+        const offset: usize = switch (kind) {
+            .query => 0,
+            .key => layout.attention_projection_bytes[0],
+            .value => try std.math.add(usize, layout.attention_projection_bytes[0], layout.attention_projection_bytes[1]),
+        };
+        const bank = try self.bindLayerWorkspace(layout, span, span.bytes);
+        return try bank.borrowRange(offset, bytes);
     }
 
     pub fn bindAttentionInputs(self: *const Module, inputs: AttentionInputs) !?[3]buffer.DeviceBuffer {

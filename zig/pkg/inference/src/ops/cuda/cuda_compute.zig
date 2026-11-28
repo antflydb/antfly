@@ -4028,6 +4028,7 @@ pub const CudaCompute = struct {
                     .declared_projection_staging_bytes = if (layout.projection_staging) |span| span.bytes else 0,
                     .declared_attention_residual_bytes = if (layout.attention_residual) |span| span.bytes else 0,
                     .declared_attention_inputs_bytes = if (layout.attention_inputs) |span| span.bytes else 0,
+                    .declared_attention_projection_bytes = layout.attention_projection_bytes,
                     .declared_layer_norm_bytes = if (layout.layer_norm) |span| span.bytes else 0,
                     .declared_layer_norm_mirror_bytes = if (layout.layer_norm_mirror) |span| span.bytes else 0,
                     .declared_final_norm_mirror_bytes = if (layout.final_norm_mirror) |span| span.bytes else 0,
@@ -4356,7 +4357,7 @@ pub const CudaCompute = struct {
         const vendor = self.currentGraphVendorWorkspace() orelse return error.PreparedCachePlanChanged;
         if (!std.meta.eql(vendor, graph_phase.vendor_workspace)) return error.PreparedCachePlanChanged;
         const descriptor = graph_phase.descriptor;
-        if (graph_phase.expected_compute != @intFromPtr(self) or descriptor.epoch != epoch or descriptor.rows != rows or descriptor.hidden != hidden or descriptor.vocab != vocab or descriptor.future_tokens != future_tokens or !std.meta.eql(descriptor.attention_geometry, expected.attention_geometry) or !std.meta.eql(descriptor.recurrent_heads, expected.recurrent_heads) or descriptor.attention_layers != expected.attention_layers or descriptor.recurrent_layers != expected.recurrent_layers or descriptor.ffn_intermediate != expected.ffn_intermediate or !std.meta.eql(descriptor.head_storage, expected.head_storage) or !std.mem.eql(u64, descriptor.key, key) or !std.mem.eql(u32, descriptor.positions, positions) or !std.mem.eql(u64, descriptor.sequences, expected.sequences)) return error.PreparedCachePlanChanged;
+        if (graph_phase.expected_compute != @intFromPtr(self) or descriptor.epoch != epoch or descriptor.rows != rows or descriptor.hidden != hidden or descriptor.vocab != vocab or descriptor.future_tokens != future_tokens or !std.meta.eql(descriptor.attention_geometry, expected.attention_geometry) or !std.meta.eql(descriptor.recurrent_heads, expected.recurrent_heads) or descriptor.attention_layers != expected.attention_layers or descriptor.recurrent_layers != expected.recurrent_layers or descriptor.ffn_intermediate != expected.ffn_intermediate or descriptor.attention_q_gate != expected.attention_q_gate or !std.meta.eql(descriptor.head_storage, expected.head_storage) or !std.mem.eql(u64, descriptor.key, key) or !std.mem.eql(u32, descriptor.positions, positions) or !std.mem.eql(u64, descriptor.sequences, expected.sequences)) return error.PreparedCachePlanChanged;
         const owner = &self.bounded_decode_graph;
         while (!owner.mutex.tryLock()) std.atomic.spinLoopHint();
         var claimed = false;
@@ -29947,6 +29948,19 @@ pub fn tryCapturedFinalNorm(cb: *const ops.ComputeBackend, input: CT, weight: CT
         try buffer_mod.validateRegions(4, regions, .{ source.buffer.len, gamma.buffer.len, bytes, span.len }, .{ @alignOf(f32), 1, @alignOf(f32), @alignOf(u16) }, 2);
     }
     return try rmsNormWithDestination(cb.ptr, input, weight, dim, eps, destination, mirror);
+}
+
+pub fn tryCapturedQkvProjection(cb: *const ops.ComputeBackend, input: CT, weight: CT, rows: usize, in_dim: usize, out_dim: usize, kind: @import("bounded_decode_graph.zig").Module.AttentionProjection) !?CT {
+    if (!acceptsPhysicalImplementation(cb.vtable)) return null;
+    const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
+    const owner = &self.bounded_decode_graph;
+    if (!owner.active or self.capability_profile != .lightonocr3 or rows != owner.rows or in_dim != owner.hidden) return null;
+    const lhs = tensorFromCt(input);
+    const rhs = tensorFromCt(weight);
+    const bytes = try lightOnLinearOutputBytes(self, rhs, rows, out_dim);
+    const destination = (try owner.bindAttentionProjection(kind, bytes)) orelse return null;
+    if (kernel_geometry.byteRangesOverlap(destination.ptr, destination.len, lhs.bf16_mirror.ptr, lhs.bf16_mirror.len)) return error.InvalidAssignedAlias;
+    return try cb.observeBackendEntry(.linear_no_bias, &linearNoBiasWithDestination, .{ self, input, weight, rows, in_dim, out_dim, false, @as(?buffer_mod.DeviceBuffer, destination) });
 }
 
 /// Attention has consumed its input normalization before the output GEMM.

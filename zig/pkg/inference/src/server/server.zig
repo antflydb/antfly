@@ -48837,10 +48837,15 @@ test "LightOnOCR3 real checkpoint transcribes the invoice fixture" {
                 std.mem.alignForward(usize, layer_and_residual_bytes, alignment) + inputs_bytes
             else
                 layer_and_residual_bytes;
+            const projections = report.declared_attention_projection_bytes;
+            const kv_projection_bytes = report.rows * geometry.effectiveKVHeads() * geometry.headDim() * @sizeOf(f32);
+            const q_projection_bytes = attention_output * @as(usize, if (geometry.qwen35_attn_output_gate) 2 else 1);
+            try std.testing.expectEqualDeep([3]usize{ q_projection_bytes, kv_projection_bytes, kv_projection_bytes }, projections);
+            const layer_and_projections_bytes = std.mem.alignForward(usize, layer_and_inputs_bytes, alignment) + q_projection_bytes + 2 * kv_projection_bytes;
             const layer_and_staging_bytes = if (report.declared_projection_staging_bytes != 0)
-                std.mem.alignForward(usize, @max(layer_and_inputs_bytes, report.shared_head_scratch_bytes), alignment) + report.declared_projection_staging_bytes
+                std.mem.alignForward(usize, @max(layer_and_projections_bytes, report.shared_head_scratch_bytes), alignment) + report.declared_projection_staging_bytes
             else
-                layer_and_inputs_bytes;
+                layer_and_projections_bytes;
             const through_head_bytes = @max(layer_and_staging_bytes, report.shared_head_scratch_bytes, report.fused_head_scratch_bytes);
             const mirror_bytes = report.declared_final_norm_mirror_bytes;
             if (mirror_bytes != 0) try std.testing.expectEqual(report.rows * geometry.hidden_size * @sizeOf(u16), mirror_bytes);

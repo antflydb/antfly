@@ -556,6 +556,7 @@ pub const CudaDecoderWorkspace = struct {
     declared_projection_staging_bytes: usize = 0,
     declared_attention_residual_bytes: usize = 0,
     declared_attention_inputs_bytes: usize = 0,
+    declared_attention_projection_bytes: [3]usize = @splat(0),
     declared_layer_norm_bytes: usize = 0,
     declared_layer_norm_mirror_bytes: usize = 0,
     declared_final_norm_mirror_bytes: usize = 0,
