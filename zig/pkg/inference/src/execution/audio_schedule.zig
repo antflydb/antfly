@@ -117,9 +117,16 @@ pub const ExecutionInputs = struct {
     }
 };
 
+pub const WorkspaceDeclaration = struct {
+    /// Borrowed for the synchronous Stage lifetime, never stored in a cache.
+    events: []const @import("stream_workspace.zig").Plan.Declaration,
+    published_slot: u15,
+};
+
 /// Copied operation geometry only. The actual Stage certifies the model and
 /// rebuilds mutable backend policy/learned-layout requests after every yield.
 pub const AudioRecipe = struct {
+    workspace: ?WorkspaceDeclaration = null,
     source_bf16: bool = false,
     gradient_clipping_bits: u32 = 0,
     frames: [GroupedRows.max_clips]usize = @splat(0),

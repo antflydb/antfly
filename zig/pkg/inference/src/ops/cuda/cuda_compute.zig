@@ -8003,12 +8003,20 @@ pub const CudaCompute = struct {
         const inputs = try Inputs.describe(&shapes, rows, recipe.hidden, recipe.context_left, recipe.heads);
         const execution_key = recipe.key(segments[0..recipe.count], 0, recipe.blocks);
         const base = try self.audioCacheBase(execution_key, inputs[0..Inputs.activeCount(!recipe.source_bf16)], null);
-        const entry = self.audioPlanFor(base) orelse return;
-        const executable = entry.executableFor(base);
-        if (executable == null and !try audioWorkspaceLowerBoundFits(recipe, segments[0..recipe.count], rows, base)) return;
-        if (entry.owner == null or !entry.owner.?.managed)
-            try builder.add(.{ .audio_learning = .{ .key = base.key } });
-        if (executable) |plan| try builder.add(audioArenaRequest(plan));
+        const existing = self.audioPlanFor(base);
+        if (existing) |entry| if (entry.executableFor(base)) |plan| {
+            if (!entry.owner.?.managed) try builder.add(.{ .audio_learning = .{ .key = base.key } });
+            try builder.add(audioArenaRequest(plan));
+            return;
+        };
+        if (!try audioWorkspaceLowerBoundFits(recipe, segments[0..recipe.count], rows, base)) return;
+        if (recipe.workspace) |workspace| {
+            // Seal the exact same event program before reserving either charge.
+            var preview: AudioPlan.Owner = .{ .allocator = std.heap.page_allocator };
+            try preview.declare(base, workspace.events, workspace.published_slot);
+            try builder.add(.{ .audio_learning = .{ .key = base.key, .declared_cold = true } });
+            try builder.add(audioArenaRequest(preview.executable.?));
+        } else if (existing != null) try builder.add(.{ .audio_learning = .{ .key = base.key } });
     }
 
     pub fn visionArenaRequest(self: *const CudaCompute, batch: usize, grid_x: usize, grid_y: usize, rotary: bool) !CacheFunding.Request {

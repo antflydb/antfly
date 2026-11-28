@@ -2822,10 +2822,7 @@ pub const ComputeBackend = struct {
         rows: usize,
     };
 
-    pub const AudioWorkspaceDeclaration = struct {
-        events: []const @import("../execution/stream_workspace.zig").Plan.Declaration,
-        published_slot: u15,
-    };
+    pub const AudioWorkspaceDeclaration = @import("../execution/audio_schedule.zig").WorkspaceDeclaration;
 
     pub const AudioDispatch = struct {
         cleanup: @import("../execution/cleanup_context.zig").Context = .{},
