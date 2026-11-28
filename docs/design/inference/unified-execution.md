@@ -3446,6 +3446,15 @@ arms replayed at 113 rows. No arm exercised a completed rebind,
 so the timing comparison does not qualify changing-cohort replay.
 All four focused CUDA checks passed.
 
+A deterministic follow-up on Spark captured a graph that reads the
+recurrent and attention tables and positions. After the follower was
+released, a malformed replacement left replay suspended. A valid
+replacement kept the same graph executable and device-table addresses,
+and replay read the new recurrent pointer, block ID, token count and
+positions. All four CUDA checks passed, including the released 0.8B
+model. The fixture qualifies device binding and failure handling.
+Changing-cohort model inference and throughput remain unqualified.
+
 The M4 Max focused cohort at `061f213135` passed all seven checks
 with zero skips. It exercised the shared installed Whisper Small
 checkpoint with the Metal backend required, verified assigned packed

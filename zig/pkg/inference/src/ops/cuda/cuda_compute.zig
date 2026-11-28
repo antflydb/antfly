@@ -3784,6 +3784,31 @@ pub const CudaCompute = struct {
         try copyFromHostTracked(self, table, std.mem.sliceAsBytes(tables[0..packets]));
     }
 
+    fn resetBoundedGraphInputs(self: *CudaCompute, descriptor: @import("bounded_decode_graph.zig").Descriptor) !void {
+        const owner = &self.bounded_decode_graph;
+        if (descriptor.attention_page_key_start != null) {
+            owner.attention_page_tables_staged = false;
+            try self.stageBoundedAttentionPages(descriptor, descriptor.attention_page_size);
+            owner.attention_page_tables_staged = true;
+        }
+        const positions = descriptor.positions;
+        try copyFromHostTracked(self, owner.positions(), std.mem.sliceAsBytes(positions));
+        const zero = [_]u32{0};
+        try copyFromHostTracked(self, owner.counter(), std.mem.sliceAsBytes(&zero));
+        owner.progress = 0;
+        @memcpy(owner.base_positions[0..positions.len], positions);
+        @memcpy(owner.next_positions[0..positions.len], positions);
+    }
+
+    fn rebindBoundedGraphInputs(self: *CudaCompute, phase: *const @import("bounded_decode_graph.zig").GraphPhase) !void {
+        const owner = &self.bounded_decode_graph;
+        if (!phase.canRebind(owner)) return error.PreparedCachePlanChanged;
+        try self.stageBoundedRecurrentPages(phase.descriptor);
+        owner.recurrent_page_table_staged = true;
+        try self.resetBoundedGraphInputs(phase.descriptor);
+        owner.publishRebind(phase.descriptor);
+    }
+
     pub fn lightOnGraphStateOwned(cb: *const ops.ComputeBackend, state: *const @import("gated_delta.zig").State) bool {
         const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
         const eligible = state.ctx == &self.ctx and state.initialized and !state.failed and
@@ -4197,16 +4222,8 @@ pub const CudaCompute = struct {
         const owner = &self.bounded_decode_graph;
         if (!owner.retirementPending() or !owner.references(dependency)) return;
         if (dependency) |binding| {
-            if (platform.env.getenvBool("ANTFLY_CUDA_LIGHTON_GRAPH_REBIND") and owner.canSuspendBinding(binding)) {
-                try owner.validateCleanup(current);
-                if (!owner.rebind_required) {
-                    // The old tables remain in the graph, but no caller may
-                    // submit them after the departing row can recycle state.
-                    try self.ctx.synchronize();
-                    owner.rebind_required = true;
-                }
-                return;
-            }
+            if (platform.env.getenvBool("ANTFLY_CUDA_LIGHTON_GRAPH_REBIND") and
+                try self.suspendBoundedGraphBinding(current, binding)) return;
         }
         try self.retireCapturedGraph(current, reason);
     }
@@ -4471,6 +4488,19 @@ pub const CudaCompute = struct {
         if (phase.mode == .arena and !phase.matchesOwner(owner)) return error.PreparedCachePlanChanged;
         try phase.bind(current);
     }
+    fn suspendBoundedGraphBinding(self: *CudaCompute, current: CacheCleanup, dependency: @import("bounded_decode_graph.zig").Module.Dependency) !bool {
+        const owner = &self.bounded_decode_graph;
+        if (!owner.canSuspendBinding(dependency)) return false;
+        try owner.validateCleanup(current);
+        if (!owner.rebind_required) {
+            // No later submission may observe the old tables once the
+            // departing row's state can be reused.
+            try self.ctx.synchronize();
+            owner.rebind_required = true;
+        }
+        return true;
+    }
+
     fn retireCapturedGraph(self: *CudaCompute, current: CacheCleanup, reason: GraphRetirement) !void {
         const observation = @import("../../execution/runtime_observation.zig");
         const owner = &self.bounded_decode_graph;
@@ -4543,7 +4573,7 @@ pub const CudaCompute = struct {
         }
         const head_destination = try owner.bindExecutionStorage();
         const capture_scope = if (owner.phase == .capture) try owner.bindArena() else null;
-        if ((rebind or !owner.recurrent_page_table_staged) and descriptor.recurrent_page_key_start != null) {
+        if (!rebind and !owner.recurrent_page_table_staged and descriptor.recurrent_page_key_start != null) {
             try self.stageBoundedRecurrentPages(descriptor);
             owner.recurrent_page_table_staged = true;
         }
@@ -4551,24 +4581,11 @@ pub const CudaCompute = struct {
         try self.lighton_attention.init(&self.ctx);
         if (owner.phase == .warm and owner.storage_layout.?.fused_head_workspace != null)
             try self.lighton_head.init(&self.ctx);
-        if (owner.phase != .replay or rebind) {
-            if (descriptor.attention_page_key_start != null) {
-                owner.attention_page_tables_staged = false;
-                try self.stageBoundedAttentionPages(descriptor, descriptor.attention_page_size);
-                owner.attention_page_tables_staged = true;
-            }
-            owner.progress = 0;
-            @memcpy(owner.base_positions[0..positions.len], positions);
-            @memcpy(owner.next_positions[0..positions.len], positions);
-            try copyFromHostTracked(self, owner.positions(), std.mem.sliceAsBytes(positions));
-            const zero = [_]u32{0};
-            try copyFromHostTracked(self, owner.counter(), std.mem.sliceAsBytes(&zero));
-        }
         if (rebind) {
-            owner.publishRebind(descriptor);
+            try self.rebindBoundedGraphInputs(graph_phase);
             if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
                 std.debug.print("LIGHTONOCR3 cuda_model_graph_rebound_rows={d}\n", .{rows});
-        }
+        } else if (owner.phase != .replay) try self.resetBoundedGraphInputs(descriptor);
 
         // Ensure the owned cohort can retain its warmed plans. Prefill shape
         // diversity may exhaust the cache between otherwise valid epochs.
@@ -59572,6 +59589,138 @@ test "captured graph prefunded nonempty program and learned workspace replay aft
     workspace_lease.release();
     peer_lease.release();
     try std.testing.expectEqualDeep(@import("../../runtime/tier/memory.zig").AdmissionAmounts{}, domain.controller.snapshot());
+}
+
+test "CUDA reader replays one executable after staged follower replacement" {
+    if (comptime !cuda_enabled) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const Graph = @import("bounded_decode_graph.zig");
+    const Attention = @import("paged_attention_bf16.zig");
+    const RecurrentPage = @import("gated_delta.zig").BatchPage;
+    var compute = try CudaCompute.testing.init(a);
+    defer compute.deinit();
+    const owner = &compute.bounded_decode_graph;
+    var departing = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, 64);
+    defer _ = departing.freeChecked(&compute.ctx) catch unreachable;
+    var replacement = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, 64);
+    defer _ = replacement.freeChecked(&compute.ctx) catch unreachable;
+    const key = [_]u64{
+        100,                10, 11, 12,            13,
+        21,                 22, 23, departing.ptr, departing.ptr + 16,
+        departing.ptr + 32, 3,  16, 1,             1,
+        4,                  16, 1,  2,             90,
+        91,                 92, 93,
+    };
+    const descriptor: Graph.Descriptor = .{
+        .epoch = 1,
+        .key = &key,
+        .sequences = &.{ 3, 4 },
+        .positions = &.{ 1, 2, 3, 4, 5, 6 },
+        .rows = 2,
+        .hidden = 1024,
+        .vocab = 128,
+        .future_tokens = 16,
+        .attention_layers = 1,
+        .recurrent_layers = 1,
+        .recurrent_page_key_start = 1,
+        .attention_page_key_start = 11,
+        .attention_page_size = 16,
+        .attention_tokens = &.{ 5, 7 },
+    };
+    const layout = try descriptor.layout();
+    owner.metadata = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, layout.metadata_bytes);
+    owner.storage_layout = layout;
+    owner.host_allocator = a;
+    owner.key = try a.dupe(u64, &key);
+    owner.epoch_id = descriptor.epoch;
+    owner.rows = descriptor.rows;
+    owner.hidden = descriptor.hidden;
+    owner.vocab = descriptor.vocab;
+    owner.attention_layers = descriptor.attention_layers;
+    owner.recurrent_layers = descriptor.recurrent_layers;
+    owner.sequences[0..2].* = .{ 3, 4 };
+    owner.sequence_count = 2;
+    owner.recurrent_page_key_start = descriptor.recurrent_page_key_start;
+    owner.attention_page_size = descriptor.attention_page_size;
+    var receipt: buffer_mod.DeviceBuffer = .{};
+    defer _ = receipt.freeChecked(&compute.ctx) catch unreachable;
+    defer compute.clearCapturedGraphWithCleanup(.{ .outside_execution = true }) catch unreachable;
+
+    try compute.stageBoundedRecurrentPages(descriptor);
+    owner.recurrent_page_table_staged = true;
+    try compute.resetBoundedGraphInputs(descriptor);
+    const recurrent = owner.recurrentPageTable().?;
+    const attention = owner.attentionPageTables().?;
+    receipt = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, recurrent.len + attention.len + owner.positions().len);
+    const recurrent_receipt = try receipt.borrowRange(0, recurrent.len);
+    const attention_receipt = try receipt.borrowRange(recurrent.len, attention.len);
+    const position_receipt = try receipt.borrowRange(recurrent.len + attention.len, owner.positions().len);
+
+    try compute.ctx.synchronize();
+    try compute.ctx.beginStreamCapture(driver_mod.CU_STREAM_CAPTURE_MODE_GLOBAL);
+    errdefer if (compute.ctx.debug_graph_capture_active) {
+        owner.pending_graph = compute.ctx.endStreamCapture() catch null;
+    };
+    try recurrent_receipt.copyFromDevice(&compute.ctx, recurrent, recurrent.len);
+    try attention_receipt.copyFromDevice(&compute.ctx, attention, attention.len);
+    try position_receipt.copyFromDevice(&compute.ctx, owner.positions(), owner.positions().len);
+    owner.pending_graph = try compute.ctx.endStreamCapture();
+    owner.graph = try compute.ctx.instantiateGraph(owner.pending_graph);
+    try compute.ctx.destroyGraphChecked(&owner.pending_graph);
+    owner.phase = .replay;
+
+    const exec = owner.graph;
+    try compute.ctx.launchGraph(exec);
+    try compute.ctx.synchronize();
+    var pages: [2]RecurrentPage = undefined;
+    var table: Attention.PageTable = undefined;
+    var positions: [6]u32 = undefined;
+    try recurrent_receipt.copyToHost(&compute.ctx, std.mem.asBytes(&pages));
+    try attention_receipt.copyToHost(&compute.ctx, std.mem.asBytes(&table));
+    try std.testing.expectEqual(departing.ptr, pages[1].state);
+    try std.testing.expectEqual(@as(u32, 2), table.blocks[1]);
+    try std.testing.expectEqual(@as(u32, 7), table.pages[1].tokens);
+
+    try std.testing.expect(!try compute.suspendBoundedGraphBinding(.{ .outside_execution = true }, .{ .sequence = 3 }));
+    try std.testing.expect(try compute.suspendBoundedGraphBinding(.{ .outside_execution = true }, .{ .sequence = 4 }));
+    try std.testing.expect(owner.rebind_required);
+    _ = try departing.freeChecked(&compute.ctx);
+    var replacement_key = key;
+    replacement_key[8..11].* = .{ replacement.ptr, replacement.ptr + 16, replacement.ptr + 32 };
+    replacement_key[15] = 5;
+    replacement_key[18] = 6;
+    var next = descriptor;
+    next.key = &replacement_key;
+    next.sequences = &.{ 3, 5 };
+    next.positions = &.{ 7, 8, 9, 11, 12, 13 };
+    var phase: Graph.GraphPhase = undefined;
+    next.attention_tokens = &.{ 9, 0 };
+    try phase.initInto(next);
+    try std.testing.expectError(error.InvalidExecutionPlan, compute.rebindBoundedGraphInputs(&phase));
+    try std.testing.expect(owner.rebind_required);
+    const Never = struct {
+        fn record(_: *anyopaque, _: *CudaCompute.BoundedDecodeClaim) !void {
+            return error.UnexpectedRecording;
+        }
+    };
+    var claim: CudaCompute.BoundedDecodeClaim = .{ .compute = &compute, .head_destination = null };
+    try std.testing.expectError(error.InvalidExecutionPlan, claim.run(&compute, Never.record));
+    next.attention_tokens = &.{ 9, 12 };
+    try phase.initInto(next);
+    try compute.rebindBoundedGraphInputs(&phase);
+    try std.testing.expectEqual(exec, owner.graph);
+    try std.testing.expect(owner.matches(next));
+    try std.testing.expectEqual(recurrent.ptr, owner.recurrentPageTable().?.ptr);
+    try std.testing.expectEqual(attention.ptr, owner.attentionPageTables().?.ptr);
+    try compute.ctx.launchGraph(exec);
+    try compute.ctx.synchronize();
+    try recurrent_receipt.copyToHost(&compute.ctx, std.mem.asBytes(&pages));
+    try attention_receipt.copyToHost(&compute.ctx, std.mem.asBytes(&table));
+    try position_receipt.copyToHost(&compute.ctx, std.mem.asBytes(&positions));
+    try std.testing.expectEqual(replacement.ptr, pages[1].state);
+    try std.testing.expectEqual(@as(u32, 6), table.blocks[1]);
+    try std.testing.expectEqual(@as(u32, 12), table.pages[1].tokens);
+    try std.testing.expectEqualSlices(u32, next.positions, &positions);
 }
 
 test "CUDA KV typed mutation refuses copied hook table before invalid context cast" {
